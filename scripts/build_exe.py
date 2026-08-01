@@ -134,15 +134,18 @@ def upload_release(zip_path: Path, sha_path: Path, version: str, repo: str, toke
         "User-Agent": "DouStudio-Release/1.0",
     }
 
-    def _req(method: str, url: str, body=None) -> dict:
+    def _req(method: str, url: str, body=None) -> dict | None:
         data = None if body is None else json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                raw = resp.read()
+                if not raw or resp.status in (204, 304):
+                    return None
+                return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"GitHub {method} {url} → HTTP {exc.code}: {detail}") from exc
+            raise RuntimeError(f"GitHub {method} {url} -> HTTP {exc.code}: {detail}") from exc
 
     # 1. 找/建 release
     try:
