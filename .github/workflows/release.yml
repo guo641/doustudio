@@ -10,10 +10,20 @@ permissions:
   contents: write
 
 jobs:
-  windows:
-    name: Package DouStudio (Windows x64)
-    runs-on: windows-latest
+  build:
+    name: Build & Upload ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            plat: windows-x86_64
+            artifact_name: DouStudio-windows-x86_64
+          - os: ubuntu-latest
+            plat: linux-x86_64
+            artifact_name: DouStudio-linux-x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -29,58 +39,12 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install Python deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller==6.12.0
-          pip install -e .
-
-      - name: Build frontend
-        working-directory: frontend
-        run: |
-          npm ci
-          npm run build
-
-      - name: Build DouStudio onedir
-        env:
-          DOUSTUDIO_VERSION: ${{ github.ref_name }}
-        run: |
-          python scripts/build_exe.py --mode onedir --version "$DOUSTUDIO_VERSION" --upload
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: DouStudio-windows-x64
-          path: |
-            dist/DouStudio-v*.zip
-            dist/DouStudio-v*.zip.sha256
-          if-no-files-found: error
-          retention-days: 30
-
-  linux:
-    name: Package DouStudio (Linux x64)
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install system deps (PyWebView GTK + Playwright)
+      # Linux runner 需要 gtk/webkit 给 PyWebView 用
+      - name: Install Linux GUI deps
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.1-0 python3-gi gir1.2-gtk-3.0
-          sudo apt-get install -y xvfb
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.1-0 python3-gi gir1.2-gtk-3.0 xvfb
 
       - name: Install Python deps
         run: |
@@ -94,16 +58,21 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build DouStudio onedir
+      # Windows runner: 跑构建后直接上传到 GitHub Release(zip + sha256)
+      # build_exe.py 现在用纯 urllib 打 GitHub API,不依赖 gh CLI
+      - name: Build onedir + upload to release
         env:
           DOUSTUDIO_VERSION: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python scripts/build_exe.py --mode onedir --version "$DOUSTUDIO_VERSION" --upload
 
-      - name: Upload artifact
+      # 双保险:即使 --upload 失败,artifact 仍可手动从 workflow run 下载
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DouStudio-linux-x86_64
+          name: ${{ matrix.artifact_name }}
           path: |
             dist/DouStudio-v*.zip
             dist/DouStudio-v*.zip.sha256

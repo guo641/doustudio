@@ -5,8 +5,11 @@ import { DpBadge, DpButton, DpEmpty, DpLink, DpPanel, DpSearchInput, DpSelect, D
 
 type VideoTaskRow = {
   id: string;
+  account_id?: string | null;
   account_name?: string;
   prompt: string;
+  original_prompt?: string;
+  prompt_retry_count?: number;
   model: string;
   ratio: string;
   duration: number;
@@ -14,11 +17,17 @@ type VideoTaskRow = {
   image_count?: number;
   status: string;
   result_url?: string;
+  clean_video_url?: string;
+  clean_error?: string;
   error?: string;
   quota_used?: number;
   quota_total?: number;
+  group_id?: string;
+  group_index?: number;
   created_at: string;
 };
+
+type TagVariant = 'accent' | 'success' | 'muted' | 'warning' | 'danger';
 
 const props = defineProps<{ tasks: VideoTaskRow[] }>();
 defineEmits<{ retry: [task: VideoTaskRow] }>();
@@ -134,7 +143,7 @@ function paramsText(task: VideoTaskRow) {
                 <DpTag v-if="task.group_id" tone="info" :title="`组 ID: ${task.group_id}`">
                   组 #{{ task.group_index || 1 }}
                 </DpTag>
-                <DpTag v-if="task.prompt_retry_count > 0" tone="warning">
+                <DpTag v-if="(task.prompt_retry_count || 0) > 0" tone="warning">
                   已改写 {{ task.prompt_retry_count }} 次
                 </DpTag>
                 <span class="params">{{ paramsText(task) }}</span>

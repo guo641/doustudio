@@ -21,6 +21,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import urllib.parse
 import zipfile
 from pathlib import Path
 
@@ -101,22 +102,82 @@ def package_zip(dist: Path, mode: str, version: str) -> Path:
 
 
 def upload_release(zip_path: Path, sha_path: Path, version: str, repo: str, token: str) -> None:
-    """用 GitHub CLI 触发 release + 上传(简单粗暴但够用)"""
-    if not shutil.which("gh"):
-        print("[upload] gh CLI 未安装,跳过上传")
-        return
-    cmd = [
-        "gh", "release", "create", version,
-        "--repo", repo,
-        "--title", f"DouStudio {version}",
-        "--notes", f"自动构建产物。SHA256 见 .sha256 文件。",
-        str(zip_path),
-        str(sha_path),
-    ]
-    print(f"[upload] running: gh release create {version} ...")
-    env = os.environ.copy()
-    env["GH_TOKEN"] = token
-    subprocess.check_call(cmd, env=env)
+    """
+    用 GitHub REST API 上传 zip + sha256 到既有 release。
+    - 优先 reuse 现有 release(同名 tag),否则新建
+    - 不依赖 gh CLI(Windows runner 默认没装)
+    - 自动用 sha256 做 deterministic-name
+    """
+    import json
+    import urllib.request
+    import urllib.error
+
+    api = f"https://api.github.com/repos/{repo}"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "DouStudio-Release/1.0",
+    }
+
+    def _req(method: str, url: str, body=None) -> dict:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"GitHub {method} {url} → HTTP {exc.code}: {detail}") from exc
+
+    # 1. 找/建 release
+    try:
+        rel = _req("GET", f"{api}/releases/tags/{version}")
+        release_id = rel["id"]
+        upload_url = rel["upload_url"]
+        print(f"[upload] reuse release {version} (id={release_id})")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise RuntimeError(f"GitHub releases/tags 失败: HTTP {exc.code}") from exc
+        print(f"[upload] release {version} 不存在,创建")
+        rel = _req(
+            "POST", f"{api}/releases",
+            {
+                "tag_name": version,
+                "name": f"DouStudio {version}",
+                "body": (
+                    "自动构建产物。SHA256 见同名 .sha256 文件。\n\n"
+                    "## 验证\n\n"
+                    "```bash\n"
+                    "sha256sum -c DouStudio-{ver}-<plat>.zip.sha256\n"
+                    "```"
+                ).format(ver=version),
+                "draft": False,
+                "prerelease": False,
+            },
+        )
+        release_id = rel["id"]
+        upload_url = rel["upload_url"]
+
+    # 2. 上传 zip + sha256
+    upload_base = upload_url.split("{", 1)[0]  # 去掉 {?name,label}
+    for f in (zip_path, sha_path):
+        size = f.stat().st_size
+        name = f.name
+        url = f"{upload_base}?name={urllib.parse.quote(name)}"
+        print(f"[upload] {name} ({size} bytes) → {url}")
+        req = urllib.request.Request(
+            url,
+            data=f.read_bytes(),
+            method="POST",
+            headers={
+                **headers,
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(size),
+            },
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        print(f"[upload] ok → {payload.get('browser_download_url')}")
 
 
 def main() -> int:
