@@ -26,6 +26,14 @@ import zipfile
 from pathlib import Path
 
 
+# 强制 stdout/stderr 用 utf-8,避免 Windows runner 默认 cp1252 撞上中文/箭头字符
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
+
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -82,7 +90,7 @@ def build(mode: str = "onedir") -> Path:
     dist = _dist_dir(mode)
     if not dist.exists():
         raise RuntimeError(f"build finished but {dist} missing")
-    print(f"[build] ok → {dist}")
+    print(f"[build] ok -> {dist}")
     return dist
 
 
@@ -165,13 +173,23 @@ def upload_release(zip_path: Path, sha_path: Path, version: str, repo: str, toke
         release_id = rel["id"]
         upload_url = rel["upload_url"]
 
-    # 2. 上传 zip + sha256
+    # 2. 上传 zip + sha256(覆盖模式:先删同名旧 asset,再 POST)
     upload_base = upload_url.split("{", 1)[0]  # 去掉 {?name,label}
+
+    # 列出现有 assets,删除同名的以便覆盖
+    existing = _req("GET", f"{api}/releases/{release_id}/assets")
+    if isinstance(existing, list):
+        for asset in existing:
+            if asset.get("name") in (zip_path.name, sha_path.name):
+                old_id = asset["id"]
+                print(f"[upload] 删除旧 asset {asset['name']} (id={old_id})")
+                _req("DELETE", f"{api}/release-assets/{old_id}")
+
     for f in (zip_path, sha_path):
         size = f.stat().st_size
         name = f.name
         url = f"{upload_base}?name={urllib.parse.quote(name)}"
-        print(f"[upload] {name} ({size} bytes) → {url}")
+        print(f"[upload] {name} ({size} bytes) -> {url}")
         req = urllib.request.Request(
             url,
             data=f.read_bytes(),
@@ -184,7 +202,7 @@ def upload_release(zip_path: Path, sha_path: Path, version: str, repo: str, toke
         )
         with urllib.request.urlopen(req, timeout=300) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
-        print(f"[upload] ok → {payload.get('browser_download_url')}")
+        print(f"[upload] ok -> {payload.get('browser_download_url')}")
 
 
 def main() -> int:
