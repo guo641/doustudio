@@ -131,13 +131,29 @@ function paramsText(task: VideoTaskRow) {
                 <DpTag v-if="(task.mode || 't2v') === 'i2v' && task.image_count" tone="success">
                   {{ task.image_count }} 图
                 </DpTag>
+                <DpTag v-if="task.group_id" tone="info" :title="`组 ID: ${task.group_id}`">
+                  组 #{{ task.group_index || 1 }}
+                </DpTag>
+                <DpTag v-if="task.prompt_retry_count > 0" tone="warning">
+                  已改写 {{ task.prompt_retry_count }} 次
+                </DpTag>
                 <span class="params">{{ paramsText(task) }}</span>
               </div>
             </td>
             <td class="account">{{ task.account_name || '等待分配' }}</td>
             <td class="time">{{ formatTime(task.created_at) }}</td>
             <td class="actions">
-              <template v-if="task.result_url">
+              <template v-if="task.clean_video_url">
+                <DpLink :href="task.clean_video_url" external>
+                  <ExternalLink :size="12" />
+                  无水印
+                </DpLink>
+                <DpLink :href="task.clean_video_url" download>
+                  <Download :size="12" />
+                  下载
+                </DpLink>
+              </template>
+              <template v-else-if="task.result_url">
                 <DpLink :href="task.result_url" external>
                   <ExternalLink :size="12" />
                   预览
@@ -147,6 +163,9 @@ function paramsText(task: VideoTaskRow) {
                   下载
                 </DpLink>
               </template>
+              <span v-if="task.clean_error" class="clean-error" :title="task.clean_error">
+                去水印失败
+              </span>
               <DpButton
                 v-if="task.status === 'failed'"
                 size="sm"
@@ -156,7 +175,7 @@ function paramsText(task: VideoTaskRow) {
                 <RotateCcw :size="12" />
                 重试
               </DpButton>
-              <span v-if="!task.result_url && task.status !== 'failed'" class="dash">—</span>
+              <span v-if="!task.result_url && !task.clean_video_url && task.status !== 'failed'" class="dash">—</span>
             </td>
           </tr>
           <tr v-if="expanded.has(task.id)" class="detail-row">
@@ -253,6 +272,13 @@ function paramsText(task: VideoTaskRow) {
 
 .dash {
   color: var(--text-faint);
+}
+
+.clean-error {
+  color: var(--warning-text, #b45309);
+  font-size: 11.5px;
+  cursor: help;
+  margin-right: 4px;
 }
 
 .detail-row td {

@@ -41,6 +41,16 @@ function formatRecovery(value?: string) {
   if (!value) return '—';
   return new Date(value).toLocaleString('zh-CN');
 }
+
+function quotaRatio(account: Account): number {
+  const used = account.video_quota_used ?? 0;
+  const total = account.video_quota_total ?? 5;
+  return total > 0 ? Math.min(1, used / total) : 0;
+}
+
+function quotaBarWidth(account: Account): number {
+  return Math.round(quotaRatio(account) * 100);
+}
 </script>
 
 <template>
@@ -94,9 +104,17 @@ function formatRecovery(value?: string) {
             </DpBadge>
           </td>
           <td>
-            <span class="quota" :class="{ limited: account.video_limited_until }">
-              {{ formatQuota(account) }}
-            </span>
+            <div class="quota-cell">
+              <span class="quota" :class="{ limited: account.video_limited_until }">
+                {{ formatQuota(account) }}
+              </span>
+              <div
+                class="quota-bar"
+                :class="{ exhausted: quotaRatio(account) >= 1, limited: account.video_limited_until }"
+              >
+                <div class="quota-bar-fill" :style="{ width: quotaBarWidth(account) + '%' }" />
+              </div>
+            </div>
           </td>
           <td class="muted">{{ formatRecovery(account.video_limited_until) }}</td>
           <td>
@@ -188,6 +206,31 @@ function formatRecovery(value?: string) {
 
 .quota.limited {
   color: var(--danger-text);
+}
+
+.quota-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 110px;
+}
+
+.quota-bar {
+  height: 6px;
+  background: var(--bg-elev);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.quota-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.quota-bar.exhausted .quota-bar-fill,
+.quota-bar.limited .quota-bar-fill {
+  background: var(--danger-text);
 }
 
 .muted {

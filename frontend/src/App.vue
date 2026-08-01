@@ -209,7 +209,11 @@ function openTaskDialog() {
 }
 
 async function submitVideo() {
-  if (!prompt.value.trim()) return;
+  const promptLines = prompt.value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (promptLines.length === 0) return;
   if (imageFiles.value.length > MAX_I2V_IMAGES) {
     showToast('failed', `最多支持 ${MAX_I2V_IMAGES} 张图片`);
     return;
@@ -226,8 +230,11 @@ async function submitVideo() {
             })),
           )
         : [];
+    // 多行 prompt → 自动归组;单行 → 走原 prompt 字段(向后兼容)
+    const isGroup = promptLines.length > 1;
     await createVideoTask({
-      prompt: prompt.value.trim(),
+      prompt: isGroup ? '' : promptLines[0],
+      prompts: isGroup ? promptLines : undefined,
       model: model.value,
       ratio: ratio.value,
       duration: duration.value,
@@ -240,7 +247,11 @@ async function submitVideo() {
     showTaskDialog.value = false;
     showToast(
       'succeeded',
-      mode === 'i2v' ? `图生任务已加入队列（${images.length} 张图）` : '文生任务已加入队列',
+      mode === 'i2v'
+        ? `图生任务已加入队列（${images.length} 张图）`
+        : isGroup
+          ? `${promptLines.length} 段 prompt 已自动归组`
+          : '文生任务已加入队列',
     );
     await refreshTasks();
   } catch (error) {
@@ -437,11 +448,14 @@ onBeforeUnmount(() => {
             :placeholder="
               imageFiles.length
                 ? '描述图片如何运动、镜头和氛围…'
-                : '描述主体、动作、场景、镜头和光线…'
+                : '描述主体、动作、场景、镜头和光线…\n\n一行一段 prompt 时自动归组到同一文件夹'
             "
           />
         </DpField>
-        <div class="char-hint">{{ prompt.length }} / 2000</div>
+        <div class="char-hint">
+          {{ prompt.length }} / 2000 ·
+          {{ prompt.split(/\r?\n/).filter((l) => l.trim()).length }} 段(多段自动归组)
+        </div>
 
         <div class="form-grid">
           <DpField label="模型" for-id="video-model">
