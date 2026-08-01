@@ -177,13 +177,21 @@ def upload_release(zip_path: Path, sha_path: Path, version: str, repo: str, toke
     upload_base = upload_url.split("{", 1)[0]  # 去掉 {?name,label}
 
     # 列出现有 assets,删除同名的以便覆盖
+    # GitHub API 正确路径:/repos/{owner}/{repo}/releases/assets/{asset_id}
     existing = _req("GET", f"{api}/releases/{release_id}/assets")
     if isinstance(existing, list):
         for asset in existing:
             if asset.get("name") in (zip_path.name, sha_path.name):
                 old_id = asset["id"]
                 print(f"[upload] 删除旧 asset {asset['name']} (id={old_id})")
-                _req("DELETE", f"{api}/release-assets/{old_id}")
+                try:
+                    _req("DELETE", f"{api}/releases/assets/{old_id}")
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 404:
+                        # 并发删除或已不存在,忽略
+                        print(f"[upload] 旧 asset 已不存在 (404),忽略")
+                        continue
+                    raise
 
     for f in (zip_path, sha_path):
         size = f.stat().st_size
