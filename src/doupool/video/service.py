@@ -15,6 +15,12 @@ from zoneinfo import ZoneInfo
 
 from doupool.db.models import Account, VideoTask
 from doupool.db.repository import AccountRepository
+from doupool.prompt_reviser import classify_failure, revise_prompt
+from doupool.watermark import (
+    ZhucekaConfigError,
+    ZhucekaError,
+    resolve_clean_url as zhuceka_resolve,
+)
 
 from .protocol import DURATIONS, MAX_I2V_IMAGES, MODELS, RATIOS, TASK_MODES, DoubaoRateLimited
 
@@ -222,6 +228,8 @@ class VideoTaskService:
                         self.logger.info(
                             "视频任务生成成功", extra={"event": "video_succeeded", "account_id": account.id}
                         )
+                        # 生成成功后异步调去水印,失败也不影响主流程
+                        await self._run_watermark(task_id, result, settings)
                         return
                     except DoubaoRateLimited:
                         self.repository.mark_account_limited(
@@ -243,11 +251,72 @@ class VideoTaskService:
                                 task_id, status="queued", error_message="应用已停止，等待下次继续"
                             )
                             return
+                        # 分类失败 → 决定是否改写 prompt 后重试
+                        failure = classify_failure(str(exc))
+                        attempt = getattr(task, "prompt_retry_count", 0) or 0
+                        max_attempts = int(settings.get("max_prompt_retries", 2))
+                        if failure.revise_prompt and attempt < max_attempts:
+                            new_prompt = revise_prompt(task.prompt, failure, attempt=attempt + 1)
+                            if new_prompt and new_prompt != task.prompt:
+                                self.repository.update_video_task(
+                                    task_id,
+                                    prompt=new_prompt,
+                                    prompt_retry_count=attempt + 1,
+                                    status="queued",
+                                    error_message=f"改写 prompt 第 {attempt + 1} 次重试:{failure.kind}",
+                                    account_id=None,
+                                )
+                                self.logger.warning(
+                                    "prompt 改写重试 %d/%d: %s",
+                                    attempt + 1, max_attempts, failure.detail,
+                                    extra={"event": "prompt_revised", "task_id": task_id},
+                                )
+                                continue
                         self.repository.update_video_task(task_id, status="failed", error_message=str(exc))
                         self.logger.exception(
                             "视频任务失败", extra={"event": "video_failed", "account_id": account.id}
                         )
                         return
+
+    async def _run_watermark(self, task_id: str, result: dict, settings: dict) -> None:
+        """
+        生成成功后异步调 zhuceka 去水印。失败/未启用都不影响主任务状态。
+        写入 clean_video_url / clean_error 字段供前端展示。
+        """
+        if not settings.get("watermark_enabled"):
+            return
+        uid = (settings.get("watermark_uid") or "").strip()
+        key = (settings.get("watermark_key") or "").strip()
+        if not (uid and key):
+            self.repository.update_video_task(
+                task_id, clean_error="未配置 zhuceka uid/key,请在设置面板填写"
+            )
+            return
+
+        # 优先用 result_url(无水印)→ 备用 backup_result_url → 最后 fallback_result_url(可能带水印)
+        source_url = (
+            result.get("result_url")
+            or result.get("backup_result_url")
+            or result.get("fallback_result_url")
+            or ""
+        )
+        if not source_url:
+            self.repository.update_video_task(task_id, clean_error="无可用视频链接,跳过去水印")
+            return
+
+        try:
+            clean_url = await zhuceka_resolve(source_url, uid=uid, key=key)
+            self.repository.update_video_task(task_id, clean_video_url=clean_url, clean_error=None)
+            self.logger.info(
+                "zhuceka 去水印成功", extra={"event": "watermark_succeeded", "task_id": task_id}
+            )
+        except ZhucekaConfigError as exc:
+            self.repository.update_video_task(task_id, clean_error=str(exc))
+        except ZhucekaError as exc:
+            self.repository.update_video_task(task_id, clean_error=f"去水印失败: {exc}")
+            self.logger.warning(
+                "zhuceka 去水印失败: %s", exc, extra={"event": "watermark_failed", "task_id": task_id}
+            )
 
     async def shutdown(self) -> None:
         for cancellation in self._cancellations.values():

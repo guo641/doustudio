@@ -142,6 +142,8 @@ class AccountRepository:
                 id=str(uuid4()),
                 account=account_id,
                 prompt=prompt,
+                original_prompt=prompt,
+                prompt_retry_count=0,
                 model=model,
                 ratio=ratio,
                 duration=duration,

@@ -28,7 +28,7 @@ class DatabaseManager:
         if version is None:
             with self.database.atomic():
                 self.database.create_tables(ALL_MODELS)
-                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (5)")
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (7)")
             return
         if version < 2:
             with self.database.atomic():
@@ -82,6 +82,30 @@ class DatabaseManager:
                 if "image_paths" not in columns:
                     self.database.execute_sql("ALTER TABLE videotask ADD COLUMN image_paths TEXT")
                 self.database.execute_sql("INSERT INTO schema_version(version) VALUES (5)")
+            version = 5
+        if version < 6:
+            columns = {
+                row[1] for row in self.database.execute_sql("PRAGMA table_info(videotask)").fetchall()
+            }
+            with self.database.atomic():
+                if "clean_video_url" not in columns:
+                    self.database.execute_sql("ALTER TABLE videotask ADD COLUMN clean_video_url TEXT")
+                if "clean_error" not in columns:
+                    self.database.execute_sql("ALTER TABLE videotask ADD COLUMN clean_error TEXT")
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (6)")
+            version = 6
+        if version < 7:
+            columns = {
+                row[1] for row in self.database.execute_sql("PRAGMA table_info(videotask)").fetchall()
+            }
+            with self.database.atomic():
+                if "original_prompt" not in columns:
+                    self.database.execute_sql("ALTER TABLE videotask ADD COLUMN original_prompt TEXT")
+                if "prompt_retry_count" not in columns:
+                    self.database.execute_sql(
+                        "ALTER TABLE videotask ADD COLUMN prompt_retry_count INTEGER NOT NULL DEFAULT 0"
+                    )
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (7)")
 
     def _make_video_account_nullable(self) -> None:
         self.database.execute_sql("""

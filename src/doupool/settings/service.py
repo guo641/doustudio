@@ -18,6 +18,12 @@ class SettingsService:
         "download_dir": "",
         "log_level": "INFO",
         "log_retention_days": 30,
+        # zhuceka 去水印
+        "watermark_enabled": False,
+        "watermark_uid": "",
+        "watermark_key": "",
+        # 失败自动改 prompt 重试
+        "max_prompt_retries": 2,
     }
 
     def __init__(self, repository, data_dir: Path, database_path: Path):

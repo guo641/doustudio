@@ -16,6 +16,9 @@ type Settings = {
   log_level: string;
   log_retention_days: number;
   data_dir: string;
+  watermark_enabled: boolean;
+  watermark_uid: string;
+  watermark_key: string;
 };
 
 const settings = ref<Settings | null>(null);
@@ -109,6 +112,41 @@ async function backup() {
       </div>
     </DpCard>
 
+    <DpCard wide title="去水印(zhuceka)" description="视频生成后自动调 https://api.zhuceka.cn 去除水印,失败不影响主任务状态">
+      <div class="fields">
+        <DpField label="启用去水印" for-id="setting-watermark-enabled">
+          <input
+            id="setting-watermark-enabled"
+            v-model="settings.watermark_enabled"
+            type="checkbox"
+            class="checkbox"
+          />
+        </DpField>
+        <DpField label="UID" for-id="setting-watermark-uid">
+          <DpInput
+            id="setting-watermark-uid"
+            v-model="settings.watermark_uid"
+            placeholder="zhuceka 用户 UID"
+          />
+        </DpField>
+        <DpField label="KEY" for-id="setting-watermark-key" span2>
+          <DpInput
+            id="setting-watermark-key"
+            v-model="settings.watermark_key"
+            type="password"
+            placeholder="zhuceka 接口 KEY"
+          />
+        </DpField>
+        <DpField span2>
+          <span class="watermark-hint">
+            开启后,每个视频任务生成完成时,会自动用上述 KEY 调
+            <code>https://api.zhuceka.cn/home/api?type=dsp&uid=...&key=...&url=...</code>
+            把无水印链接写到任务的「clean_video_url」字段。
+          </span>
+        </DpField>
+      </div>
+    </DpCard>
+
     <DpCard wide title="文件与日志" description="本地下载路径、日志级别与数据备份">
       <div class="fields">
         <DpField label="视频下载目录" span2>
@@ -184,6 +222,26 @@ async function backup() {
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
   background: var(--bg-panel);
+}
+
+.checkbox {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+  accent-color: var(--accent, #3b82f6);
+}
+
+.watermark-hint {
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.watermark-hint code {
+  background: var(--bg-elev, #f3f4f6);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11.5px;
 }
 
 @media (max-width: 900px) {
