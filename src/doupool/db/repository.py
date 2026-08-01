@@ -136,6 +136,8 @@ class AccountRepository:
         *,
         mode: str = "t2v",
         image_paths: list[str] | None = None,
+        group_id: str | None = None,
+        group_index: int = 0,
     ) -> VideoTask:
         with self.database.atomic():
             task = VideoTask.create(
@@ -149,10 +151,44 @@ class AccountRepository:
                 duration=duration,
                 mode=mode or "t2v",
                 image_paths=json.dumps(image_paths or [], ensure_ascii=False) if image_paths else None,
+                group_id=group_id,
+                group_index=group_index,
             )
             if account_id:
                 Account.update(updated_at=utcnow()).where(Account.id == account_id).execute()
         return task
+
+    def list_task_groups(self, limit: int = 50) -> list[dict]:
+        """聚合返回最近的有 group_id 的任务组,按组内首个任务时间倒序"""
+        # 找出最近 N 个 group_id,以及每个组的任务数
+        from peewee import fn
+        rows = list(
+            VideoTask.select(
+                VideoTask.group_id,
+                fn.MIN(VideoTask.created_at).alias("first_at"),
+                fn.COUNT(VideoTask.id).alias("task_count"),
+            )
+            .where(VideoTask.group_id.is_null(False))
+            .group_by(VideoTask.group_id)
+            .order_by(fn.MIN(VideoTask.created_at).desc())
+            .limit(limit)
+        )
+        return [
+            {
+                "group_id": r.group_id,
+                "task_count": r.task_count,
+                "first_at": r.first_at.isoformat() if r.first_at else None,
+            }
+            for r in rows
+        ]
+
+    def list_tasks_by_group(self, group_id: str) -> list[VideoTask]:
+        return list(
+            VideoTask.select(VideoTask, Account)
+            .join(Account, JOIN.LEFT_OUTER)
+            .where(VideoTask.group_id == group_id)
+            .order_by(VideoTask.group_index.asc(), VideoTask.created_at.asc())
+        )
 
     def assign_video_task(self, task_id: str, account_id: str | None) -> VideoTask:
         task = VideoTask.get_by_id(task_id)

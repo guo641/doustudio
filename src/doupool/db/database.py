@@ -28,7 +28,7 @@ class DatabaseManager:
         if version is None:
             with self.database.atomic():
                 self.database.create_tables(ALL_MODELS)
-                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (7)")
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (8)")
             return
         if version < 2:
             with self.database.atomic():
@@ -106,6 +106,22 @@ class DatabaseManager:
                         "ALTER TABLE videotask ADD COLUMN prompt_retry_count INTEGER NOT NULL DEFAULT 0"
                     )
                 self.database.execute_sql("INSERT INTO schema_version(version) VALUES (7)")
+            version = 7
+        if version < 8:
+            columns = {
+                row[1] for row in self.database.execute_sql("PRAGMA table_info(videotask)").fetchall()
+            }
+            with self.database.atomic():
+                if "group_id" not in columns:
+                    self.database.execute_sql("ALTER TABLE videotask ADD COLUMN group_id VARCHAR(255)")
+                    self.database.execute_sql(
+                        "CREATE INDEX IF NOT EXISTS videotask_group_id ON videotask(group_id)"
+                    )
+                if "group_index" not in columns:
+                    self.database.execute_sql(
+                        "ALTER TABLE videotask ADD COLUMN group_index INTEGER NOT NULL DEFAULT 0"
+                    )
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (8)")
 
     def _make_video_account_nullable(self) -> None:
         self.database.execute_sql("""

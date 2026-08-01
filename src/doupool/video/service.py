@@ -81,10 +81,20 @@ class VideoTaskService:
         account_id: str | None = None,
         mode: str = "t2v",
         images: list[dict] | None = None,
+        prompts: list[str] | None = None,
     ):
         prompt = prompt.strip()
         mode = (mode or "t2v").strip().lower()
-        if not prompt:
+        # 兼容: 同时支持单 prompt / prompts 列表
+        prompt_list: list[str] = []
+        if prompts:
+            for p in prompts:
+                p2 = (p or "").strip()
+                if p2:
+                    prompt_list.append(p2)
+        if prompt:
+            prompt_list.insert(0, prompt)
+        if not prompt_list:
             raise ValueError("请输入画面描述")
         if mode not in TASK_MODES:
             raise ValueError("不支持的任务类型")
@@ -107,17 +117,25 @@ class VideoTaskService:
         elif images:
             raise ValueError("文生视频不支持图片附件")
 
-        task = self.repository.create_video_task(
-            account_id,
-            prompt,
-            model,
-            ratio,
-            duration,
-            mode=mode,
-            image_paths=image_paths or None,
-        )
-        self._schedule(task.id)
-        return task
+        # 多个 prompt → 同一 group_id,自动归组
+        group_id = str(uuid4()) if len(prompt_list) > 1 else None
+        first_task = None
+        for index, p in enumerate(prompt_list, start=1):
+            task = self.repository.create_video_task(
+                account_id,
+                p,
+                model,
+                ratio,
+                duration,
+                mode=mode,
+                image_paths=image_paths or None,
+                group_id=group_id,
+                group_index=index if group_id else 0,
+            )
+            self._schedule(task.id)
+            if first_task is None:
+                first_task = task
+        return first_task
 
     def _persist_images(self, images: list[dict]) -> list[str]:
         count = len(images)

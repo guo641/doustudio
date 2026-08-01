@@ -23,7 +23,8 @@ class ImageAttachmentBody(BaseModel):
 
 
 class CreateVideoTaskBody(BaseModel):
-    prompt: str = Field(min_length=1, max_length=2000)
+    prompt: str = ""
+    prompts: list[str] = Field(default_factory=list, max_length=20)
     model: str = "seedance_v2.0_mini"
     ratio: str = "1:1"
     duration: int = 5
@@ -57,6 +58,8 @@ def _video_task_dict(task, daily_quota: int = 5) -> dict:
             image_count = 0
     return {
         "id": task.id,
+        "group_id": task.group_id,
+        "group_index": task.group_index,
         "account_id": account.id if account else None,
         "account_name": account.display_name if account else None,
         "quota_used": account.video_quota_used if account else None,
@@ -224,6 +227,19 @@ def create_app(
         authorize(x_doupool_token)
         quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
         return [_video_task_dict(task, quota) for task in repository.list_video_tasks()]
+
+    @app.get("/api/video-task-groups")
+    def video_task_groups(limit: int = 50, x_doupool_token: str | None = Header(default=None)):
+        """按 group_id 聚合返回最近的任务组(每个组首条 + 任务数)"""
+        authorize(x_doupool_token)
+        return repository.list_task_groups(limit=limit)
+
+    @app.get("/api/video-task-groups/{group_id}")
+    def video_task_group_detail(group_id: str, x_doupool_token: str | None = Header(default=None)):
+        """返回某 group 下所有任务,按 group_index 排序"""
+        authorize(x_doupool_token)
+        quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
+        return [_video_task_dict(t, quota) for t in repository.list_tasks_by_group(group_id)]
 
     @app.post("/api/video-tasks", status_code=202)
     async def create_video_task(body: CreateVideoTaskBody, x_doupool_token: str | None = Header(default=None)):

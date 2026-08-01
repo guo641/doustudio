@@ -69,6 +69,8 @@ class AppLog(BaseModel):
 class VideoTask(BaseModel):
     id = CharField(primary_key=True)
     account = ForeignKeyField(Account, null=True, backref="video_tasks")
+    group_id = CharField(null=True, index=True)
+    group_index = IntegerField(default=0)  # 组内顺序(从 1 开始)
     prompt = TextField()
     original_prompt = TextField(null=True)
     prompt_retry_count = IntegerField(default=0)

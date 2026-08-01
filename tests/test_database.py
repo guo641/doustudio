@@ -64,7 +64,7 @@ def test_version_three_database_migrates_without_losing_related_rows(tmp_path):
     manager = DatabaseManager(path)
     manager.initialize()
     try:
-        assert manager.database.execute_sql("SELECT MAX(version) FROM schema_version").fetchone()[0] == 5
+        assert manager.database.execute_sql("SELECT MAX(version) FROM schema_version").fetchone()[0] == 8
         assert manager.database.execute_sql("SELECT COUNT(*) FROM account").fetchone()[0] == 1
         assert manager.database.execute_sql("SELECT COUNT(*) FROM loginattempt").fetchone()[0] == 1
         columns = {row[1] for row in manager.database.execute_sql("PRAGMA table_info(videotask)")}

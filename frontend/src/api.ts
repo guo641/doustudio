@@ -41,7 +41,8 @@ export async function listVideoTasks() {
   return json(await fetch('/api/video-tasks', { headers }), '任务加载失败');
 }
 export async function createVideoTask(body: {
-  prompt: string;
+  prompt?: string;
+  prompts?: string[];
   model: string;
   ratio: string;
   duration: number;
@@ -52,6 +53,20 @@ export async function createVideoTask(body: {
   return json(
     await fetch('/api/video-tasks', { method: 'POST', headers, body: JSON.stringify(body) }),
     '任务创建失败',
+  );
+}
+
+export async function listVideoTaskGroups(limit = 50) {
+  return json(
+    await fetch(`/api/video-task-groups?limit=${limit}`, { headers }),
+    '任务组加载失败',
+  );
+}
+
+export async function listVideoTaskGroupDetail(groupId: string) {
+  return json(
+    await fetch(`/api/video-task-groups/${encodeURIComponent(groupId)}`, { headers }),
+    '任务组详情加载失败',
   );
 }
 export async function listLogs() {
