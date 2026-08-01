@@ -58,6 +58,15 @@ jobs:
           npm ci
           npm run build
 
+      # 安装 Playwright Chromium 浏览器,让 Windows/Linux 用户首次启动即可用
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install chromium
+          # Windows runner 上还要装 OS 级 deps(linux runner 已在上面 apt-get 装好)
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python -m playwright install --with-deps chromium || true
+          fi
+
       # Windows runner: 跑构建后直接上传到 GitHub Release(zip + sha256)
       # build_exe.py 现在用纯 urllib 打 GitHub API,不依赖 gh CLI
       - name: Build onedir + upload to release
@@ -67,6 +76,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python scripts/build_exe.py --mode onedir --version "$DOUSTUDIO_VERSION" --upload
+        shell: bash
 
       # 双保险:即使 --upload 失败,artifact 仍可手动从 workflow run 下载
       - name: Upload workflow artifact

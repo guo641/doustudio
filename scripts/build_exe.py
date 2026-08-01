@@ -65,12 +65,19 @@ def build(mode: str = "onedir") -> Path:
         str(REPO_ROOT / "packaging" / "doubao_manager.spec"),
     ]
     if mode == "onefile":
-        # onedir → onefile: 让 spec 里 EXE 自包含(覆盖产物名)
         env = os.environ.copy()
         env["DOUSTUDIO_ONEFILE"] = "1"
-        subprocess.check_call(cmd, cwd=str(REPO_ROOT), env=env)
     else:
-        subprocess.check_call(cmd, cwd=str(REPO_ROOT))
+        env = None
+    try:
+        subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"PyInstaller 失败: returncode={exc.returncode}\n"
+            f"  cmd: {' '.join(cmd)}\n"
+            f"  cwd: {REPO_ROOT}\n"
+            f"  (stderr/stdout 已由 PyInstaller 直接打印到上方日志)"
+        ) from exc
 
     dist = _dist_dir(mode)
     if not dist.exists():
@@ -198,7 +205,11 @@ def main() -> int:
         if not (token and repo):
             print("[upload] 缺 GH_TOKEN 或 GITHUB_REPOSITORY,跳过上传")
         else:
-            upload_release(zip_path, sha_path, version, repo, token)
+            try:
+                upload_release(zip_path, sha_path, version, repo, token)
+            except Exception as exc:
+                print(f"[upload] FAILED: {exc}", file=sys.stderr)
+                raise
 
     print("[done] 产物:")
     print(f"  - {zip_path}")
