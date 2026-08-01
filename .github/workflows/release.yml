@@ -9,6 +9,12 @@ on:
 permissions:
   contents: write
 
+# 所有 step 默认 bash:windows-latest 默认是 pwsh,但这里所有命令都是 bash 风格
+# (apt / python / curl / mv 等),统一在 bash 下执行最稳
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     name: Build & Upload ${{ matrix.os }}
@@ -58,17 +64,21 @@ jobs:
           npm ci
           npm run build
 
-      # 安装 Playwright Chromium 浏览器,让 Windows/Linux 用户首次启动即可用
-      - name: Install Playwright Chromium
+      # Linux 装 Playwright Chromium 浏览器(让 linux 用户首次启动即可用)
+      - name: Install Playwright Chromium (Linux)
+        if: runner.os == 'Linux'
         run: |
           python -m playwright install chromium
-          # Windows runner 上还要装 OS 级 deps(linux runner 已在上面 apt-get 装好)
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            python -m playwright install --with-deps chromium || true
-          fi
 
-      # Windows runner: 跑构建后直接上传到 GitHub Release(zip + sha256)
-      # build_exe.py 现在用纯 urllib 打 GitHub API,不依赖 gh CLI
+      # Windows 装 Playwright Chromium(同样让 windows 用户首次启动即可用)
+      - name: Install Playwright Chromium (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -m playwright install chromium
+          python -m playwright install --with-deps chromium || true
+
+      # 构建 onedir + 自动上传 zip + sha256 到 GitHub Release
+      # build_exe.py 用纯 urllib 打 GitHub API,不依赖 gh CLI
       - name: Build onedir + upload to release
         env:
           DOUSTUDIO_VERSION: ${{ github.ref_name }}
@@ -76,7 +86,6 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python scripts/build_exe.py --mode onedir --version "$DOUSTUDIO_VERSION" --upload
-        shell: bash
 
       # 双保险:即使 --upload 失败,artifact 仍可手动从 workflow run 下载
       - name: Upload workflow artifact
