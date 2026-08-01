@@ -38,6 +38,7 @@ def main() -> None:
     app = create_app(
         secrets.token_urlsafe(32), settings.frontend_dir, repository, service,
         video_service, settings_service,
+        current_version=settings.version,
     )
     try:
         DesktopRuntime(app, settings.debug).run()

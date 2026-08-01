@@ -69,6 +69,10 @@ export async function listVideoTaskGroupDetail(groupId: string) {
     '任务组详情加载失败',
   );
 }
+
+export async function checkUpdate() {
+  return json(await fetch('/api/update-check', { headers }), '更新检查失败');
+}
 export async function listLogs() {
   return json(await fetch('/api/logs', { headers }), '日志加载失败');
 }

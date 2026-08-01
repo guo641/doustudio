@@ -16,6 +16,7 @@ class Settings:
     frontend_dir: Path
     debug: bool = False
     login_timeout_seconds: int = 300
+    version: str = "0.1.0"  # DouStudio 当前版本(updater 用来对比 latest)
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -26,5 +27,6 @@ class Settings:
             log_dir=log_dir,
             frontend_dir=resolve_frontend_dir(),
             debug=os.environ.get("DOUPOOL_DEBUG", "").lower() in {"1", "true", "yes"},
+            version=os.environ.get("DOUSTUDIO_VERSION", "0.1.0"),
         )
 

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from doupool.db.models import Account, LoginAttempt
 from doupool.login.service import LoginAlreadyRunning
 from doupool.logging.setup import set_log_level
+from doupool.updater import check_for_update
 from doupool.video.service import NoAvailableAccount
 
 
@@ -95,6 +96,7 @@ def create_app(
     login_service,
     video_service=None,
     settings_service=None,
+    current_version: str = "0.1.0",
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app):
@@ -114,7 +116,20 @@ def create_app(
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok"}
+        return {"status": "ok", "version": current_version}
+
+    @app.get("/api/update-check")
+    async def update_check(x_doupool_token: str | None = Header(default=None)):
+        authorize(x_doupool_token)
+        info = await check_for_update(current_version)
+        return {
+            "current_version": info.current_version,
+            "latest_version": info.latest_version,
+            "has_update": info.has_update,
+            "release_url": info.release_url,
+            "release_notes": info.release_notes,
+            "asset_urls": info.asset_urls,
+        }
 
     @app.get("/api/accounts", dependencies=[])
     def accounts(x_doupool_token: str | None = Header(default=None)):

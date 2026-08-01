@@ -56,7 +56,9 @@ def test_create_login_attempt_runs_inside_event_loop(repository, tmp_path):
 def test_health_is_available_without_token(repository, tmp_path):
     service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
     client = TestClient(create_app("secret", tmp_path / "missing", repository, service))
-    assert client.get("/api/health").json() == {"status": "ok"}
+    data = client.get("/api/health").json()
+    assert data["status"] == "ok"
+    assert "version" in data  # 启动时回填的 DouStudio 版本号
 
 
 def test_spa_injects_token_when_index_has_no_head(repository, tmp_path):

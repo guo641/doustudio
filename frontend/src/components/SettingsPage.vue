@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
-import { Database, Save } from '@lucide/vue';
-import { backupDatabase, getSettings, saveSettings } from '../api';
+import { Database, Save, Download } from '@lucide/vue';
+import { backupDatabase, checkUpdate, getSettings, saveSettings } from '../api';
 import { DpButton, DpCard, DpEmpty, DpField, DpInput, DpSelect } from '@/ui';
 
 type Settings = {
@@ -55,6 +55,39 @@ async function backup() {
     message.value = `备份已保存：${result.path}`;
   } catch (e) {
     message.value = e instanceof Error ? e.message : '备份失败';
+  }
+}
+
+const currentVersion = ref('未知');
+const latestVersion = ref('');
+const releaseUrl = ref('');
+const hasUpdate = ref(false);
+const updateNote = ref('');
+const checkingUpdate = ref(false);
+
+onMounted(async () => {
+  try {
+    const health = await fetch('/api/health').then((r) => r.json());
+    if (health?.version) currentVersion.value = health.version;
+  } catch {
+    /* 离线模式,version 维持未知 */
+  }
+});
+
+async function onCheckUpdate() {
+  checkingUpdate.value = true;
+  try {
+    const info = await checkUpdate();
+    latestVersion.value = info.latest_version;
+    releaseUrl.value = info.release_url;
+    hasUpdate.value = info.has_update;
+    updateNote.value = info.has_update
+      ? `发现新版本 ${info.latest_version}(当前 ${info.current_version})`
+      : `已是最新版本 ${info.latest_version}`;
+  } catch (e) {
+    message.value = e instanceof Error ? e.message : '检查更新失败';
+  } finally {
+    checkingUpdate.value = false;
   }
 }
 </script>
@@ -174,6 +207,35 @@ async function backup() {
       </template>
     </DpCard>
 
+    <DpCard wide title="检查更新" description="自动检查 GitHub Releases 是否有新版本">
+      <div class="fields">
+        <DpField label="当前版本" span2>
+          <DpInput :model-value="currentVersion" readonly />
+        </DpField>
+        <DpField label="最新版本" span2>
+          <DpInput :model-value="latestVersion || '尚未检查'" readonly />
+        </DpField>
+        <DpField span2 v-if="updateNote">
+          <span class="watermark-hint">{{ updateNote }}</span>
+        </DpField>
+      </div>
+      <template #footer>
+        <DpButton @click="onCheckUpdate" :disabled="checkingUpdate">
+          <Download :size="14" />
+          {{ checkingUpdate ? '检查中…' : '检查更新' }}
+        </DpButton>
+        <a
+          v-if="releaseUrl && hasUpdate"
+          :href="releaseUrl"
+          target="_blank"
+          rel="noopener"
+          class="release-link"
+        >
+          下载 {{ latestVersion }} →
+        </a>
+      </template>
+    </DpCard>
+
     <div class="footer">
       <span class="footer-msg" :class="{ ok: message === '设置已保存' }">{{ message }}</span>
       <DpButton variant="primary" :disabled="saving" @click="save">
@@ -242,6 +304,18 @@ async function backup() {
   padding: 1px 6px;
   border-radius: 4px;
   font-size: 11.5px;
+}
+
+.release-link {
+  margin-left: 12px;
+  color: var(--accent, #3b82f6);
+  text-decoration: none;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.release-link:hover {
+  text-decoration: underline;
 }
 
 @media (max-width: 900px) {
