@@ -13,3 +13,7 @@ build/
 dist/
 ms-playwright/
 *.spec.bak
+
+# DoubaoManager 上游带的 Windows uv 嵌入(我们用 pip 即可)
+tools/
+
