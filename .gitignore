@@ -1,0 +1,33 @@
+.superpowers/
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/coverage/
+data/
+*.log
+*.sqlite3
+*.sqlite3-journal
+.DS_Store
+build/
+dist/
+ms-playwright/
+*.spec.bak
+*.exe
+
+# DoubaoManager 上游带的 Windows uv 嵌入(我们用 pip 即可)
+tools/
+
+# 本地 IDE / Claude 残留
+.vscode/
+.idea/
+.claude/
+
+# 用户环境(避免泄漏 token)
+.env
+.env.local
+
