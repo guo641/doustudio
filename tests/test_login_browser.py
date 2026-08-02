@@ -1,6 +1,12 @@
 import threading
+import time
 
-from doupool.login.browser import _try_verify, wait_for_identity
+from doupool.login.browser import (
+    _cookie_poll_loop,
+    _retry_verify,
+    _try_verify,
+    wait_for_identity,
+)
 from doupool.login.detector import DoubaoIdentity, DoubaoLoginDetector
 from playwright.sync_api import Error as PlaywrightError
 
@@ -175,3 +181,197 @@ def test_try_verify_returns_none_when_context_not_logged_in():
     detector = DoubaoLoginDetector()
 
     assert _try_verify(detector, context) is None
+
+
+# ---------------------------------------------------------------------------
+# Round 6:cookie poll daemon + retry verify
+# ---------------------------------------------------------------------------
+
+
+class FakeCookieContext:
+    """模拟 Playwright BrowserContext,只暴露 cookies()。detector.verify 走 _try_verify
+    时被 detector.verify 替换成 lambda 短路掉,所以这里不需要实现 request"""
+
+    def __init__(self, cookies, identity=None):
+        self._cookies = cookies
+        self._identity = identity
+
+    def cookies(self):
+        return list(self._cookies)
+
+
+def test_cookie_poll_loop_sets_identity_when_doubao_cookies_appear():
+    """doubao.com cookie 出现 → 触发 verify 并 set identity_ready"""
+    cookies = [
+        {"name": "sessionid", "domain": ".doubao.com", "value": "xxx"},
+    ]
+    context = FakeCookieContext(
+        cookies,
+        identity=DoubaoIdentity("user-poll", "轮询命中"),
+    )
+    # verify 直接走 detector,但 detector.verify 调 request_api.get;
+    # 给一个让 detector.verify 拿到 identity 的包装
+    detector = DoubaoLoginDetector()
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    lock = threading.Lock()
+    cancel = threading.Event()
+
+    # 替换 detector.verify → 直接返回 identity,跳过真实 HTTP
+    detector.verify = lambda _ctx: DoubaoIdentity("user-poll", "轮询命中")  # type: ignore[assignment]
+
+    _cookie_poll_loop(
+        context, ready, identities, lock,
+        detector, cancel, poll_interval=0.05,
+    )
+
+    assert ready.is_set()
+    assert identities and identities[0].user_id == "user-poll"
+
+
+def test_cookie_poll_loop_exits_when_context_closed():
+    """cookies() 抛异常 → 线程退出,不挂住"""
+    class ClosedContext:
+        def cookies(self):
+            raise RuntimeError("context has been closed")
+
+    detector = DoubaoLoginDetector()
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    lock = threading.Lock()
+    cancel = threading.Event()
+
+    # 应该正常退出,不抛
+    _cookie_poll_loop(
+        ClosedContext(), ready, identities, lock,
+        detector, cancel, poll_interval=0.05,
+    )
+
+    assert not ready.is_set()
+    assert identities == []
+
+
+def test_cookie_poll_loop_ignores_non_doubao_cookies():
+    """没 doubao.com cookie → 不触发 verify,identity_ready 仍 False"""
+    cookies = [{"name": "_ga", "domain": ".google.com", "value": "x"}]
+    context = FakeCookieContext(cookies)
+    detector = DoubaoLoginDetector()
+    detector.verify = lambda _ctx: None  # type: ignore[assignment]
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    lock = threading.Lock()
+    cancel = threading.Event()
+
+    # 后台跑 poll loop,验证 verify 没被调用
+    t = threading.Thread(
+        target=_cookie_poll_loop,
+        args=(context, ready, identities, lock, detector, cancel),
+        kwargs={"poll_interval": 0.05},
+        daemon=True,
+    )
+    t.start()
+    time.sleep(0.2)  # 让它 poll 几轮
+    cancel.set()  # 触发退出
+    t.join(timeout=1.0)
+
+    assert not ready.is_set()
+    assert identities == []
+    assert not t.is_alive(), "poll loop 应该在 cancel 后退出"
+
+
+def test_retry_verify_returns_first_success():
+    """verify 前两次返回 None,第三次成功 → 返回 identity"""
+
+    class FlakyVerifyDetector:
+        def __init__(self):
+            self.calls = 0
+
+        def verify(self, _ctx):
+            self.calls += 1
+            if self.calls < 3:
+                return None
+            return DoubaoIdentity("u-retry", "重试命中")
+
+    detector = FlakyVerifyDetector()
+    context = FakeCookieContext([])
+
+    identity = _retry_verify(
+        detector, context, threading.Event(),
+        retries=3, backoff=0.01,
+    )
+
+    assert identity is not None
+    assert identity.user_id == "u-retry"
+    assert detector.calls == 3
+
+
+def test_retry_verify_returns_none_when_all_fail():
+    """verify 始终返回 None → 返回 None(不抛)"""
+    class AlwaysFailDetector:
+        def verify(self, _ctx):
+            return None
+
+    detector = AlwaysFailDetector()
+    context = FakeCookieContext([])
+
+    assert _retry_verify(
+        detector, context, threading.Event(),
+        retries=3, backoff=0.01,
+    ) is None
+
+
+def test_wait_identity_retries_verify_before_raising_on_page_close():
+    """page 已关且 verify 多次失败 → 调多次 verify 后才 raise"""
+    call_count = {"n": 0}
+
+    class CountingDetector:
+        def verify(self, _ctx):
+            call_count["n"] += 1
+            return None  # 永远拿不到
+
+    detector = CountingDetector()
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    page = EventPumpingPage(ready, identities)
+    page.closed = True
+    context = FakeCookieContext([])
+
+    try:
+        wait_for_identity(
+            page, ready, identities, threading.Event(),
+            detector=detector, context=context,
+        )
+    except RuntimeError as exc:
+        assert "登录窗口已关闭" in str(exc)
+    else:
+        raise AssertionError("应该抛 RuntimeError")
+
+    # retry 3 次,verify 应该被调用 3 次
+    assert call_count["n"] == 3
+
+
+def test_wait_identity_recovers_when_verify_succeeds_on_retry():
+    """page 已关,但 verify 重试第 2 次成功 → 正常返回 identity"""
+    call_count = {"n": 0}
+
+    class SucceedOnSecondDetector:
+        def verify(self, _ctx):
+            call_count["n"] += 1
+            if call_count["n"] < 2:
+                return None
+            return DoubaoIdentity("u-late", "迟到但成功")
+
+    detector = SucceedOnSecondDetector()
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    page = EventPumpingPage(ready, identities)
+    page.closed = True
+    context = FakeCookieContext([])
+
+    identity = wait_for_identity(
+        page, ready, identities, threading.Event(),
+        detector=detector, context=context,
+    )
+
+    assert identity.user_id == "u-late"
+    assert call_count["n"] == 2

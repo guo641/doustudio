@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
 
 ACCOUNT_INFO_URL = "https://www.doubao.com/passport/web/account/info/"
+_LOG = logging.getLogger("doupool.login")
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,19 +102,27 @@ class DoubaoLoginDetector:
         request_api = getattr(page_or_context, "context", page_or_context).request
         try:
             response = request_api.get(ACCOUNT_INFO_URL)
-        except Exception:
+        except Exception as exc:
+            _LOG.warning("verify(): context.request.get 失败: %s", exc)
             return None
-        if not response.ok or response.status != 200:
+        if not response.ok:
+            _LOG.warning("verify(): account/info 返回 status=%s", response.status)
             return None
         try:
             payload = response.json()
-        except Exception:
+        except Exception as exc:
+            _LOG.warning("verify(): account/info 响应不是 JSON: %s", exc)
             return None
         if payload.get("code") not in (0, None):
+            _LOG.debug("verify(): account/info code=%s(非登录态)", payload.get("code"))
             return None
         data = payload.get("data") or {}
         user = data.get("user") or {}
         user_id = user.get("user_id") or data.get("user_id") or data.get("id")
         if not user_id:
+            _LOG.debug("verify(): account/info 无 user_id,视为未登录")
             return None
-        return DoubaoIdentity(str(user_id), user.get("name") or data.get("name"))
+        identity = DoubaoIdentity(str(user_id), user.get("name") or data.get("name"))
+        _LOG.info("verify(): 已验证登录 user_id=%s nickname=%s",
+                  identity.user_id, identity.nickname)
+        return identity
