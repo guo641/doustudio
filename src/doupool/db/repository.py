@@ -41,7 +41,10 @@ class AccountRepository:
     ) -> Account:
         user_id = identity.get("user_id")
         if not user_id:
-            raise ValueError("identity.user_id is required")
+            raise ValueError(
+                "identity.user_id is required "
+                "(v0.2.7: 无法从 cookies/localStorage 提取, 请重新扫码登录)"
+            )
         nickname = identity.get("nickname")
         now = utcnow()
         with self.database.atomic():

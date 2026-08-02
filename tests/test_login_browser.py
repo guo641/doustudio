@@ -1,20 +1,27 @@
+"""v0.2.7:沿 yaonieyo/doubao-account-pool 双轨判定测试。
+
+不再测试 on_response / /passport/web/account/info/ 调用 —— 字节系 aegis 风控
+把所有非浏览器指纹请求拒为 1011。我们只信 Chromium 自己看到的:
+  Tier 1: context.cookies() doubao.com cookie 计数
+  Tier 2: page.evaluate DOM innerText 不含登录关键词
+  user_id: page.evaluate localStorage.__tea_cache_tokens_497858.user_unique_id
+"""
 import json
 import threading
-import time
 from pathlib import Path
 
 from doupool.login.browser import (
-    _context_has_doubao_cookie,
+    LOGGED_OUT_KEYWORDS,
+    _context_doubao_cookie_count,
+    _extract_user_id_from_cookies,
     _is_doubao_cookie,
-    _safe_page_verify,
-    _safe_request_verify,
-    _save_account_info_to_disk,
+    _page_looks_logged_in,
+    _read_user_unique_id_from_page,
     _save_doubao_cookies_to_disk,
-    _try_one_verify,
-    _try_rescue_cookies,
+    _try_rescue_for_fallback,
     wait_for_identity,
 )
-from doupool.login.detector import DoubaoIdentity, DoubaoLoginDetector
+from doupool.login.detector import DoubaoIdentity
 from doupool.login.service import _verify_from_disk
 from playwright.sync_api import Error as PlaywrightError
 
@@ -25,12 +32,21 @@ from playwright.sync_api import Error as PlaywrightError
 
 
 class FakePage:
-    """page 假对象,可控制 is_closed / evaluate / url"""
+    """v0.2.7 FakePage:支持 evaluate_queue(按 evaluate 调用顺序返回不同值),
+    因为新主循环对同一 page 调两次 evaluate(一次 DOM,一次 localStorage)。"""
 
-    def __init__(self, alive=True, evaluate_payload=None, evaluate_raises=None):
+    def __init__(
+        self,
+        alive=True,
+        evaluate_payload=None,
+        evaluate_raises=None,
+        evaluate_queue=None,
+    ):
         self._alive = alive
         self._evaluate_payload = evaluate_payload
         self._evaluate_raises = evaluate_raises
+        self._evaluate_queue = list(evaluate_queue) if evaluate_queue else None
+        self._evaluate_calls: list[str] = []
         self.url = "https://www.doubao.com/"
 
     def is_closed(self):
@@ -38,24 +54,25 @@ class FakePage:
             raise self._evaluate_raises["is_closed"]
         return not self._alive
 
-    def evaluate(self, _script):
+    def evaluate(self, script):
+        self._evaluate_calls.append(script)
         if self._evaluate_raises and "evaluate" in self._evaluate_raises:
             raise self._evaluate_raises["evaluate"]
+        if self._evaluate_queue:
+            try:
+                return self._evaluate_queue.pop(0)
+            except IndexError:
+                return None
         return self._evaluate_payload
 
     def wait_for_timeout(self, ms):
-        # 测试里不要真 sleep;只是让 pump 一次
         pass
 
 
 class FakeContext:
-    def __init__(self, alive=True, cookies=None, request_identity=None, pages=None):
+    def __init__(self, alive=True, cookies=None, pages=None):
         self._alive = alive
         self._cookies = cookies or []
-        self._request_identity = request_identity
-        self._request_calls = 0
-        # 默认有一个 alive page,让 _save_account_info_to_disk 走通。
-        # 测试里想测"无 active page"路径就显式传 pages=[] 或 pages=[FakePage(alive=False)]
         self._pages = pages if pages is not None else [FakePage(alive=True)]
 
     def is_closed(self):
@@ -63,9 +80,6 @@ class FakeContext:
 
     @property
     def pages(self):
-        """Playwright BrowserContext.pages —— 返回当前打开的 page 列表(快照)。
-        _save_account_info_to_disk 用 hasattr(context, "pages") 判断后,
-        再 [_page_is_alive(p) for p in context.pages] 过滤。"""
         return list(self._pages)
 
     def cookies(self):
@@ -73,46 +87,23 @@ class FakeContext:
             raise PlaywrightError("Target page, context or browser has been closed")
         return list(self._cookies)
 
-    @property
-    def request(self):
-        """detector.verify() 期望 .request.get(url),所以是属性 + 可调对象。"""
-        outer = self
-
-        class _Req:
-            def get(self, url):
-                outer._request_calls += 1
-                if not outer._alive:
-                    raise PlaywrightError("Request context disposed")
-                if outer._request_identity is None:
-                    raise PlaywrightError("account/info code=-1")
-                from doupool.login.detector import ACCOUNT_INFO_URL
-                assert url == ACCOUNT_INFO_URL
-                return _FakeResponse(outer._request_identity)
-
-        return _Req()
-
     def wait_for_event(self, event_name, timeout=None):
-        """主循环在没有 active page 时用 context.wait_for_event('page', timeout) pump 事件。
-        测试里不需要真等,只是模拟一次空转,直接返回 None。"""
         return None
 
 
-class _FakeResponse:
-    def __init__(self, identity):
-        self.identity = identity
-        self.ok = True
-        self.status = 200
+class _FakeCancelingPage(FakePage):
+    """每次 evaluate 后调一次 after_evaluate(callback)。用于测试"等待 N 次
+    evaluate 后用户取消"的场景,避免主循环真死锁卡 pytest。"""
 
-    def json(self):
-        return {
-            "code": 0,
-            "data": {
-                "user": {
-                    "user_id": self.identity.user_id,
-                    "name": self.identity.nickname,
-                }
-            },
-        }
+    def __init__(self, alive=True, evaluate_payload=None, after_evaluate=None):
+        super().__init__(alive=alive, evaluate_payload=evaluate_payload)
+        self._after_evaluate = after_evaluate
+
+    def evaluate(self, script):
+        result = super().evaluate(script)
+        if self._after_evaluate is not None:
+            self._after_evaluate(script)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -127,302 +118,152 @@ def test_is_doubao_cookie_matches_doubao_domain():
     assert _is_doubao_cookie({"domain": None, "name": "x"}) is False
 
 
-def test_context_has_doubao_cookie_detects_login_state():
+def test_context_doubao_cookie_count_counts_only_doubao_with_value():
     ctx = FakeContext(cookies=[
-        {"name": "sessionid", "domain": ".doubao.com", "value": "x"},
+        {"name": "sessionid", "value": "abc", "domain": ".doubao.com"},
+        {"name": "_ga", "value": "x", "domain": ".google.com"},
+        {"name": "uid_tt", "value": "", "domain": ".doubao.com"},  # 空 value 不计
+        {"name": "user_unique_id", "value": "u-1", "domain": "doubao.com"},
     ])
-    assert _context_has_doubao_cookie(ctx) is True
+    assert _context_doubao_cookie_count(ctx) == 2
 
 
-def test_context_has_doubao_cookie_false_when_only_third_party():
+def test_context_doubao_cookie_count_zero_when_no_doubao_cookie():
     ctx = FakeContext(cookies=[
-        {"name": "_ga", "domain": ".google.com", "value": "x"},
+        {"name": "_ga", "value": "x", "domain": ".google.com"},
     ])
-    assert _context_has_doubao_cookie(ctx) is False
+    assert _context_doubao_cookie_count(ctx) == 0
 
 
-def test_context_has_doubao_cookie_false_when_context_closed():
-    ctx = FakeContext(alive=False, cookies=[])
-    assert _context_has_doubao_cookie(ctx) is False  # 不抛异常
-
-
-def test_safe_request_verify_returns_identity_when_context_alive():
-    identity = DoubaoIdentity("u-req", "request-命中")
-    ctx = FakeContext(request_identity=identity)
-    detector = DoubaoLoginDetector()
-
-    got = _safe_request_verify(detector, ctx)
-
-    assert got is not None
-    assert got.user_id == "u-req"
-    assert ctx._request_calls == 1
-
-
-def test_safe_request_verify_returns_none_when_context_closed():
-    ctx = FakeContext(alive=False, request_identity=DoubaoIdentity("x", "y"))
-    detector = DoubaoLoginDetector()
-
-    assert _safe_request_verify(detector, ctx) is None
-    assert ctx._request_calls == 0  # 早退,不调 request
-
-
-def test_safe_page_verify_returns_identity_from_payload():
-    identity_payload = {
-        "code": 0,
-        "data": {"user": {"user_id": "u-page", "name": "page-命中"}},
-    }
-    page = FakePage(evaluate_payload=identity_payload)
-    detector = DoubaoLoginDetector()
-
-    got = _safe_page_verify(detector, page)
-
-    assert got is not None
-    assert got.user_id == "u-page"
-    assert got.nickname == "page-命中"
-
-
-def test_safe_page_verify_returns_none_on_navigation_destroyed():
-    page = FakePage(evaluate_raises={"evaluate": PlaywrightError("Execution context destroyed")})
-    detector = DoubaoLoginDetector()
-
-    assert _safe_page_verify(detector, page) is None
-
-
-def test_safe_page_verify_returns_none_when_page_closed():
-    page = FakePage(alive=False, evaluate_payload={"code": 0, "data": {}})
-    detector = DoubaoLoginDetector()
-
-    assert _safe_page_verify(detector, page) is None
-
-
-def test_safe_page_verify_returns_none_on_fetch_error_payload():
-    page = FakePage(evaluate_payload={"__err": "Failed to fetch"})
-    detector = DoubaoLoginDetector()
-
-    assert _safe_page_verify(detector, page) is None
-
-
-def test_try_one_verify_prefers_page_evaluate():
-    """page.evaluate 命中 → 不调 context.request,只返回 page 路径的 identity"""
-    page_payload = {
-        "code": 0,
-        "data": {"user": {"user_id": "u-page", "name": "page"}},
-    }
-    page = FakePage(evaluate_payload=page_payload)
-    ctx = FakeContext(
-        alive=True,
-        cookies=[{"name": "sessionid", "domain": ".doubao.com"}],
-        request_identity=DoubaoIdentity("u-req", "req"),  # 不应被调
-    )
-    detector = DoubaoLoginDetector()
-
-    identity = _try_one_verify(detector, [page], ctx)
-
-    assert identity is not None
-    assert identity.user_id == "u-page"
-    assert ctx._request_calls == 0
-
-
-def test_try_one_verify_falls_back_to_context_request():
-    """page.evaluate 失败 + cookie 已写入 → fallback 到 context.request"""
-    page = FakePage(evaluate_raises={"evaluate": PlaywrightError("Target closed")})
-    ctx = FakeContext(
-        alive=True,
-        cookies=[{"name": "sessionid", "domain": ".doubao.com"}],
-        request_identity=DoubaoIdentity("u-req", "req-fallback"),
-    )
-    detector = DoubaoLoginDetector()
-
-    identity = _try_one_verify(detector, [page], ctx)
-
-    assert identity is not None
-    assert identity.user_id == "u-req"
-
-
-def test_try_one_verify_returns_none_when_no_cookie_no_identity():
-    page = FakePage(evaluate_payload={"__err": "fetch failed"})
-    ctx = FakeContext(alive=True, cookies=[], request_identity=None)
-    detector = DoubaoLoginDetector()
-
-    assert _try_one_verify(detector, [page], ctx) is None
-
-
-# ---------------------------------------------------------------------------
-# wait_for_identity 行为测试
-# ---------------------------------------------------------------------------
-
-
-def test_wait_identity_returns_immediately_when_on_response_already_set():
-    ready = threading.Event()
-    identities = [DoubaoIdentity("u-fast", "on-response 先到")]
-    ready.set()
-
-    page = FakePage(alive=True)
-    ctx = FakeContext(alive=True)
-
-    identity = wait_for_identity(
-        lambda: [page], ready, identities, threading.Event(),
-        detector=DoubaoLoginDetector(), context=ctx,
-    )
-
-    assert identity.user_id == "u-fast"
-
-
-def test_wait_identity_returns_via_page_evaluate():
-    """正常路径:active page + evaluate 命中 → 返回 identity"""
-    ready = threading.Event()
-    identities: list[DoubaoIdentity] = []
-    identity_payload = {
-        "code": 0,
-        "data": {"user": {"user_id": "u-page-eval", "name": "page-eval"}},
-    }
-    page = FakePage(alive=True, evaluate_payload=identity_payload)
-    ctx = FakeContext(alive=True)
-
-    identity = wait_for_identity(
-        lambda: [page], ready, identities, threading.Event(),
-        detector=DoubaoLoginDetector(), context=ctx,
-    )
-
-    assert identity.user_id == "u-page-eval"
-
-
-def test_wait_identity_returns_via_context_request_after_page_closed():
-    """原 page 已关 + cookie 已写入 + context 还在 → grace period 内 verify 命中"""
-    ready = threading.Event()
-    identities: list[DoubaoIdentity] = []
-
-    class _Ctx(FakeContext):
-        def cookies(self):
-            return [{"name": "sessionid", "domain": ".doubao.com"}]
-
-        @property
-        def request(self):
-            outer = self
-
-            class Req:
-                def get(self, url):
-                    outer._request_calls += 1
-                    return _FakeResponse(DoubaoIdentity("u-grace", "grace"))
-
-            return Req()
-
-    ctx = _Ctx(alive=True, request_identity=DoubaoIdentity("u-grace", "grace"))
-
-    def pages_provider():
-        # 第一轮返回 closed page(模拟 navigation 已关),后续保持这样
-        return [FakePage(alive=False)]
-
-    identity = wait_for_identity(
-        pages_provider, ready, identities, threading.Event(),
-        detector=DoubaoLoginDetector(), context=ctx,
-    )
-
-    assert identity.user_id == "u-grace"
-
-
-def test_wait_identity_raises_when_no_page_no_cookie_after_grace():
-    """无 active page + 没 cookie + grace 过了 → raise"""
-    ready = threading.Event()
-    identities: list[DoubaoIdentity] = []
-    ctx = FakeContext(alive=True, cookies=[])
-
-    def pages_provider():
-        return [FakePage(alive=False)]
-
-    try:
-        wait_for_identity(
-            pages_provider, ready, identities, threading.Event(),
-            detector=DoubaoLoginDetector(), context=ctx,
-        )
-    except RuntimeError as exc:
-        assert "登录窗口已关闭" in str(exc)
-    else:
-        raise AssertionError("应该 raise RuntimeError")
-
-
-def test_wait_identity_raises_when_context_closed():
-    """context 直接关掉 → raise"""
-    ready = threading.Event()
-    identities: list[DoubaoIdentity] = []
-    page = FakePage(alive=True, evaluate_payload={"code": 0, "data": {}})
-    ctx = FakeContext(alive=False)
-
-    try:
-        wait_for_identity(
-            lambda: [page], ready, identities, threading.Event(),
-            detector=DoubaoLoginDetector(), context=ctx,
-        )
-    except RuntimeError as exc:
-        assert "登录窗口已关闭" in str(exc)
-    else:
-        raise AssertionError("应该 raise RuntimeError")
-
-
-def test_wait_identity_resets_grace_when_new_page_appears():
-    """原 page 关掉后,新 page 出现 → grace 重置,不立即 raise"""
-    ready = threading.Event()
-    identities: list[DoubaoIdentity] = []
-    ctx = FakeContext(alive=True, cookies=[
-        {"name": "sessionid", "domain": ".doubao.com"},
+def test_context_doubao_cookie_count_zero_when_context_closed():
+    ctx = FakeContext(alive=False, cookies=[
+        {"name": "sessionid", "value": "x", "domain": ".doubao.com"},
     ])
+    assert _context_doubao_cookie_count(ctx) == 0
 
-    # 用一个状态机模拟:前几轮返回 closed page,后几轮返回 alive page
-    state = {"round": 0, "identity_returned_at": None}
 
-    def pages_provider():
-        state["round"] += 1
-        if state["round"] <= 2:
-            return [FakePage(alive=False)]
-        # 第 3 轮起:新 page 上线 + evaluate 命中
-        if state["identity_returned_at"] is None:
-            state["identity_returned_at"] = state["round"]
-        return [FakePage(
-            alive=True,
-            evaluate_payload={
-                "code": 0,
-                "data": {"user": {"user_id": "u-newpage", "name": "新 page 命中"}},
-            },
-        )]
-
-    identity = wait_for_identity(
-        pages_provider, ready, identities, threading.Event(),
-        detector=DoubaoLoginDetector(), context=ctx,
+def test_page_looks_logged_in_when_no_login_keywords():
+    page = FakePage(
+        alive=True,
+        evaluate_payload="欢迎来到豆包,这是主聊天界面,显示你的对话列表",
     )
-
-    assert identity.user_id == "u-newpage"
-    # 关键:前两轮没 raise,而是等到了第 3 轮新 page
-    assert state["identity_returned_at"] is not None
-    assert state["identity_returned_at"] >= 3
+    assert _page_looks_logged_in(page) is True
 
 
-def test_wait_identity_raises_on_cancel():
-    """cancel_event.set() → raise 登录已取消"""
-    ready = threading.Event()
-    identities: list[DoubaoIdentity] = []
-    page = FakePage(alive=True, evaluate_payload={"__err": "fetch"})
-    ctx = FakeContext(alive=True)
-    cancel = threading.Event()
-    cancel.set()  # 立即 cancel
+def test_page_looks_logged_in_false_when_scan_qr_keyword():
+    page = FakePage(
+        alive=True,
+        evaluate_payload="请使用 豆包 APP 扫码登录,或者切换到手机号登录",
+    )
+    assert _page_looks_logged_in(page) is False
 
-    try:
-        wait_for_identity(
-            lambda: [page], ready, identities, cancel,
-            detector=DoubaoLoginDetector(), context=ctx,
-        )
-    except RuntimeError as exc:
-        assert "登录已取消" in str(exc) or "登录窗口已关闭" in str(exc)
-    else:
-        raise AssertionError("应该 raise")
+
+def test_page_looks_logged_in_false_when_login_register_keyword():
+    page = FakePage(
+        alive=True,
+        evaluate_payload="顶部有 登录/注册 按钮,点击开始体验",
+    )
+    assert _page_looks_logged_in(page) is False
+
+
+def test_page_looks_logged_in_false_when_page_closed():
+    page = FakePage(alive=False, evaluate_payload="无关文本")
+    assert _page_looks_logged_in(page) is False
+
+
+def test_page_looks_logged_in_false_when_evaluate_raises():
+    page = FakePage(
+        alive=True,
+        evaluate_raises={"evaluate": PlaywrightError("Execution context destroyed")},
+    )
+    assert _page_looks_logged_in(page) is False
+
+
+def test_page_looks_logged_in_false_when_evaluate_returns_non_string():
+    page = FakePage(alive=True, evaluate_payload=None)
+    assert _page_looks_logged_in(page) is False
+
+
+def test_read_user_unique_id_from_page_returns_user_unique_id():
+    page = FakePage(
+        alive=True,
+        evaluate_payload={"ok": True, "value": "3830030044314"},
+    )
+    assert _read_user_unique_id_from_page(page) == "3830030044314"
+
+
+def test_read_user_unique_id_falls_back_to_web_id():
+    page = FakePage(
+        alive=True,
+        evaluate_payload={"ok": True, "value": "web-id-7777"},
+    )
+    assert _read_user_unique_id_from_page(page) == "web-id-7777"
+
+
+def test_read_user_unique_id_returns_none_when_no_tea():
+    page = FakePage(
+        alive=True,
+        evaluate_payload={"ok": False},
+    )
+    assert _read_user_unique_id_from_page(page) is None
+
+
+def test_read_user_unique_id_returns_none_when_evaluate_raises():
+    page = FakePage(
+        alive=True,
+        evaluate_raises={"evaluate": PlaywrightError("Target closed")},
+    )
+    assert _read_user_unique_id_from_page(page) is None
+
+
+def test_read_user_unique_id_returns_none_when_evaluate_returns_non_dict():
+    page = FakePage(alive=True, evaluate_payload="not a dict")
+    assert _read_user_unique_id_from_page(page) is None
+
+
+def test_extract_user_id_from_cookies_finds_user_unique_id_hint():
+    cookies = [
+        {"name": "sessionid", "value": "abc", "domain": ".doubao.com"},
+        {"name": "user_unique_id", "value": "u-from-cookie", "domain": "doubao.com"},
+    ]
+    assert _extract_user_id_from_cookies(cookies) == "u-from-cookie"
+
+
+def test_extract_user_id_from_cookies_finds_user_id_hint():
+    cookies = [{"name": "user_id", "value": "u-2", "domain": ".doubao.com"}]
+    assert _extract_user_id_from_cookies(cookies) == "u-2"
+
+
+def test_extract_user_id_from_cookies_finds_uid_hint():
+    cookies = [{"name": "uid", "value": "u-3", "domain": ".doubao.com"}]
+    assert _extract_user_id_from_cookies(cookies) == "u-3"
+
+
+def test_extract_user_id_from_cookies_returns_none_when_no_hint():
+    cookies = [
+        {"name": "sessionid", "value": "abc", "domain": ".doubao.com"},
+        {"name": "_ga", "value": "x", "domain": ".google.com"},
+    ]
+    assert _extract_user_id_from_cookies(cookies) is None
+
+
+def test_extract_user_id_from_cookies_skips_empty_value():
+    cookies = [{"name": "user_unique_id", "value": "", "domain": ".doubao.com"}]
+    assert _extract_user_id_from_cookies(cookies) is None
+
+
+def test_logged_out_keywords_contains_yaonieyo_set():
+    """对标 yaonieyo electron/executor.ts:326-334 关键词集合。"""
+    for kw in ("扫码登录", "手机号登录", "验证码登录", "登录/注册"):
+        assert kw in LOGGED_OUT_KEYWORDS
 
 
 # ---------------------------------------------------------------------------
-# v0.2.5 cookie 抢救 + disk fallback 测试
+# cookies 抢救 + identity 救援
 # ---------------------------------------------------------------------------
 
 
 def test_save_doubao_cookies_writes_only_doubao_domain(tmp_path: Path):
-    """_save_doubao_cookies_to_disk 只写 doubao.com 域 cookie,且不写空 value"""
     cookies = [
         {"name": "sessionid", "value": "abc123", "domain": ".doubao.com",
          "path": "/", "httpOnly": True, "secure": True, "expires": -1},
@@ -442,392 +283,375 @@ def test_save_doubao_cookies_writes_only_doubao_domain(tmp_path: Path):
     assert target.exists()
     payload = json.loads(target.read_text(encoding="utf-8"))
     names = [c["name"] for c in payload]
-    # google 域被过滤,空 value 的 uid_tt 被过滤
     assert names == ["sessionid", "passport_auth_status"]
-    # 保留关键字段
     sess = next(c for c in payload if c["name"] == "sessionid")
     assert sess["httpOnly"] is True
     assert sess["domain"] == ".doubao.com"
 
 
 def test_save_doubao_cookies_returns_false_when_context_closed(tmp_path: Path):
-    """context 已死 → cookies() 抛 PlaywrightError → 返回 False,不写盘"""
     ctx = FakeContext(alive=False, cookies=[
         {"name": "sessionid", "value": "x", "domain": ".doubao.com"},
     ])
-
     ok = _save_doubao_cookies_to_disk(ctx, tmp_path)
-
     assert ok is False
     assert not (tmp_path / "cookies.json").exists()
 
 
 def test_save_doubao_cookies_returns_false_when_no_doubao_cookie(tmp_path: Path):
-    """context 还活着但没有 doubao 域 cookie → 返回 False"""
     ctx = FakeContext(alive=True, cookies=[
         {"name": "_ga", "value": "x", "domain": ".google.com"},
     ])
-
     ok = _save_doubao_cookies_to_disk(ctx, tmp_path)
-
     assert ok is False
     assert not (tmp_path / "cookies.json").exists()
 
 
-def test_try_rescue_cookies_is_noop_when_profile_dir_none():
-    """profile_dir=None 时 _try_rescue_cookies 直接早退,不动 context"""
+def test_rescue_for_fallback_writes_cookies_and_identity(tmp_path: Path):
+    """v0.2.7 关键路径:context 还活着 + 有 doubao cookie + localStorage 有
+    user_unique_id → 抢救后 cookies.json 和 identity.json 都写盘。"""
+    cookies = [
+        {"name": "sessionid", "value": "abc", "domain": ".doubao.com",
+         "path": "/", "httpOnly": True, "secure": False, "expires": -1},
+    ]
+    page = FakePage(
+        alive=True,
+        evaluate_payload={"ok": True, "value": "u-from-localStorage"},
+    )
+    ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
+
+    _try_rescue_for_fallback(ctx, tmp_path)
+
+    assert (tmp_path / "cookies.json").exists()
+    id_payload = json.loads((tmp_path / "identity.json").read_text(encoding="utf-8"))
+    assert id_payload["user_id"] == "u-from-localStorage"
+    assert "rescued_at" in id_payload
+
+
+def test_rescue_for_fallback_noop_when_profile_dir_none():
     ctx = FakeContext(alive=True, cookies=[
         {"name": "sessionid", "value": "x", "domain": ".doubao.com"},
     ])
-
-    _try_rescue_cookies(ctx, None)  # 不抛异常,也不写盘
-
-    assert ctx._request_calls == 0  # 没动 request
+    _try_rescue_for_fallback(ctx, None)
+    # 不抛异常,无副作用
 
 
-def test_wait_identity_rescues_cookies_before_raising_when_context_closed(tmp_path: Path):
-    """v0.2.5 关键路径:context 同毫秒 dispose → raise 之前抢救一次 cookies"""
+def test_rescue_for_fallback_noop_when_context_closed(tmp_path: Path):
+    ctx = FakeContext(alive=False)
+    _try_rescue_for_fallback(ctx, tmp_path)
+    assert not (tmp_path / "cookies.json").exists()
+    assert not (tmp_path / "identity.json").exists()
+
+
+def test_rescue_for_fallback_skips_identity_when_no_active_page(tmp_path: Path):
+    cookies = [{"name": "sessionid", "value": "abc", "domain": ".doubao.com"}]
+    # pages 里只有一个 alive=False 的 page
+    ctx = FakeContext(
+        alive=True, cookies=cookies, pages=[FakePage(alive=False)],
+    )
+    _try_rescue_for_fallback(ctx, tmp_path)
+    # cookies 抢救成功
+    assert (tmp_path / "cookies.json").exists()
+    # identity 没抢救(没有 active page)
+    assert not (tmp_path / "identity.json").exists()
+
+
+def test_rescue_for_fallback_skips_identity_when_localStorage_empty(tmp_path: Path):
+    cookies = [{"name": "sessionid", "value": "abc", "domain": ".doubao.com"}]
+    page = FakePage(alive=True, evaluate_payload={"ok": False})
+    ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
+    _try_rescue_for_fallback(ctx, tmp_path)
+    assert (tmp_path / "cookies.json").exists()
+    assert not (tmp_path / "identity.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# wait_for_identity 主循环
+# ---------------------------------------------------------------------------
+
+
+def test_wait_identity_returns_when_already_set():
+    ready = threading.Event()
+    identities = [DoubaoIdentity("u-fast", None)]
+    ready.set()
+
+    page = FakePage(alive=True)
+    ctx = FakeContext(alive=True)
+
+    identity = wait_for_identity(
+        lambda: [page], ready, identities, threading.Event(),
+        context=ctx,
+    )
+    assert identity.user_id == "u-fast"
+
+
+def test_wait_identity_returns_via_cookie_dom_localstorage():
+    """完整主路径:cookie 出现 + DOM 通过 + localStorage user_unique_id → 命中。"""
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+
+    cookies = [{"name": "sessionid", "value": "abc", "domain": ".doubao.com"}]
+    # evaluate_queue 第一次返 DOM 文本(无登录关键词),第二次返 user_unique_id。
+    # 注意 LOGGED_OUT_KEYWORDS 含 "登录" 兜底词,DOM payload 必须避开这两个字。
+    page = FakePage(
+        alive=True,
+        evaluate_queue=[
+            "欢迎使用豆包 AI,这是对话列表页面",  # DOM 探测
+            {"ok": True, "value": "u-from-tea"},     # localStorage 探测
+        ],
+    )
+    ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
+
+    identity = wait_for_identity(
+        lambda: [page], ready, identities, threading.Event(),
+        context=ctx,
+    )
+    assert identity.user_id == "u-from-tea"
+    assert identity.nickname is None
+
+
+def test_wait_identity_skips_when_dom_still_has_login_keywords():
+    """cookie 有但 DOM 仍含登录关键词 → 不读 localStorage,继续等。"""
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+
+    cookies = [{"name": "sessionid", "value": "abc", "domain": ".doubao.com"}]
+    page = FakePage(
+        alive=True,
+        evaluate_payload="请使用 豆包 APP 扫码登录",  # 永远包含登录关键词
+    )
+    ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
+
+    try:
+        wait_for_identity(
+            lambda: [page], ready, identities, threading.Event(),
+            context=ctx,
+        )
+    except RuntimeError:
+        pass  # grace period 过了 raise
+    # 不论怎样,identity 永远不该被设(因为 DOM 不通过)
+    assert identities == []
+
+
+def test_wait_identity_skips_when_dom_still_has_login_keywords():
+    """cookie 有但 DOM 仍含登录关键词 → 不读 localStorage,继续等。"""
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    cancel = threading.Event()
+
+    cookies = [{"name": "sessionid", "value": "abc", "domain": ".doubao.com"}]
+    # 主循环 `_page_looks_logged_in` 每轮都 evaluate 拿同样字符串 → 永远 False。
+    # 测试不能让 wait_for_identity 自然等 6 秒 grace 退出(那会卡住 pytest),
+    # 用一个 FakePage:每次 evaluate 后 set cancel,模拟用户最终手动取消。
+    def _after_evaluate(script):
+        cancel.set()
+
+    page = _FakeCancelingPage(
+        alive=True,
+        evaluate_payload="请使用 豆包 APP 扫码登录",
+        after_evaluate=_after_evaluate,
+    )
+    ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
+
+    try:
+        wait_for_identity(
+            lambda: [page], ready, identities, cancel,
+            context=ctx,
+        )
+    except RuntimeError as exc:
+        assert "登录已取消" in str(exc)
+    else:
+        raise AssertionError("应该 raise RuntimeError(登录已取消)")
+    # 不论怎样,identity 永远不该被设(因为 DOM 不通过)
+    assert identities == []
+
+
+def test_wait_identity_raises_when_no_page_no_cookie_after_grace():
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    ctx = FakeContext(alive=True, cookies=[])
+
+    def pages_provider():
+        return [FakePage(alive=False)]
+
+    try:
+        wait_for_identity(
+            pages_provider, ready, identities, threading.Event(),
+            context=ctx,
+        )
+    except RuntimeError as exc:
+        assert "登录窗口已关闭" in str(exc)
+    else:
+        raise AssertionError("应该 raise")
+
+
+def test_wait_identity_raises_when_context_closed():
     ready = threading.Event()
     identities: list[DoubaoIdentity] = []
     page = FakePage(alive=True)
-    # context 已死 + cookies() 会抛 PlaywrightError(FakeContext 默认 alive=False 时抛)
     ctx = FakeContext(alive=False)
 
     try:
         wait_for_identity(
             lambda: [page], ready, identities, threading.Event(),
-            detector=DoubaoLoginDetector(), context=ctx,
-            profile_dir=tmp_path,
+            context=ctx,
         )
-    except RuntimeError:
-        pass
+    except RuntimeError as exc:
+        assert "登录窗口已关闭" in str(exc)
     else:
         raise AssertionError("应该 raise")
 
-    # cookies.json 不应被写入(context 已死,抢救必然失败)
-    assert not (tmp_path / "cookies.json").exists()
+
+def test_wait_identity_raises_on_cancel():
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    page = FakePage(alive=True, evaluate_payload="无关")
+    ctx = FakeContext(alive=True)
+    cancel = threading.Event()
+    cancel.set()
+
+    try:
+        wait_for_identity(
+            lambda: [page], ready, identities, cancel,
+            context=ctx,
+        )
+    except RuntimeError as exc:
+        assert "登录已取消" in str(exc)
+    else:
+        raise AssertionError("应该 raise")
 
 
-def test_wait_identity_rescues_cookies_on_grace_timeout(tmp_path: Path):
-    """grace period 超时前抢救一次 cookies(此时 context 还活着)"""
+def test_wait_identity_rescues_on_grace_timeout(tmp_path: Path):
+    """v0.2.7:grace period 超时前抢救 cookies + identity(若 active page 在抢救时存在)。"""
     ready = threading.Event()
     identities: list[DoubaoIdentity] = []
     cookies = [
         {"name": "sessionid", "value": "abc", "domain": ".doubao.com",
          "path": "/", "httpOnly": True, "secure": False, "expires": -1},
     ]
-    ctx = FakeContext(alive=True, cookies=cookies)
+    # 用 evaluate_queue:第一次给 DOM(避开"登录"二字),第二次给 localStorage
+    page = FakePage(
+        alive=True,
+        evaluate_queue=[
+            "豆包 AI 对话页面,显示对话列表和创作入口",
+            {"ok": True, "value": "u-rescue-777"},
+        ],
+    )
+    ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
+
+    # 模拟 page_closed_since 起点:全程返回 closed page
+    def pages_provider():
+        return [FakePage(alive=False)]
 
     try:
         wait_for_identity(
-            lambda: [FakePage(alive=False)], ready, identities,
-            threading.Event(),
-            detector=DoubaoLoginDetector(), context=ctx,
-            profile_dir=tmp_path,
+            pages_provider, ready, identities, threading.Event(),
+            context=ctx, profile_dir=tmp_path,
         )
     except RuntimeError:
         pass
+
+    # grace period 超时后 _try_rescue_for_fallback 应该写盘
+    assert (tmp_path / "cookies.json").exists()
+
+
+def test_wait_identity_raises_when_context_arg_missing():
+    """context=None 时直接 raise,无需其他参数。"""
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    try:
+        wait_for_identity(
+            lambda: [], ready, identities, threading.Event(),
+            context=None,
+        )
+    except RuntimeError as exc:
+        assert "owner thread" in str(exc) or "context" in str(exc).lower()
     else:
         raise AssertionError("应该 raise")
 
-    # grace period 超时后抢救应成功
-    target = tmp_path / "cookies.json"
-    assert target.exists()
-    payload = json.loads(target.read_text(encoding="utf-8"))
-    assert any(c["name"] == "sessionid" for c in payload)
-
 
 # ---------------------------------------------------------------------------
-# _verify_from_disk 测试(httpx fallback)
+# _verify_from_disk 单路径测试
 # ---------------------------------------------------------------------------
 
 
-def test_verify_from_disk_returns_none_when_no_cookies_file(tmp_path: Path):
-    """cookies.json 不存在 → 返回 None(不启动 Chromium)"""
-    import doupool.login.service as svc_mod
-    original = svc_mod._verify_via_persistent_context
-    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
-    try:
-        assert _verify_from_disk(tmp_path) is None
-    finally:
-        svc_mod._verify_via_persistent_context = original
-
-
-def test_verify_from_disk_returns_none_on_malformed_json(tmp_path: Path):
-    """cookies.json 损坏 → 返回 None,不抛异常"""
-    (tmp_path / "cookies.json").write_text("not-json{", encoding="utf-8")
-    import doupool.login.service as svc_mod
-    original = svc_mod._verify_via_persistent_context
-    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
-    try:
-        assert _verify_from_disk(tmp_path) is None
-    finally:
-        svc_mod._verify_via_persistent_context = original
-
-
-def test_verify_from_disk_httpx_call(monkeypatch, tmp_path: Path):
-    """cookies.json + httpx mock 调通 → 返回 identity mapping"""
-    cookies = [
-        {"name": "sessionid", "value": "abc", "domain": ".doubao.com"},
-        {"name": "uid_tt", "value": "u-xyz", "domain": ".doubao.com"},
-    ]
-    (tmp_path / "cookies.json").write_text(
-        json.dumps(cookies), encoding="utf-8"
+def test_verify_from_disk_prefers_identity_json(tmp_path: Path):
+    """identity.json 存在且有 user_id → 直接返回,不看 cookies.json。"""
+    (tmp_path / "identity.json").write_text(
+        json.dumps({"user_id": "u-from-identity", "rescued_at": "2026-08-02T00:00:00Z"}),
+        encoding="utf-8",
     )
-
-    class _FakeResp:
-        status_code = 200
-
-        def json(self):
-            return {
-                "code": 0,
-                "data": {"user": {"user_id": "99999", "name": "disk-命中"}},
-            }
-
-    captured: dict[str, str] = {}
-
-    def fake_get(url, headers=None, timeout=None, follow_redirects=None):
-        captured["url"] = url
-        captured["cookie"] = headers["Cookie"]
-        return _FakeResp()
-
-    import httpx
-    monkeypatch.setattr(httpx, "get", fake_get)
-
-    # 阻止路径 3 启动 Chromium(测试环境跑不起来)
-    import doupool.login.service as svc_mod
-    original = svc_mod._verify_via_persistent_context
-    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
-    try:
-        identity = _verify_from_disk(tmp_path)
-    finally:
-        svc_mod._verify_via_persistent_context = original
-
+    # 也写 cookies.json 但应该不被读到
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([{"name": "sessionid", "value": "abc", "domain": ".doubao.com"}]),
+        encoding="utf-8",
+    )
+    identity = _verify_from_disk(tmp_path)
     assert identity is not None
-    assert identity["user_id"] == "99999"
-    assert identity["nickname"] == "disk-命中"
-    assert "sessionid=abc" in captured["cookie"]
-    assert "uid_tt=u-xyz" in captured["cookie"]
-    assert "passport/web/account/info/" in captured["url"]
+    assert identity["user_id"] == "u-from-identity"
+    assert identity["nickname"] is None
 
 
-def test_verify_from_disk_returns_none_on_non_200(monkeypatch, tmp_path: Path):
-    """httpx 返回 401/302 → 返回 None"""
+def test_verify_from_disk_falls_back_to_cookies_user_unique_id(tmp_path: Path):
+    """没有 identity.json,cookies.json 有 user_unique_id hint → 命中。"""
     (tmp_path / "cookies.json").write_text(
-        json.dumps([{"name": "x", "value": "y", "domain": ".doubao.com"}]),
+        json.dumps([
+            {"name": "sessionid", "value": "abc", "domain": ".doubao.com"},
+            {"name": "user_unique_id", "value": "u-from-cookie", "domain": "doubao.com"},
+        ]),
         encoding="utf-8",
     )
-
-    class _FakeResp:
-        status_code = 401
-
-        def json(self):
-            return {}
-
-    import httpx
-    monkeypatch.setattr(httpx, "get", lambda *a, **kw: _FakeResp())
-
-    import doupool.login.service as svc_mod
-    original = svc_mod._verify_via_persistent_context
-    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
-    try:
-        result = _verify_from_disk(tmp_path)
-    finally:
-        svc_mod._verify_via_persistent_context = original
-    assert result is None
-
-
-def test_verify_from_disk_returns_none_when_account_info_code_nonzero(monkeypatch, tmp_path: Path):
-    """account/info 返回 code=-1(未登录)→ 返回 None"""
-    (tmp_path / "cookies.json").write_text(
-        json.dumps([{"name": "x", "value": "y", "domain": ".doubao.com"}]),
-        encoding="utf-8",
-    )
-
-    class _FakeResp:
-        status_code = 200
-
-        def json(self):
-            return {"code": -1, "message": "not login"}
-
-    import httpx
-    monkeypatch.setattr(httpx, "get", lambda *a, **kw: _FakeResp())
-
-    import doupool.login.service as svc_mod
-    original = svc_mod._verify_via_persistent_context
-    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
-    try:
-        result = _verify_from_disk(tmp_path)
-    finally:
-        svc_mod._verify_via_persistent_context = original
-    assert result is None
-
-
-def test_verify_from_disk_skips_non_doubao_cookies(monkeypatch, tmp_path: Path):
-    """只有 google 域 cookie → 没 Cookie 头 → 返回 None"""
-    (tmp_path / "cookies.json").write_text(
-        json.dumps([{"name": "_ga", "value": "x", "domain": ".google.com"}]),
-        encoding="utf-8",
-    )
-
-    called = {"count": 0}
-
-    import httpx
-    def fake_get(*a, **kw):
-        called["count"] += 1
-        raise AssertionError("应该不调 httpx")
-
-    monkeypatch.setattr(httpx, "get", fake_get)
-
-    import doupool.login.service as svc_mod
-    original = svc_mod._verify_via_persistent_context
-    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
-    try:
-        result = _verify_from_disk(tmp_path)
-    finally:
-        svc_mod._verify_via_persistent_context = original
-    assert result is None
-    assert called["count"] == 0
-
-
-# ---------------------------------------------------------------------------
-# v0.2.6 _save_account_info_to_disk 测试
-# ---------------------------------------------------------------------------
-
-
-def test_save_account_info_returns_false_when_no_active_page(tmp_path: Path):
-    """没有 active page → 返回 False,不写盘"""
-    ctx = FakeContext(alive=True, pages=[])
-
-    ok = _save_account_info_to_disk(ctx, tmp_path)
-
-    assert ok is False
-    assert not (tmp_path / "account_info.json").exists()
-
-
-def test_save_account_info_returns_false_when_context_closed(tmp_path: Path):
-    """context 已死 → 返回 False"""
-    ctx = FakeContext(alive=False, pages=[FakePage(alive=True)])
-
-    ok = _save_account_info_to_disk(ctx, tmp_path)
-
-    assert ok is False
-    assert not (tmp_path / "account_info.json").exists()
-
-
-def test_save_account_info_writes_json_on_success(tmp_path: Path):
-    """page.evaluate 返回 status=200 + code=0 → 写 account_info.json"""
-    identity_payload = {
-        "__status": 200,
-        "__body": json.dumps({
-            "code": 0,
-            "data": {"user": {"user_id": "u-fetch", "name": "fetch-命中"}},
-        }, ensure_ascii=False),
-    }
-    page = FakePage(alive=True, evaluate_payload=identity_payload)
-    ctx = FakeContext(alive=True, pages=[page])
-
-    ok = _save_account_info_to_disk(ctx, tmp_path)
-
-    assert ok is True
-    target = tmp_path / "account_info.json"
-    assert target.exists()
-    saved = json.loads(target.read_text(encoding="utf-8"))
-    assert saved["data"]["user"]["user_id"] == "u-fetch"
-
-
-def test_save_account_info_returns_false_on_non_200(tmp_path: Path):
-    """fetch 返回 status != 200 → 不写盘"""
-    page = FakePage(alive=True, evaluate_payload={
-        "__status": 1011,
-        "__body": '{"error_code":1011,"message":"用户未登录"}',
-    })
-    ctx = FakeContext(alive=True, pages=[page])
-
-    ok = _save_account_info_to_disk(ctx, tmp_path)
-
-    assert ok is False
-    assert not (tmp_path / "account_info.json").exists()
-
-
-def test_save_account_info_returns_false_on_code_nonzero(tmp_path: Path):
-    """fetch 返回 200 但 code != 0(被 aegis 风控拒,仍是 200 但 code=-1)→ 不写盘"""
-    page = FakePage(alive=True, evaluate_payload={
-        "__status": 200,
-        "__body": '{"code":-1,"message":"用户未登录","error_code":1011}',
-    })
-    ctx = FakeContext(alive=True, pages=[page])
-
-    ok = _save_account_info_to_disk(ctx, tmp_path)
-
-    assert ok is False
-    assert not (tmp_path / "account_info.json").exists()
-
-
-def test_save_account_info_returns_false_on_fetch_error_payload(tmp_path: Path):
-    """fetch 在浏览器内抛错 → payload.__err 存在 → 不写盘"""
-    page = FakePage(alive=True, evaluate_payload={"__err": "Failed to fetch"})
-    ctx = FakeContext(alive=True, pages=[page])
-
-    ok = _save_account_info_to_disk(ctx, tmp_path)
-
-    assert ok is False
-    assert not (tmp_path / "account_info.json").exists()
-
-
-def test_save_account_info_returns_false_on_non_json_body(tmp_path: Path):
-    """fetch 返回 200 但 body 不是 JSON → 不写盘"""
-    page = FakePage(alive=True, evaluate_payload={
-        "__status": 200,
-        "__body": "<html>not json</html>",
-    })
-    ctx = FakeContext(alive=True, pages=[page])
-
-    ok = _save_account_info_to_disk(ctx, tmp_path)
-
-    assert ok is False
-    assert not (tmp_path / "account_info.json").exists()
-
-
-# ---------------------------------------------------------------------------
-# _verify_from_disk 路径 1 (account_info.json) 测试
-# ---------------------------------------------------------------------------
-
-
-def test_verify_from_disk_prefers_account_info_over_httpx(tmp_path: Path):
-    """account_info.json 存在 + 是登录态 → 优先用,不调 httpx 也不起 Chromium"""
-    (tmp_path / "account_info.json").write_text(
-        json.dumps({
-            "code": 0,
-            "data": {"user": {"user_id": "u-browser-fetch", "name": "browser-命中"}},
-        }),
-        encoding="utf-8",
-    )
-
-    # 阻止路径 3 启动 Chromium(测试环境没装浏览器跑不起来)
-    import doupool.login.service as svc_mod
-    original = svc_mod._verify_via_persistent_context
-    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
-    try:
-        identity = _verify_from_disk(tmp_path)
-    finally:
-        svc_mod._verify_via_persistent_context = original
-
+    identity = _verify_from_disk(tmp_path)
     assert identity is not None
-    assert identity["user_id"] == "u-browser-fetch"
-    assert identity["nickname"] == "browser-命中"
+    assert identity["user_id"] == "u-from-cookie"
 
 
-def test_verify_from_disk_returns_none_when_account_info_not_login(tmp_path: Path):
-    """account_info.json 存在但 code != 0 → 视为过期,继续走路径 2/3"""
-    (tmp_path / "account_info.json").write_text(
-        json.dumps({"code": -1, "message": "用户未登录"}),
+def test_verify_from_disk_returns_none_when_no_files(tmp_path: Path):
+    """既无 identity.json 也无 cookies.json → None。"""
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_returns_none_on_malformed_identity_json(tmp_path: Path):
+    """identity.json 损坏 → 跳过,尝试 cookies.json。"""
+    (tmp_path / "identity.json").write_text("not-json{", encoding="utf-8")
+    # 没有 cookies.json → 整体返回 None
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_returns_none_on_identity_json_without_user_id(tmp_path: Path):
+    """identity.json 结构合法但没 user_id → fallback 到 cookies.json(也没)→ None。"""
+    (tmp_path / "identity.json").write_text(
+        json.dumps({"rescued_at": "2026-08-02T00:00:00Z"}),
         encoding="utf-8",
     )
-    import doupool.login.service as svc_mod
-    original = svc_mod._verify_via_persistent_context
-    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
-    try:
-        assert _verify_from_disk(tmp_path) is None
-    finally:
-        svc_mod._verify_via_persistent_context = original
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_skips_non_doubao_cookies(tmp_path: Path):
+    """cookies.json 全是非 doubao 域 → 没 user_id hint → None。"""
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([
+            {"name": "_ga", "value": "x", "domain": ".google.com"},
+            {"name": "_fbp", "value": "y", "domain": ".facebook.com"},
+        ]),
+        encoding="utf-8",
+    )
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_handles_corrupt_cookies_json(tmp_path: Path):
+    """cookies.json 损坏 → 捕获,返回 None(不抛)。"""
+    (tmp_path / "cookies.json").write_text("{not-json", encoding="utf-8")
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_falls_through_identity_to_cookies(tmp_path: Path):
+    """identity.json 损坏 → 跳过,继续读 cookies.json(且命中 user_id hint)。"""
+    (tmp_path / "identity.json").write_text("{not-json", encoding="utf-8")
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([{"name": "user_unique_id", "value": "u-fallthrough", "domain": ".doubao.com"}]),
+        encoding="utf-8",
+    )
+    identity = _verify_from_disk(tmp_path)
+    assert identity is not None
+    assert identity["user_id"] == "u-fallthrough"

@@ -3,49 +3,159 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
-from .detector import DoubaoIdentity, DoubaoLoginDetector, ResponseMeta
+from .detector import DoubaoIdentity
 from .service import VerifiedLogin
 
 _LOG = logging.getLogger("doupool.login")
 
 
-# Playwright sync API 的所有调用必须在创建 sync_playwright() 的同一 OS thread / greenlet
-# 内完成(它是 gevent 协程实现,跨线程会触发 "Cannot switch to a different thread")。
-# 所以 v0.2.4 放弃 v0.2.3 的 daemon thread cookie_poll_loop,改在 runner owner thread
-# 内用 page.wait_for_timeout() pump 事件 + context.on('page')/on('framenavigated')/
-# on('close') 监听页面生命周期。
-
-# 在主循环里几次 verify 失败后、还要等多长时间才认定登录失败。
-# 真实场景:doubao navigation 关掉原始 page 后,新 page 可能 1-3 秒后才出现,
-# account/info fetch 也要等 cookie 真正生效,所以保留 grace period。
-GRACE_PERIOD_SECONDS = 6.0
+# v0.2.7:沿 yaonieyo/doubao-account-pool 双轨判定,完全抛弃
+# /passport/web/account/info/ 调用 —— 字节系 aegis 风控会把浏览器外任何
+# 客户端(包括 page.evaluate 内的 fetch)判为指纹不合法,返回 1011。
+#
+# 我们只信 Chromium 进程自己看到的东西:
+#   Tier 1: context.cookies() 是否有 doubao.com 域 cookie
+#   Tier 2: page.evaluate 读 document.body.innerText,不含登录关键词
+#   user_id: page.evaluate 读 localStorage.__tea_cache_tokens_497858.user_unique_id
+#            (本项目 video/browser.py:28 已验证该字段真实存在,兜底 web_id)
+#
+# Playwright sync API 必须在创建 sync_playwright() 的同一 OS thread 内调用
+# (gevent 实现,跨线程会触发 "Cannot switch to a different thread")。所有
+# page.evaluate / context.cookies() 都走 owner thread,不需要 daemon 线程。
+GRACE_PERIOD_SECONDS = 6.0  # 页面全部关闭后的等待窗口(给新 page / cookie 生效)
 LOOP_TICK_MS = 250  # 主循环 sleep 间隔(同时 pump Playwright 事件)
-VERIFY_RETRY_BACKOFF = 0.3  # verify 失败后再次尝试的退避
+VERIFY_RETRY_BACKOFF = 0.3  # user_id 重读退避
+USER_ID_LOCALSTORAGE_KEY = "__tea_cache_tokens_497858"
+
+# DOM 关键词集合 —— 任一命中即视为未登录。
+# 集中维护:doubao 文案改了改这里一处。
+LOGGED_OUT_KEYWORDS = (
+    "扫码登录",   # 桌面端 QR 入口
+    "手机号登录",  # 切换手机号 tab
+    "验证码登录",  # 切换验证码 tab
+    "登录/注册",  # 顶部 CTA
+    "扫码",       # 通用兜底,会被 "扫码登录" 命中,留作未来兼容
+    "登录",       # 兜底,但会跟"已登录用户xxx"误伤 —— 我们用 not any(...) 判定
+)
+
+# cookie 兜底:字节通常不把 user_id 放进 cookie,命中率低,留作最后一道防线。
+_USER_ID_COOKIE_HINTS = ("user_unique_id", "user_id", "uid")
 
 
 def _is_doubao_cookie(cookie: dict) -> bool:
-    """判断 cookie 是否来自 doubao 域。"""
+    """判断 cookie 是否来自 doubao 域(对标 yaonieyo cookies.filter)。"""
     return "doubao.com" in (cookie.get("domain") or "")
 
 
-def _save_doubao_cookies_to_disk(context, profile_dir: Path) -> bool:
+def _context_is_alive(context) -> bool:
+    """Playwright 1.54+ 提供 is_closed(),用于 TOCTOU 提示
+    (调用外层仍必须 try/except,is_closed 和真正调用之间还有时间窗)。"""
+    try:
+        return not context.is_closed()
+    except PlaywrightError:
+        return False
+
+
+def _page_is_alive(page) -> bool:
+    try:
+        return not page.is_closed()
+    except PlaywrightError:
+        return False
+
+
+def _context_doubao_cookie_count(context) -> int:
+    """v0.2.7 Tier 1:返回 context 内 doubao.com 域非空 cookie 数量
+    (对标 yaonieyo electron/main.ts:303-314 `cookies.length > 0`)。"""
+    if not _context_is_alive(context):
+        return 0
+    try:
+        cookies = context.cookies()
+    except PlaywrightError as exc:
+        _LOG.debug("context.cookies() 不可用: %s", exc)
+        return 0
+    return sum(1 for c in cookies if _is_doubao_cookie(c) and c.get("value"))
+
+
+def _page_looks_logged_in(page) -> bool:
+    """v0.2.7 Tier 2:DOM 文本不含登录关键词 → 视为已登录
+    (对标 yaonieyo electron/executor.ts:326-334 looksLoggedOut)。
+
+    注意:由于 "登录" 是 "登录/注册" 的子串,完整关键词集合仍可命中,
+    代价是已登录用户昵称若含"登录"二字会被误判。我们没找到 doubao 实际
+    出现这种情况的证据,如有可在 LOGGED_OUT_KEYWORDS 调整。
     """
-    把 doubao.com 域的 cookie 写到 profile_dir/cookies.json。
+    if not _page_is_alive(page):
+        return False
+    try:
+        text = page.evaluate(
+            "() => document.body ? (document.body.innerText || '') : ''"
+        )
+    except PlaywrightError as exc:
+        _LOG.debug("读 DOM innerText 失败: %s", exc)
+        return False
+    if not isinstance(text, str):
+        return False
+    return not any(keyword in text for keyword in LOGGED_OUT_KEYWORDS)
 
-    真实场景里(用户 v0.2.4 日志):
-        11:38:27  active page removed
-        11:38:27  context.request.get 失败: Request context disposed
-        11:38:27  wait_for_identity: context 已关闭,放弃 verify
 
-    context 在 verify 同一毫秒就 dispose,所有 Playwright API 路径全部失效。
-    但 cookie 早就写到 Chromium 持久化 profile 里了,只要在 context 还活着的
-    那一瞬间抢救一次 context.cookies() 写盘,后续就能用 httpx 调 account/info。
+def _read_user_unique_id_from_page(page) -> str | None:
+    """v0.2.7:从 Chromium 进程内读 localStorage.__tea_cache_tokens_497858。
 
-    返回 True 表示写盘成功,False 表示抢救失败(context 已死)。
+    本项目 src/doupool/video/browser.py:28,33-34 已验证:
+      - tea.user_unique_id 是字节系 web 通用 user_id
+      - 兜底 tea.web_id
+    完全在浏览器进程内读,无 aegis 风险。
+    """
+    if not _page_is_alive(page):
+        return None
+    try:
+        payload = page.evaluate(
+            """
+            () => {
+              try {
+                const raw = localStorage.getItem('__tea_cache_tokens_497858');
+                if (!raw) return { ok: false };
+                const tea = JSON.parse(raw);
+                if (tea && typeof tea === 'object') {
+                  if (tea.user_unique_id) return { ok: true, value: String(tea.user_unique_id) };
+                  if (tea.web_id)         return { ok: true, value: String(tea.web_id) };
+                }
+              } catch (e) { /* JSON parse fail */ }
+              return { ok: false };
+            }
+            """
+        )
+    except PlaywrightError as exc:
+        _LOG.debug("读 user_unique_id 失败: %s", exc)
+        return None
+    if isinstance(payload, dict) and payload.get("ok"):
+        value = payload.get("value")
+        return str(value) if value else None
+    return None
+
+
+def _extract_user_id_from_cookies(cookies: list[dict]) -> str | None:
+    """从 doubao.com 域 cookie 列表中按 hint 顺序找 user_id。
+    字节通常不把 user_id 放进 cookie,这是兜底链最末一环。"""
+    for hint in _USER_ID_COOKIE_HINTS:
+        for c in cookies:
+            if c.get("name") == hint and c.get("value"):
+                return str(c["value"])
+    return None
+
+
+def _iso_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _save_doubao_cookies_to_disk(context, profile_dir: Path) -> bool:
+    """v0.2.7:抢救 doubao.com 域 cookie 到 profile_dir/cookies.json。
+    后续 service 层 disk fallback 会读这个文件用 _extract_user_id_from_cookies 兜底。
     """
     if not _context_is_alive(context):
         return False
@@ -74,7 +184,6 @@ def _save_doubao_cookies_to_disk(context, profile_dir: Path) -> bool:
     try:
         profile_dir.mkdir(parents=True, exist_ok=True)
         target = profile_dir / "cookies.json"
-        # 用临时文件 + rename 保证原子写
         tmp = target.with_suffix(".json.tmp")
         tmp.write_text(
             json.dumps(doubao_cookies, ensure_ascii=False, indent=2),
@@ -89,341 +198,47 @@ def _save_doubao_cookies_to_disk(context, profile_dir: Path) -> bool:
         return False
 
 
-def _save_account_info_to_disk(context, profile_dir: Path) -> bool:
-    """
-    在 Playwright 进程内通过 page.evaluate(fetch) 调
-    /passport/web/account/info/,把响应落到 profile_dir/account_info.json。
+def _try_rescue_for_fallback(context, profile_dir: Path | None) -> None:
+    """v0.2.7 抢救 helper:同时抢救 cookies 和 identity。
 
-    为什么必须用 page.evaluate 而不是 httpx:
-    用户 v0.2.5 实测:cookie 抢救成功 27 条(含 sessionid/uid_tt/ttwid 等),
-    但 httpx 用这些 cookie 调 account/info 始终返回 1011(用户未登录)。
-    根因是字节系 aegis 风控:非浏览器指纹请求被直接拒。
-    在浏览器进程内 fetch 自带浏览器指纹 + HttpOnly cookie + sec-ch-ua
-    等所有 aegis 校验字段,才是唯一权威的检测方式。
+    - cookies 由 Chromium CookieMonster 持有,可直接 context.cookies() 取
+    - identity(user_unique_id)必须 page.evaluate 读 localStorage
 
-    返回 True 表示写盘成功,False 表示抢救失败(没有 active page / context 死 /
-    fetch 抛错 / 响应非登录态等)。
+    抢救对象是 service 层 disk fallback,只读 identity.json / cookies.json。
+    context 已死 → 全失败,静默返回(不抛错,让上层正常处理)。
     """
-    if not _context_is_alive(context):
-        return False
+    if profile_dir is None or not _context_is_alive(context):
+        return
+    _save_doubao_cookies_to_disk(context, profile_dir)
     active_pages = [
-        p for p in context.pages if _page_is_alive(p)
-    ] if hasattr(context, "pages") else []
+        p for p in getattr(context, "pages", []) if _page_is_alive(p)
+    ]
     if not active_pages:
-        _LOG.info("抢救 account_info: 没有 active page,跳过")
-        return False
-    try:
-        payload = active_pages[0].evaluate(
-            """
-            async () => {
-                try {
-                    const resp = await fetch(
-                        'https://www.doubao.com/passport/web/account/info/',
-                        { credentials: 'include', redirect: 'manual' }
-                    );
-                    return {
-                        __status: resp.status,
-                        __body: await resp.text(),
-                    };
-                } catch (e) {
-                    return { __err: String(e) };
-                }
-            }
-            """
-        )
-    except PlaywrightError as exc:
-        _LOG.debug("抢救 account_info 失败(page.evaluate): %s", exc)
-        return False
-    if not isinstance(payload, dict):
-        return False
-    if "__err" in payload:
-        _LOG.debug("抢救 account_info fetch 异常: %s", payload.get("__err"))
-        return False
-    status = payload.get("__status")
-    body = payload.get("__body") or ""
-    if status != 200:
-        _LOG.info("抢救 account_info 返回 status=%s (非登录态或风控)", status)
-        return False
-    try:
-        parsed = json.loads(body)
-    except json.JSONDecodeError as exc:
-        _LOG.warning("抢救 account_info body 不是 JSON: %s", exc)
-        return False
-    # 只在确实是登录态时落盘 —— aegis 风控可能返回 {"error_code":1011} 也
-    # 是 200 OK,但没有 user_id,这种不能用作 fallback。
-    if not isinstance(parsed, dict):
-        return False
-    if parsed.get("code") not in (0, None):
-        _LOG.info("抢救 account_info code=%s (非登录态),不落盘",
-                  parsed.get("code"))
-        return False
+        return
+    user_id = _read_user_unique_id_from_page(active_pages[0])
+    if not user_id:
+        return
     try:
         profile_dir.mkdir(parents=True, exist_ok=True)
-        target = profile_dir / "account_info.json"
+        target = profile_dir / "identity.json"
         tmp = target.with_suffix(".json.tmp")
         tmp.write_text(
-            json.dumps(parsed, ensure_ascii=False, indent=2),
+            json.dumps(
+                {"user_id": user_id, "rescued_at": _iso_now()},
+                ensure_ascii=False,
+            ),
             encoding="utf-8",
         )
         tmp.replace(target)
-        _LOG.info("抢救 account_info 成功: 写到 %s", target)
-        return True
+        _LOG.info("rescue identity: user_unique_id=%s → %s", user_id, target)
     except OSError as exc:
-        _LOG.warning("抢救 account_info 写盘失败: %s", exc)
-        return False
-
-
-def _try_rescue_cookies(context, profile_dir: Path | None) -> None:
-    """
-    抢救 helper:profile_dir 不为 None 时抢救一次。
-    v0.2.6:同时抢救 cookies 和 account_info(后者在浏览器进程内 fetch,
-    绕过 aegis 风控),让 service 层 disk fallback 不依赖 httpx。
-    """
-    if profile_dir is None:
-        return
-    _save_doubao_cookies_to_disk(context, profile_dir)
-    _save_account_info_to_disk(context, profile_dir)
-
-
-def _context_has_doubao_cookie(context) -> bool:
-    """
-    在 owner thread 内调 context.cookies() —— 这是 Playwright sync API 文档推荐的
-    权威 cookie 来源。document.cookie 不可用,因为:
-    1. HttpOnly cookie 不可见(sessionid / uid_tt / passport_auth_status 通常都是)
-    2. domain / path / secure / partition 限制不一定匹配当前文档
-    """
-    try:
-        cookies = context.cookies()
-    except PlaywrightError as exc:
-        _LOG.debug("context.cookies() 不可用: %s", exc)
-        return False
-    return any(_is_doubao_cookie(c) for c in cookies)
-
-
-def _context_is_alive(context) -> bool:
-    """Playwright 1.54+ 提供 is_closed(),用来做 TOCTOU 提示(evaluate/request
-    外层仍必须 try/except,因为 is_closed 和真正调用之间还有时间窗)。"""
-    try:
-        return not context.is_closed()
-    except PlaywrightError:
-        return False
-
-
-def _page_is_alive(page) -> bool:
-    try:
-        return not page.is_closed()
-    except PlaywrightError:
-        return False
-
-
-def _safe_request_verify(detector: DoubaoLoginDetector, context):
-    """
-    用 context.request.get(/passport/web/account/info/) 拿 identity。
-    context 关掉时会抛 Request context disposed / Target page...;都视为
-    "暂时拿不到",不要让一个非确定性错误干掉整个 grace period。
-    """
-    if not _context_is_alive(context):
-        return None
-    try:
-        return detector.verify(context)
-    except PlaywrightError as exc:
-        _LOG.warning("context.request.get 抛 PlaywrightError: %s", exc)
-        return None
-    except Exception:
-        _LOG.exception("verify() 异常")
-        return None
-
-
-def _safe_page_verify(detector: DoubaoLoginDetector, page) -> DoubaoIdentity | None:
-    """
-    通过 page.evaluate() 在浏览器里 fetch /passport/web/account/info/ 拿 identity。
-    浏览器自动带 HttpOnly cookie,这是最权威的检测方式 —— 不受 page.is_closed TOCTOU
-    限制,因为 evaluate 抛错会被外层 catch。
-
-    navigation 中 evaluate 会抛 'Execution context destroyed' / 'Target closed',
-    每次独立 catch,只重试可恢复错误,不要吞整个循环。
-    """
-    if not _page_is_alive(page):
-        return None
-    try:
-        payload = page.evaluate(
-            """
-            async () => {
-                try {
-                    const resp = await fetch(
-                        'https://www.doubao.com/passport/web/account/info/',
-                        { credentials: 'include' }
-                    );
-                    if (!resp.ok) return null;
-                    return await resp.json();
-                } catch (e) {
-                    return { __err: String(e) };
-                }
-            }
-            """
-        )
-    except PlaywrightError as exc:
-        _LOG.debug("page.evaluate(account_info) 抛 PlaywrightError: %s", exc)
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if "__err" in payload:
-        _LOG.debug("page.evaluate fetch 失败: %s", payload.get("__err"))
-        return None
-    return detector.identity_from_response(
-        ResponseMeta(
-            "https://www.doubao.com/passport/web/account/info/",
-            200,
-            "GET",
-        ),
-        payload,
-    )
-
-
-def wait_for_identity(
-    pages_provider,
-    identity_ready: threading.Event,
-    identities: list[DoubaoIdentity],
-    cancel_event: threading.Event,
-    detector: DoubaoLoginDetector | None = None,
-    context=None,
-    profile_dir: Path | None = None,
-):
-    """
-    在 owner thread 内等登录成功的 identity。
-
-    pages_provider: callable () -> list[Page],返回当前 context 下所有 active page
-                    (包括 navigation 后新开 / popup)。用它避免长期持有旧 page 引用,
-                    防止旧 page 被关后误判。
-
-    关键设计:
-    - **不依赖** on_response 事件分发(它会被 Connection.cleanup() 短路吞)
-    - **不依赖** 单一 page 引用(因为 doubao navigation 会换 page)
-    - **不依赖** daemon 线程 cookie poll(gevent 跨线程会死)
-    - **依赖** page.wait_for_timeout(250) 在 owner thread 内 pump 事件 +
-      on('page')/on('framenavigated')/on('close') 同步更新 active_pages
-
-    容错:
-    - 每次 evaluate/request 都独立 try/except,只重试可恢复错误
-    - page 关闭后给 GRACE_PERIOD_SECONDS 时间,等新 page 出现 / cookie 生效 / verify 成功
-    - grace period 内仍拿不到 → 在 raise 之前抢救一次 cookies 到 profile_dir/cookies.json,
-      让 service 层可以走 disk fallback 用 httpx 调 account/info
-    """
-    if detector is None or context is None:
-        raise RuntimeError("wait_for_identity 必须在 owner thread 调用且需要 detector+context")
-
-    last_verify_attempt = 0.0  # 上次尝试 verify 的 wall time
-    page_closed_since: float | None = None  # 第一次检测到原 page 关闭的时间
-
-    while not cancel_event.is_set():
-        # 1. on_response 已经拿到 identity → 立刻返回
-        if identity_ready.is_set() and identities:
-            return identities[0]
-
-        active = list(pages_provider())
-        any_alive = any(_page_is_alive(p) for p in active)
-        has_doubao_cookie = _context_has_doubao_cookie(context)
-        context_alive = _context_is_alive(context)
-
-        # 2. context 已经彻底死了(用户关了浏览器 / 我们 close 了 context)
-        #    Playwright 路径全部失效,但 cookie 已经写到 Chromium 持久化 profile 里。
-        #    最后抢救一次到 profile_dir/cookies.json,让 service 层可以用 httpx 走
-        #    disk fallback 调 account/info 提取 identity。
-        if not context_alive:
-            _LOG.warning("wait_for_identity: context 已关闭,抢救 cookies 后放弃 verify")
-            _try_rescue_cookies(context, profile_dir)
-            if identities:
-                return identities[0]
-            raise RuntimeError("登录窗口已关闭")
-
-        # 3. 周期性 verify(基于 wall time,不依赖 page 计时器)
-        #    只要有 active page 或者 cookie 已写入,就持续尝试。
-        now = _monotonic()
-        verify_due = (now - last_verify_attempt) >= VERIFY_RETRY_BACKOFF
-
-        if verify_due and (any_alive or has_doubao_cookie):
-            last_verify_attempt = now
-            identity = _try_one_verify(detector, active, context)
-            if identity:
-                with _lock_identities(identities, identity_ready):
-                    if not identities:
-                        identities.append(identity)
-                        identity_ready.set()
-                _LOG.info("wait_for_identity: 命中 identity user_id=%s", identity.user_id)
-                return identities[0]
-
-        # 4. page 关闭追踪
-        if not any_alive:
-            if page_closed_since is None:
-                page_closed_since = now
-                _LOG.info("wait_for_identity: 没有 active page,开始 grace period (%.1fs)",
-                          GRACE_PERIOD_SECONDS)
-            elif (now - page_closed_since) >= GRACE_PERIOD_SECONDS:
-                # grace 过了还没新 page 也没拿到 → 真的失败前抢救一次 cookies
-                # 到 profile_dir/cookies.json,让 service 层可以走 disk fallback
-                _LOG.warning("wait_for_identity: grace period 超时 (%.1fs),抢救 cookies",
-                             GRACE_PERIOD_SECONDS)
-                _try_rescue_cookies(context, profile_dir)
-                if identities:
-                    return identities[0]
-                raise RuntimeError("登录窗口已关闭")
-        else:
-            # 有 page 回来了(新 page)→ 重置 grace
-            if page_closed_since is not None:
-                _LOG.info("wait_for_identity: 新 page 出现,重置 grace period")
-            page_closed_since = None
-
-        # 5. pump Playwright 事件。这是 sync API 的关键 —— wait_for_timeout 内部
-        #    在 poll dispatcher,任何 on('page')/on('framenavigated')/on('close')
-        #    注册的回调会在这个调用期间被 dispatch。
-        try:
-            if active and any_alive:
-                active[0].wait_for_timeout(LOOP_TICK_MS)
-            else:
-                # 没有 active page 时不能调 page.wait_for_timeout,会抛 Target closed。
-                # 退到 context.wait_for_event('page', timeout) —— 它会在 owner thread
-                # 内等待新 page,期间 pump 事件;timeout 后返回 None 不算异常。
-                try:
-                    context.wait_for_event("page", timeout=LOOP_TICK_MS / 1000.0)
-                except PlaywrightError as exc:
-                    _LOG.debug("context.wait_for_event('page') 失败: %s", exc)
-        except PlaywrightError as exc:
-            # page 在 sleep 中被关 —— 不 raise,下一轮循环重新检查 page_alive
-            _LOG.debug("wait_for_timeout 抛 PlaywrightError: %s", exc)
-
-        # 6. on_response 可能在 pump 期间被 dispatch
-        if identity_ready.is_set() and identities:
-            return identities[0]
-
-    raise RuntimeError("登录已取消")
-
-
-def _try_one_verify(detector: DoubaoLoginDetector, active_pages, context):
-    """
-    三步 verify,每步独立 try/except:
-    1. 对每个 active page 调 page.evaluate(fetch account/info) —— 最权威(浏览器带 HttpOnly cookie)
-    2. context.request.get(/account/info/) —— 兜底
-    3. 都拿不到时,**只要 cookie 已写入**就保留 grace(由外层处理),不立即失败
-    """
-    # 1. page.evaluate
-    for page in active_pages:
-        identity = _safe_page_verify(detector, page)
-        if identity:
-            return identity
-
-    # 2. context.request
-    if _context_has_doubao_cookie(context):
-        identity = _safe_request_verify(detector, context)
-        if identity:
-            return identity
-
-    return None
+        _LOG.warning("rescue identity 写盘失败: %s", exc)
 
 
 class _LockCtx:
     """最小互斥:保护 identities 写入与 identity_ready.set()"""
 
-    def __init__(self, identities, identity_ready):
+    def __init__(self):
         self._lock = threading.Lock()
 
     def __enter__(self):
@@ -435,8 +250,8 @@ class _LockCtx:
         return False
 
 
-def _lock_identities(identities, identity_ready):
-    return _LockCtx(identities, identity_ready)
+def _lock_identities():
+    return _LockCtx()
 
 
 def _monotonic() -> float:
@@ -444,14 +259,129 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+def wait_for_identity(
+    pages_provider,
+    identity_ready: threading.Event,
+    identities: list[DoubaoIdentity],
+    cancel_event: threading.Event,
+    context=None,
+    profile_dir: Path | None = None,
+) -> DoubaoIdentity:
+    """v0.2.7 重写主循环。
+
+    不再监听 on_response(被 Connection.cleanup() 短路吞),不再调
+    /passport/web/account/info/(aegis 风控拒一切非浏览器指纹请求)。
+
+    判定链(Tier 1 + Tier 2 + localStorage 三件套):
+      1. context.cookies() 有 doubao.com cookie → 可能已登录
+      2. active page 的 DOM innerText 不含登录关键词 → 真的已登录
+      3. page.evaluate 读 localStorage.__tea_cache_tokens_497858.user_unique_id → 拿到 identity
+
+    容错:
+      - 每步独立 try/except
+      - 所有 page 关闭后给 GRACE_PERIOD_SECONDS 时间等新 page / cookie 生效
+      - 放弃前 _try_rescue_for_fallback 把 cookies + user_id 写盘,
+        让 service 层 disk fallback 能用 identity.json / cookies.json 兜底
+    """
+    if context is None:
+        raise RuntimeError("wait_for_identity 必须在 owner thread 调用且需要 context")
+
+    last_user_id_attempt = 0.0
+    page_closed_since: float | None = None
+
+    while not cancel_event.is_set():
+        # 1. 已经有 identity(其他路径设的)→ 立刻返回
+        if identity_ready.is_set() and identities:
+            return identities[0]
+
+        # 2. context 已死 → 最后一次抢救后放弃
+        if not _context_is_alive(context):
+            _LOG.warning("wait_for_identity: context 已关闭,抢救后放弃")
+            _try_rescue_for_fallback(context, profile_dir)
+            if identities:
+                return identities[0]
+            raise RuntimeError("登录窗口已关闭")
+
+        # 3. Tier 1: 有 doubao cookie?
+        cookie_count = _context_doubao_cookie_count(context)
+        has_cookie = cookie_count > 0
+
+        # 4. Tier 2: 找 active page,DOM 探测
+        active = list(pages_provider())
+        any_alive = any(_page_is_alive(p) for p in active)
+        looks_logged_in = False
+        if any_alive and has_cookie:
+            if _page_looks_logged_in(active[0]):
+                looks_logged_in = True
+            else:
+                _LOG.info("cookie 有但 DOM 仍含登录关键词,继续等")
+
+        # 5. localStorage user_id 探针
+        now = _monotonic()
+        if looks_logged_in and (now - last_user_id_attempt) >= VERIFY_RETRY_BACKOFF:
+            last_user_id_attempt = now
+            user_id = _read_user_unique_id_from_page(active[0])
+            if user_id:
+                identity = DoubaoIdentity(user_id=user_id, nickname=None)
+                with _lock_identities():
+                    if not identities:
+                        identities.append(identity)
+                        identity_ready.set()
+                _LOG.info("wait_for_identity: 命中 identity user_id=%s", user_id)
+                return identities[0]
+
+        # 6. grace period —— 全部 page 关闭后等新 page / cookie 生效
+        if not any_alive:
+            if page_closed_since is None:
+                page_closed_since = now
+                _LOG.info(
+                    "wait_for_identity: 没有 active page,开始 grace period (%.1fs)",
+                    GRACE_PERIOD_SECONDS,
+                )
+            elif (now - page_closed_since) >= GRACE_PERIOD_SECONDS:
+                _LOG.warning(
+                    "wait_for_identity: grace period 超时 (%.1fs),抢救 cookies+identity",
+                    GRACE_PERIOD_SECONDS,
+                )
+                _try_rescue_for_fallback(context, profile_dir)
+                if identities:
+                    return identities[0]
+                raise RuntimeError("登录窗口已关闭")
+        else:
+            if page_closed_since is not None:
+                _LOG.info("wait_for_identity: 新 page 出现,重置 grace period")
+            page_closed_since = None
+
+        # 7. pump Playwright 事件
+        try:
+            if active and any_alive:
+                active[0].wait_for_timeout(LOOP_TICK_MS)
+            else:
+                try:
+                    context.wait_for_event("page", timeout=LOOP_TICK_MS / 1000.0)
+                except PlaywrightError as exc:
+                    _LOG.debug("context.wait_for_event('page') 失败: %s", exc)
+        except PlaywrightError as exc:
+            # page 在 sleep 中被关 —— 不 raise,下一轮重新检查
+            _LOG.debug("wait_for_timeout 抛 PlaywrightError: %s", exc)
+
+        # 8. pump 期间可能有外部线程设了 identity_ready
+        if identity_ready.is_set() and identities:
+            return identities[0]
+
+    raise RuntimeError("登录已取消")
+
+
 class PlaywrightLoginRunner:
-    def __init__(self, detector: DoubaoLoginDetector | None = None):
-        self.detector = detector or DoubaoLoginDetector()
+    """v0.2.7:不再依赖 detector,直接走 yaonieyo 双轨判定。"""
+
+    def __init__(self):
+        pass
 
     def run(self, attempt_id, profile_dir: Path, emit, cancel_event: threading.Event):
         identity_ready = threading.Event()
         identities: list[DoubaoIdentity] = []
-        active_pages: list = []  # 由 context.on('page') 维护
+        active_pages: list = []
         active_pages_lock = threading.Lock()
 
         def add_page(page):
@@ -468,33 +398,7 @@ class PlaywrightLoginRunner:
 
         def get_active():
             with active_pages_lock:
-                # 过滤掉已关的(可能 on('close') 还没派发)
                 return [p for p in active_pages if _page_is_alive(p)]
-
-        def on_response(response):
-            try:
-                meta = ResponseMeta(
-                    response.url, response.status, response.request.method
-                )
-                if not self.detector.observe(meta):
-                    return
-                try:
-                    payload = response.json()
-                except Exception:
-                    _LOG.debug("on_response: %s 不是 JSON,跳过", response.url)
-                    return
-                identity = self.detector.identity_from_response(meta, payload)
-            except Exception:
-                _LOG.exception("登录响应处理异常,继续等待下一条")
-                return
-            if identity is None:
-                _LOG.debug("on_response: %s 未提取到 identity", response.url)
-                return
-            _LOG.info("on_response: 检测到登录响应 user_id=%s url=%s",
-                      identity.user_id, response.url)
-            if not identities:
-                identities.append(identity)
-                identity_ready.set()
 
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
@@ -503,21 +407,15 @@ class PlaywrightLoginRunner:
                 viewport={"width": 1100, "height": 760},
             )
 
-            # 必须在 goto 之前注册所有 page 监听,否则 navigation 触发的新 page
-            # / 新 framenavigated 会丢。
             context.on("page", add_page)
-            context.on("response", on_response)
 
             initial_page = context.pages[0] if context.pages else context.new_page()
             add_page(initial_page)
 
-            # page 关闭事件:除了从 active_pages 列表移除,还要抢救 cookies,
-            # 因为 page 关闭后 doubao 前端可能已经拿到了 identity 但 on_response
-            # 回调还没被 dispatcher 处理。context 还活着的这一刻抢救最保险。
             def _on_initial_page_close(_payload):
                 remove_page(initial_page)
-                _LOG.info("initial page closed,尝试抢救 cookies 到 %s", profile_dir)
-                _try_rescue_cookies(context, profile_dir)
+                _LOG.info("initial page closed,尝试抢救 cookies + identity")
+                _try_rescue_for_fallback(context, profile_dir)
 
             initial_page.on("close", _on_initial_page_close)
             initial_page.on(
@@ -526,7 +424,9 @@ class PlaywrightLoginRunner:
             )
 
             try:
-                initial_page.goto("https://www.doubao.com/", wait_until="domcontentloaded")
+                initial_page.goto(
+                    "https://www.doubao.com/", wait_until="domcontentloaded"
+                )
             except PlaywrightError as exc:
                 raise RuntimeError(f"无法打开豆包登录页:{exc}") from exc
             emit("waiting_for_scan", "请在豆包窗口中扫码登录")
@@ -537,16 +437,13 @@ class PlaywrightLoginRunner:
                     identity_ready,
                     identities,
                     cancel_event,
-                    detector=self.detector,
                     context=context,
                     profile_dir=profile_dir,
                 )
                 emit("verifying", "已检测到登录，正在确认账号")
                 return VerifiedLogin(identity.as_mapping(), str(profile_dir))
             finally:
-                # 关闭前最后一次抢救——很多失败路径上 wait_for_identity 已经
-                # 抢救过,但这是幂等的(写同一个 cookies.json),保证落地。
-                _try_rescue_cookies(context, profile_dir)
+                _try_rescue_for_fallback(context, profile_dir)
                 try:
                     context.close()
                 except PlaywrightError:
