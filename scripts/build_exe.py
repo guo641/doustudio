@@ -184,8 +184,9 @@ def upload_release(zip_path: Path, sha_path: Path, version: str, repo: str, toke
                     return None
                 return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"GitHub {method} {url} -> HTTP {exc.code}: {detail}") from exc
+            # 让调用方根据 HTTPError.code 自己决定怎么走(404 → 创建 release 等),
+            # 不要在这里改异常类型,否则外部 except urllib.error.HTTPError 接不到。
+            raise
 
     # 1. 找/建 release
     try:
