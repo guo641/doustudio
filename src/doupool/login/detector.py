@@ -69,6 +69,23 @@ class DoubaoLoginDetector:
             user_id = data.get("sec_user_id")
             if is_login and user_id:
                 return DoubaoIdentity(str(user_id))
+
+        # 兜底:doubao 登录成功后前端会主动调 /passport/web/account/info/
+        # 拿昵称(/chat 页面顶部的 "用户XXX" 就是它返回的)。
+        # observe 监听到了这个 path,但 identity_from_response 之前漏了它,
+        # 导致 identity_ready 永远不 set,用户关浏览器时 race condition 触发。
+        if "/passport/web/account" in path or path == "/alice/user/me":
+            user = data.get("user") if isinstance(data.get("user"), dict) else data
+            user_id = (
+                user.get("user_id")
+                or user.get("user_id_str")
+                or user.get("sec_user_id")
+                or data.get("user_id")
+                or data.get("id")
+            )
+            if user_id:
+                nickname = user.get("name") or user.get("screen_name") or data.get("name")
+                return DoubaoIdentity(str(user_id), str(nickname) if nickname else None)
         return None
 
     def verify(self, page_or_context) -> DoubaoIdentity | None:
