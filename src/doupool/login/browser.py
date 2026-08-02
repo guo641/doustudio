@@ -89,11 +89,100 @@ def _save_doubao_cookies_to_disk(context, profile_dir: Path) -> bool:
         return False
 
 
+def _save_account_info_to_disk(context, profile_dir: Path) -> bool:
+    """
+    在 Playwright 进程内通过 page.evaluate(fetch) 调
+    /passport/web/account/info/,把响应落到 profile_dir/account_info.json。
+
+    为什么必须用 page.evaluate 而不是 httpx:
+    用户 v0.2.5 实测:cookie 抢救成功 27 条(含 sessionid/uid_tt/ttwid 等),
+    但 httpx 用这些 cookie 调 account/info 始终返回 1011(用户未登录)。
+    根因是字节系 aegis 风控:非浏览器指纹请求被直接拒。
+    在浏览器进程内 fetch 自带浏览器指纹 + HttpOnly cookie + sec-ch-ua
+    等所有 aegis 校验字段,才是唯一权威的检测方式。
+
+    返回 True 表示写盘成功,False 表示抢救失败(没有 active page / context 死 /
+    fetch 抛错 / 响应非登录态等)。
+    """
+    if not _context_is_alive(context):
+        return False
+    active_pages = [
+        p for p in context.pages if _page_is_alive(p)
+    ] if hasattr(context, "pages") else []
+    if not active_pages:
+        _LOG.info("抢救 account_info: 没有 active page,跳过")
+        return False
+    try:
+        payload = active_pages[0].evaluate(
+            """
+            async () => {
+                try {
+                    const resp = await fetch(
+                        'https://www.doubao.com/passport/web/account/info/',
+                        { credentials: 'include', redirect: 'manual' }
+                    );
+                    return {
+                        __status: resp.status,
+                        __body: await resp.text(),
+                    };
+                } catch (e) {
+                    return { __err: String(e) };
+                }
+            }
+            """
+        )
+    except PlaywrightError as exc:
+        _LOG.debug("抢救 account_info 失败(page.evaluate): %s", exc)
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if "__err" in payload:
+        _LOG.debug("抢救 account_info fetch 异常: %s", payload.get("__err"))
+        return False
+    status = payload.get("__status")
+    body = payload.get("__body") or ""
+    if status != 200:
+        _LOG.info("抢救 account_info 返回 status=%s (非登录态或风控)", status)
+        return False
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        _LOG.warning("抢救 account_info body 不是 JSON: %s", exc)
+        return False
+    # 只在确实是登录态时落盘 —— aegis 风控可能返回 {"error_code":1011} 也
+    # 是 200 OK,但没有 user_id,这种不能用作 fallback。
+    if not isinstance(parsed, dict):
+        return False
+    if parsed.get("code") not in (0, None):
+        _LOG.info("抢救 account_info code=%s (非登录态),不落盘",
+                  parsed.get("code"))
+        return False
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        target = profile_dir / "account_info.json"
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(parsed, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(target)
+        _LOG.info("抢救 account_info 成功: 写到 %s", target)
+        return True
+    except OSError as exc:
+        _LOG.warning("抢救 account_info 写盘失败: %s", exc)
+        return False
+
+
 def _try_rescue_cookies(context, profile_dir: Path | None) -> None:
-    """抢救 helper:profile_dir 不为 None 时抢救一次。"""
+    """
+    抢救 helper:profile_dir 不为 None 时抢救一次。
+    v0.2.6:同时抢救 cookies 和 account_info(后者在浏览器进程内 fetch,
+    绕过 aegis 风控),让 service 层 disk fallback 不依赖 httpx。
+    """
     if profile_dir is None:
         return
     _save_doubao_cookies_to_disk(context, profile_dir)
+    _save_account_info_to_disk(context, profile_dir)
 
 
 def _context_has_doubao_cookie(context) -> bool:

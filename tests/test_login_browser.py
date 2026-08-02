@@ -8,6 +8,7 @@ from doupool.login.browser import (
     _is_doubao_cookie,
     _safe_page_verify,
     _safe_request_verify,
+    _save_account_info_to_disk,
     _save_doubao_cookies_to_disk,
     _try_one_verify,
     _try_rescue_cookies,
@@ -48,14 +49,24 @@ class FakePage:
 
 
 class FakeContext:
-    def __init__(self, alive=True, cookies=None, request_identity=None):
+    def __init__(self, alive=True, cookies=None, request_identity=None, pages=None):
         self._alive = alive
         self._cookies = cookies or []
         self._request_identity = request_identity
         self._request_calls = 0
+        # 默认有一个 alive page,让 _save_account_info_to_disk 走通。
+        # 测试里想测"无 active page"路径就显式传 pages=[] 或 pages=[FakePage(alive=False)]
+        self._pages = pages if pages is not None else [FakePage(alive=True)]
 
     def is_closed(self):
         return not self._alive
+
+    @property
+    def pages(self):
+        """Playwright BrowserContext.pages —— 返回当前打开的 page 列表(快照)。
+        _save_account_info_to_disk 用 hasattr(context, "pages") 判断后,
+        再 [_page_is_alive(p) for p in context.pages] 过滤。"""
+        return list(self._pages)
 
     def cookies(self):
         if not self._alive:
@@ -532,14 +543,26 @@ def test_wait_identity_rescues_cookies_on_grace_timeout(tmp_path: Path):
 
 
 def test_verify_from_disk_returns_none_when_no_cookies_file(tmp_path: Path):
-    """cookies.json 不存在 → 返回 None"""
-    assert _verify_from_disk(tmp_path) is None
+    """cookies.json 不存在 → 返回 None(不启动 Chromium)"""
+    import doupool.login.service as svc_mod
+    original = svc_mod._verify_via_persistent_context
+    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
+    try:
+        assert _verify_from_disk(tmp_path) is None
+    finally:
+        svc_mod._verify_via_persistent_context = original
 
 
 def test_verify_from_disk_returns_none_on_malformed_json(tmp_path: Path):
     """cookies.json 损坏 → 返回 None,不抛异常"""
     (tmp_path / "cookies.json").write_text("not-json{", encoding="utf-8")
-    assert _verify_from_disk(tmp_path) is None
+    import doupool.login.service as svc_mod
+    original = svc_mod._verify_via_persistent_context
+    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
+    try:
+        assert _verify_from_disk(tmp_path) is None
+    finally:
+        svc_mod._verify_via_persistent_context = original
 
 
 def test_verify_from_disk_httpx_call(monkeypatch, tmp_path: Path):
@@ -571,7 +594,14 @@ def test_verify_from_disk_httpx_call(monkeypatch, tmp_path: Path):
     import httpx
     monkeypatch.setattr(httpx, "get", fake_get)
 
-    identity = _verify_from_disk(tmp_path)
+    # 阻止路径 3 启动 Chromium(测试环境跑不起来)
+    import doupool.login.service as svc_mod
+    original = svc_mod._verify_via_persistent_context
+    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
+    try:
+        identity = _verify_from_disk(tmp_path)
+    finally:
+        svc_mod._verify_via_persistent_context = original
 
     assert identity is not None
     assert identity["user_id"] == "99999"
@@ -597,7 +627,14 @@ def test_verify_from_disk_returns_none_on_non_200(monkeypatch, tmp_path: Path):
     import httpx
     monkeypatch.setattr(httpx, "get", lambda *a, **kw: _FakeResp())
 
-    assert _verify_from_disk(tmp_path) is None
+    import doupool.login.service as svc_mod
+    original = svc_mod._verify_via_persistent_context
+    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
+    try:
+        result = _verify_from_disk(tmp_path)
+    finally:
+        svc_mod._verify_via_persistent_context = original
+    assert result is None
 
 
 def test_verify_from_disk_returns_none_when_account_info_code_nonzero(monkeypatch, tmp_path: Path):
@@ -616,7 +653,14 @@ def test_verify_from_disk_returns_none_when_account_info_code_nonzero(monkeypatc
     import httpx
     monkeypatch.setattr(httpx, "get", lambda *a, **kw: _FakeResp())
 
-    assert _verify_from_disk(tmp_path) is None
+    import doupool.login.service as svc_mod
+    original = svc_mod._verify_via_persistent_context
+    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
+    try:
+        result = _verify_from_disk(tmp_path)
+    finally:
+        svc_mod._verify_via_persistent_context = original
+    assert result is None
 
 
 def test_verify_from_disk_skips_non_doubao_cookies(monkeypatch, tmp_path: Path):
@@ -635,5 +679,155 @@ def test_verify_from_disk_skips_non_doubao_cookies(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(httpx, "get", fake_get)
 
-    assert _verify_from_disk(tmp_path) is None
+    import doupool.login.service as svc_mod
+    original = svc_mod._verify_via_persistent_context
+    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
+    try:
+        result = _verify_from_disk(tmp_path)
+    finally:
+        svc_mod._verify_via_persistent_context = original
+    assert result is None
     assert called["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# v0.2.6 _save_account_info_to_disk 测试
+# ---------------------------------------------------------------------------
+
+
+def test_save_account_info_returns_false_when_no_active_page(tmp_path: Path):
+    """没有 active page → 返回 False,不写盘"""
+    ctx = FakeContext(alive=True, pages=[])
+
+    ok = _save_account_info_to_disk(ctx, tmp_path)
+
+    assert ok is False
+    assert not (tmp_path / "account_info.json").exists()
+
+
+def test_save_account_info_returns_false_when_context_closed(tmp_path: Path):
+    """context 已死 → 返回 False"""
+    ctx = FakeContext(alive=False, pages=[FakePage(alive=True)])
+
+    ok = _save_account_info_to_disk(ctx, tmp_path)
+
+    assert ok is False
+    assert not (tmp_path / "account_info.json").exists()
+
+
+def test_save_account_info_writes_json_on_success(tmp_path: Path):
+    """page.evaluate 返回 status=200 + code=0 → 写 account_info.json"""
+    identity_payload = {
+        "__status": 200,
+        "__body": json.dumps({
+            "code": 0,
+            "data": {"user": {"user_id": "u-fetch", "name": "fetch-命中"}},
+        }, ensure_ascii=False),
+    }
+    page = FakePage(alive=True, evaluate_payload=identity_payload)
+    ctx = FakeContext(alive=True, pages=[page])
+
+    ok = _save_account_info_to_disk(ctx, tmp_path)
+
+    assert ok is True
+    target = tmp_path / "account_info.json"
+    assert target.exists()
+    saved = json.loads(target.read_text(encoding="utf-8"))
+    assert saved["data"]["user"]["user_id"] == "u-fetch"
+
+
+def test_save_account_info_returns_false_on_non_200(tmp_path: Path):
+    """fetch 返回 status != 200 → 不写盘"""
+    page = FakePage(alive=True, evaluate_payload={
+        "__status": 1011,
+        "__body": '{"error_code":1011,"message":"用户未登录"}',
+    })
+    ctx = FakeContext(alive=True, pages=[page])
+
+    ok = _save_account_info_to_disk(ctx, tmp_path)
+
+    assert ok is False
+    assert not (tmp_path / "account_info.json").exists()
+
+
+def test_save_account_info_returns_false_on_code_nonzero(tmp_path: Path):
+    """fetch 返回 200 但 code != 0(被 aegis 风控拒,仍是 200 但 code=-1)→ 不写盘"""
+    page = FakePage(alive=True, evaluate_payload={
+        "__status": 200,
+        "__body": '{"code":-1,"message":"用户未登录","error_code":1011}',
+    })
+    ctx = FakeContext(alive=True, pages=[page])
+
+    ok = _save_account_info_to_disk(ctx, tmp_path)
+
+    assert ok is False
+    assert not (tmp_path / "account_info.json").exists()
+
+
+def test_save_account_info_returns_false_on_fetch_error_payload(tmp_path: Path):
+    """fetch 在浏览器内抛错 → payload.__err 存在 → 不写盘"""
+    page = FakePage(alive=True, evaluate_payload={"__err": "Failed to fetch"})
+    ctx = FakeContext(alive=True, pages=[page])
+
+    ok = _save_account_info_to_disk(ctx, tmp_path)
+
+    assert ok is False
+    assert not (tmp_path / "account_info.json").exists()
+
+
+def test_save_account_info_returns_false_on_non_json_body(tmp_path: Path):
+    """fetch 返回 200 但 body 不是 JSON → 不写盘"""
+    page = FakePage(alive=True, evaluate_payload={
+        "__status": 200,
+        "__body": "<html>not json</html>",
+    })
+    ctx = FakeContext(alive=True, pages=[page])
+
+    ok = _save_account_info_to_disk(ctx, tmp_path)
+
+    assert ok is False
+    assert not (tmp_path / "account_info.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# _verify_from_disk 路径 1 (account_info.json) 测试
+# ---------------------------------------------------------------------------
+
+
+def test_verify_from_disk_prefers_account_info_over_httpx(tmp_path: Path):
+    """account_info.json 存在 + 是登录态 → 优先用,不调 httpx 也不起 Chromium"""
+    (tmp_path / "account_info.json").write_text(
+        json.dumps({
+            "code": 0,
+            "data": {"user": {"user_id": "u-browser-fetch", "name": "browser-命中"}},
+        }),
+        encoding="utf-8",
+    )
+
+    # 阻止路径 3 启动 Chromium(测试环境没装浏览器跑不起来)
+    import doupool.login.service as svc_mod
+    original = svc_mod._verify_via_persistent_context
+    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
+    try:
+        identity = _verify_from_disk(tmp_path)
+    finally:
+        svc_mod._verify_via_persistent_context = original
+
+    assert identity is not None
+    assert identity["user_id"] == "u-browser-fetch"
+    assert identity["nickname"] == "browser-命中"
+
+
+def test_verify_from_disk_returns_none_when_account_info_not_login(tmp_path: Path):
+    """account_info.json 存在但 code != 0 → 视为过期,继续走路径 2/3"""
+    (tmp_path / "account_info.json").write_text(
+        json.dumps({"code": -1, "message": "用户未登录"}),
+        encoding="utf-8",
+    )
+    import doupool.login.service as svc_mod
+    original = svc_mod._verify_via_persistent_context
+    svc_mod._verify_via_persistent_context = lambda *a, **kw: None
+    try:
+        assert _verify_from_disk(tmp_path) is None
+    finally:
+        svc_mod._verify_via_persistent_context = original

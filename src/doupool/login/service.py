@@ -36,79 +36,194 @@ _ACCOUNT_INFO_URL = "https://www.doubao.com/passport/web/account/info/"
 _LOG = logging.getLogger("doupool.login")
 
 
-def _verify_from_disk(profile_dir: Path) -> Mapping[str, str | None] | None:
+def _identity_from_account_info_payload(payload: object) -> Mapping[str, str | None] | None:
     """
-    v0.2.5 cookie-on-disk fallback。
-
-    真实场景(用户 v0.2.4 日志 11:38:27):
-        1. 豆包扫码成功 → cookie 已写到 Chromium 持久 profile
-        2. context 同毫秒 dispose → 所有 Playwright API 全部失效
-        3. wait_for_identity 抢救一次到 profile_dir/cookies.json
-        4. service 层读 cookies.json + httpx 直接调 account/info
-
-    不依赖 Playwright,只依赖 httpx;cookies.json 已经救到磁盘上就够。
+    从浏览器内 fetch /passport/web/account/info/ 的响应 JSON 提取 identity。
+    三种结构都支持(doubao 不同接口/版本可能略有差异):
+    1. {"code":0,"data":{"user":{"user_id":"X","name":"Y"}}}
+    2. {"code":0,"data":{"user_id":"X","name":"Y"}}
+    3. {"data":{"user_id":"X","name":"Y"}}
     """
-    cookies_file = profile_dir / "cookies.json"
-    if not cookies_file.exists():
+    if not isinstance(payload, dict):
         return None
-    try:
-        cookies_list = json.loads(cookies_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        _LOG.warning("读 cookies.json 失败(%s):%s", cookies_file, exc)
-        return None
-    if not isinstance(cookies_list, list):
-        return None
-    cookie_header = "; ".join(
-        f"{c.get('name')}={c.get('value')}"
-        for c in cookies_list
-        if c.get("name") and c.get("value") and "doubao.com" in (c.get("domain") or "")
-    )
-    if not cookie_header:
-        return None
-    try:
-        import httpx
-    except ImportError:
-        _LOG.warning("httpx 不可用,无法走 disk fallback")
-        return None
-    try:
-        resp = httpx.get(
-            _ACCOUNT_INFO_URL,
-            headers={
-                "Cookie": cookie_header,
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/151.0.0.0 Safari/537.36"
-                ),
-                "Accept": "*/*",
-                "Referer": "https://www.doubao.com/",
-            },
-            timeout=10.0,
-            follow_redirects=False,
-        )
-    except Exception as exc:
-        _LOG.warning("disk fallback httpx 失败:%s", exc)
-        return None
-    if resp.status_code != 200:
-        _LOG.warning("disk fallback account/info 返回 status=%s", resp.status_code)
-        return None
-    try:
-        payload = resp.json()
-    except Exception as exc:
-        _LOG.warning("disk fallback 响应不是 JSON:%s", exc)
-        return None
-    if not isinstance(payload, dict) or payload.get("code") not in (0, None):
-        _LOG.info("disk fallback account/info code=%s(非登录态)", payload.get("code") if isinstance(payload, dict) else None)
+    if payload.get("code") not in (0, None):
         return None
     data = payload.get("data") or {}
     user = data.get("user") if isinstance(data.get("user"), dict) else data
-    user_id = user.get("user_id") or user.get("user_id_str") or user.get("sec_user_id") or data.get("user_id") or data.get("id")
+    if not isinstance(user, dict):
+        return None
+    user_id = (
+        user.get("user_id")
+        or user.get("user_id_str")
+        or user.get("sec_user_id")
+        or data.get("user_id")
+        or data.get("id")
+    )
     if not user_id:
-        _LOG.info("disk fallback account/info 无 user_id")
         return None
     nickname = user.get("name") or user.get("screen_name") or data.get("name")
-    _LOG.info("disk fallback 命中登录 user_id=%s nickname=%s", user_id, nickname)
     return {"user_id": str(user_id), "nickname": str(nickname) if nickname else None}
+
+
+def _verify_via_persistent_context(
+    profile_dir: Path,
+) -> Mapping[str, str | None] | None:
+    """
+    v0.2.6 第二道保险:用同一份 profile_dir 重新起一次 Playwright
+    persistent context,让 Chromium 进程自身加载 user_data_dir 内
+    cookies(若磁盘 SQLite 还没被 flush,会用 v0.2.5 的 cookies.json
+    通过 storage_state 注入),然后通过 context.request.get
+    /passport/web/account/info/ 验证。
+
+    直接对标 MediaCrawler / f2 模式 —— Chromium 进程发请求天然继承
+    TLS JA3 / UA / Sec-Ch-Ua / Cookie 时效,这是 v0.2.5 httpx 路径
+    失败的根本原因(API_RESEARCH 第 5 条社区共识:httpx JA3 跟 Chromium
+    不一样,触发服务端 1011)。
+    """
+    try:
+        from playwright.sync_api import (
+            Error as PlaywrightError,
+            sync_playwright,
+        )
+    except ImportError:
+        _LOG.warning("in-browser verify: playwright 不可用,跳过")
+        return None
+    if not profile_dir.exists():
+        return None
+    storage_state_path = profile_dir / "storage_state.json"
+    headless_args = ["--disable-gpu", "--no-sandbox"]
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=True,
+                args=headless_args,
+                storage_state=(
+                    str(storage_state_path) if storage_state_path.exists() else None
+                ),
+            )
+            try:
+                response = context.request.get(_ACCOUNT_INFO_URL, timeout=10.0)
+                if response.status_code != 200:
+                    _LOG.warning(
+                        "in-browser verify: account/info 返回 status=%s",
+                        response.status_code,
+                    )
+                    return None
+                payload = response.json()
+            except PlaywrightError as exc:
+                _LOG.warning("in-browser verify: request 失败: %s", exc)
+                return None
+            except Exception as exc:
+                _LOG.warning("in-browser verify: 异常: %s", exc)
+                return None
+            finally:
+                try:
+                    context.close()
+                except PlaywrightError:
+                    pass
+    except PlaywrightError as exc:
+        _LOG.warning("in-browser verify: 启动 Chromium 失败: %s", exc)
+        return None
+    return _identity_from_account_info_payload(
+        payload if "payload" in locals() else None
+    )
+
+
+def _verify_from_disk(profile_dir: Path) -> Mapping[str, str | None] | None:
+    """
+    v0.2.6 disk fallback。两条路,优先级递减:
+
+    **路径 1:account_info.json(浏览器内 fetch 的真实响应)**
+        browser.py 在 Playwright context 还活着时,通过 page.evaluate(fetch)
+        主动调 /passport/web/account/info/ 并把响应写到 profile_dir/account_info.json。
+        这是最权威的兜底 —— 在浏览器进程内 fetch 自带浏览器指纹 + HttpOnly
+        cookie + sec-ch-ua,能过 aegis 风控(v0.2.5 disk fallback 用 httpx 调
+        account/info 始终返回 1011 用户未登录,根因正是被 aegis 拒)。
+
+    **路径 2:cookies.json + httpx(老方案,仅作兜底)**
+        仅在 account_info.json 不存在时使用。aegis 风控可能拒,可能成功,
+        但不是首选 —— 用户实际命中路径 1 已经能解决。
+
+    不依赖 Playwright 运行中,只依赖磁盘上抢救出来的文件。
+    """
+    # 路径 1:account_info.json —— 浏览器内 fetch 的真实响应
+    account_info_file = profile_dir / "account_info.json"
+    if account_info_file.exists():
+        try:
+            payload = json.loads(account_info_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _LOG.warning("读 account_info.json 失败(%s):%s", account_info_file, exc)
+        else:
+            identity = _identity_from_account_info_payload(payload)
+            if identity:
+                _LOG.info("disk fallback(浏览器内 fetch)命中登录 user_id=%s nickname=%s",
+                          identity["user_id"], identity.get("nickname"))
+                return identity
+            _LOG.info("disk fallback account_info.json 不是登录态")
+    # 路径 2:cookies.json + httpx —— 老兜底,aegis 风控可能拒
+    cookies_file = profile_dir / "cookies.json"
+    if cookies_file.exists():
+        try:
+            cookies_list = json.loads(cookies_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _LOG.warning("读 cookies.json 失败(%s):%s", cookies_file, exc)
+            cookies_list = None
+        if isinstance(cookies_list, list):
+            cookie_header = "; ".join(
+                f"{c.get('name')}={c.get('value')}"
+                for c in cookies_list
+                if c.get("name") and c.get("value")
+                and "doubao.com" in (c.get("domain") or "")
+            )
+            if cookie_header:
+                try:
+                    import httpx
+                except ImportError:
+                    _LOG.warning("httpx 不可用,跳过 httpx fallback")
+                else:
+                    try:
+                        resp = httpx.get(
+                            _ACCOUNT_INFO_URL,
+                            headers={
+                                "Cookie": cookie_header,
+                                "User-Agent": (
+                                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    "Chrome/151.0.0.0 Safari/537.36"
+                                ),
+                                "Accept": "*/*",
+                                "Referer": "https://www.doubao.com/",
+                            },
+                            timeout=10.0,
+                            follow_redirects=False,
+                        )
+                    except Exception as exc:
+                        _LOG.warning("disk fallback httpx 失败:%s", exc)
+                    else:
+                        if resp.status_code == 200:
+                            try:
+                                payload = resp.json()
+                            except Exception as exc:
+                                _LOG.warning("disk fallback 响应不是 JSON:%s", exc)
+                            else:
+                                identity = _identity_from_account_info_payload(payload)
+                                if identity:
+                                    _LOG.info("disk fallback(httpx)命中登录 user_id=%s nickname=%s",
+                                              identity["user_id"], identity.get("nickname"))
+                                    return identity
+                                _LOG.info("disk fallback account/info 无 user_id(可能被 aegis 风控拒)")
+                        else:
+                            _LOG.warning("disk fallback account/info 返回 status=%s",
+                                         resp.status_code)
+    # 路径 3:复用 profile_dir 重新起 Chromium —— 字节系 aegis 风控 httpx 几乎
+    # 必拒,但 Chromium 进程自身发请求继承 TLS JA3 / UA / sec-ch-ua,能过。
+    # 这是 v0.2.5 disk fallback httpx 始终 1011 的根本修复。代价是重新起一次
+    # Chromium(~2 秒),失败也不影响其他路径。
+    identity = _verify_via_persistent_context(profile_dir)
+    if identity:
+        return identity
+    return None
 
 
 class LoginRunner(Protocol):
