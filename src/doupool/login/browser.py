@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from pathlib import Path
@@ -29,6 +30,70 @@ VERIFY_RETRY_BACKOFF = 0.3  # verify 失败后再次尝试的退避
 def _is_doubao_cookie(cookie: dict) -> bool:
     """判断 cookie 是否来自 doubao 域。"""
     return "doubao.com" in (cookie.get("domain") or "")
+
+
+def _save_doubao_cookies_to_disk(context, profile_dir: Path) -> bool:
+    """
+    把 doubao.com 域的 cookie 写到 profile_dir/cookies.json。
+
+    真实场景里(用户 v0.2.4 日志):
+        11:38:27  active page removed
+        11:38:27  context.request.get 失败: Request context disposed
+        11:38:27  wait_for_identity: context 已关闭,放弃 verify
+
+    context 在 verify 同一毫秒就 dispose,所有 Playwright API 路径全部失效。
+    但 cookie 早就写到 Chromium 持久化 profile 里了,只要在 context 还活着的
+    那一瞬间抢救一次 context.cookies() 写盘,后续就能用 httpx 调 account/info。
+
+    返回 True 表示写盘成功,False 表示抢救失败(context 已死)。
+    """
+    if not _context_is_alive(context):
+        return False
+    try:
+        all_cookies = context.cookies()
+    except PlaywrightError as exc:
+        _LOG.warning("抢救 cookies 失败(context.cookies): %s", exc)
+        return False
+    doubao_cookies = [
+        {
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c.get("domain", ""),
+            "path": c.get("path", "/"),
+            "expires": c.get("expires", -1),
+            "httpOnly": c.get("httpOnly", False),
+            "secure": c.get("secure", False),
+            "sameSite": c.get("sameSite"),
+        }
+        for c in all_cookies
+        if _is_doubao_cookie(c) and c.get("value")
+    ]
+    if not doubao_cookies:
+        _LOG.info("抢救 cookies: 没有 doubao.com cookie,跳过")
+        return False
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        target = profile_dir / "cookies.json"
+        # 用临时文件 + rename 保证原子写
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(doubao_cookies, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(target)
+        _LOG.info("抢救 cookies 成功: %d 条 cookie 写到 %s",
+                  len(doubao_cookies), target)
+        return True
+    except OSError as exc:
+        _LOG.warning("抢救 cookies 写盘失败: %s", exc)
+        return False
+
+
+def _try_rescue_cookies(context, profile_dir: Path | None) -> None:
+    """抢救 helper:profile_dir 不为 None 时抢救一次。"""
+    if profile_dir is None:
+        return
+    _save_doubao_cookies_to_disk(context, profile_dir)
 
 
 def _context_has_doubao_cookie(context) -> bool:
@@ -133,6 +198,7 @@ def wait_for_identity(
     cancel_event: threading.Event,
     detector: DoubaoLoginDetector | None = None,
     context=None,
+    profile_dir: Path | None = None,
 ):
     """
     在 owner thread 内等登录成功的 identity。
@@ -151,7 +217,8 @@ def wait_for_identity(
     容错:
     - 每次 evaluate/request 都独立 try/except,只重试可恢复错误
     - page 关闭后给 GRACE_PERIOD_SECONDS 时间,等新 page 出现 / cookie 生效 / verify 成功
-    - grace period 内仍拿不到 → raise RuntimeError
+    - grace period 内仍拿不到 → 在 raise 之前抢救一次 cookies 到 profile_dir/cookies.json,
+      让 service 层可以走 disk fallback 用 httpx 调 account/info
     """
     if detector is None or context is None:
         raise RuntimeError("wait_for_identity 必须在 owner thread 调用且需要 detector+context")
@@ -170,9 +237,12 @@ def wait_for_identity(
         context_alive = _context_is_alive(context)
 
         # 2. context 已经彻底死了(用户关了浏览器 / 我们 close 了 context)
-        #    无法再 verify,只能接受已捕获的 identity(若有)
+        #    Playwright 路径全部失效,但 cookie 已经写到 Chromium 持久化 profile 里。
+        #    最后抢救一次到 profile_dir/cookies.json,让 service 层可以用 httpx 走
+        #    disk fallback 调 account/info 提取 identity。
         if not context_alive:
-            _LOG.warning("wait_for_identity: context 已关闭,放弃 verify")
+            _LOG.warning("wait_for_identity: context 已关闭,抢救 cookies 后放弃 verify")
+            _try_rescue_cookies(context, profile_dir)
             if identities:
                 return identities[0]
             raise RuntimeError("登录窗口已关闭")
@@ -200,9 +270,11 @@ def wait_for_identity(
                 _LOG.info("wait_for_identity: 没有 active page,开始 grace period (%.1fs)",
                           GRACE_PERIOD_SECONDS)
             elif (now - page_closed_since) >= GRACE_PERIOD_SECONDS:
-                # grace 过了还没新 page 也没拿到 → 真的失败
-                _LOG.warning("wait_for_identity: grace period 超时 (%.1fs)",
+                # grace 过了还没新 page 也没拿到 → 真的失败前抢救一次 cookies
+                # 到 profile_dir/cookies.json,让 service 层可以走 disk fallback
+                _LOG.warning("wait_for_identity: grace period 超时 (%.1fs),抢救 cookies",
                              GRACE_PERIOD_SECONDS)
+                _try_rescue_cookies(context, profile_dir)
                 if identities:
                     return identities[0]
                 raise RuntimeError("登录窗口已关闭")
@@ -349,7 +421,16 @@ class PlaywrightLoginRunner:
 
             initial_page = context.pages[0] if context.pages else context.new_page()
             add_page(initial_page)
-            initial_page.on("close", lambda _: remove_page(initial_page))
+
+            # page 关闭事件:除了从 active_pages 列表移除,还要抢救 cookies,
+            # 因为 page 关闭后 doubao 前端可能已经拿到了 identity 但 on_response
+            # 回调还没被 dispatcher 处理。context 还活着的这一刻抢救最保险。
+            def _on_initial_page_close(_payload):
+                remove_page(initial_page)
+                _LOG.info("initial page closed,尝试抢救 cookies 到 %s", profile_dir)
+                _try_rescue_cookies(context, profile_dir)
+
+            initial_page.on("close", _on_initial_page_close)
             initial_page.on(
                 "framenavigated",
                 lambda _: _LOG.debug("initial page framenavigated url=%s", initial_page.url),
@@ -369,10 +450,14 @@ class PlaywrightLoginRunner:
                     cancel_event,
                     detector=self.detector,
                     context=context,
+                    profile_dir=profile_dir,
                 )
                 emit("verifying", "已检测到登录，正在确认账号")
                 return VerifiedLogin(identity.as_mapping(), str(profile_dir))
             finally:
+                # 关闭前最后一次抢救——很多失败路径上 wait_for_identity 已经
+                # 抢救过,但这是幂等的(写同一个 cookies.json),保证落地。
+                _try_rescue_cookies(context, profile_dir)
                 try:
                     context.close()
                 except PlaywrightError:

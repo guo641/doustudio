@@ -1,15 +1,20 @@
+import json
 import threading
 import time
+from pathlib import Path
 
 from doupool.login.browser import (
     _context_has_doubao_cookie,
     _is_doubao_cookie,
     _safe_page_verify,
     _safe_request_verify,
+    _save_doubao_cookies_to_disk,
     _try_one_verify,
+    _try_rescue_cookies,
     wait_for_identity,
 )
 from doupool.login.detector import DoubaoIdentity, DoubaoLoginDetector
+from doupool.login.service import _verify_from_disk
 from playwright.sync_api import Error as PlaywrightError
 
 
@@ -398,3 +403,237 @@ def test_wait_identity_raises_on_cancel():
         assert "登录已取消" in str(exc) or "登录窗口已关闭" in str(exc)
     else:
         raise AssertionError("应该 raise")
+
+
+# ---------------------------------------------------------------------------
+# v0.2.5 cookie 抢救 + disk fallback 测试
+# ---------------------------------------------------------------------------
+
+
+def test_save_doubao_cookies_writes_only_doubao_domain(tmp_path: Path):
+    """_save_doubao_cookies_to_disk 只写 doubao.com 域 cookie,且不写空 value"""
+    cookies = [
+        {"name": "sessionid", "value": "abc123", "domain": ".doubao.com",
+         "path": "/", "httpOnly": True, "secure": True, "expires": -1},
+        {"name": "_ga", "value": "x", "domain": ".google.com",
+         "path": "/", "httpOnly": False, "secure": False, "expires": -1},
+        {"name": "uid_tt", "value": "", "domain": ".doubao.com",  # 空 value 跳过
+         "path": "/", "httpOnly": True, "secure": False, "expires": -1},
+        {"name": "passport_auth_status", "value": "p", "domain": "doubao.com",
+         "path": "/", "httpOnly": False, "secure": False, "expires": -1},
+    ]
+    ctx = FakeContext(alive=True, cookies=cookies)
+
+    ok = _save_doubao_cookies_to_disk(ctx, tmp_path)
+
+    assert ok is True
+    target = tmp_path / "cookies.json"
+    assert target.exists()
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    names = [c["name"] for c in payload]
+    # google 域被过滤,空 value 的 uid_tt 被过滤
+    assert names == ["sessionid", "passport_auth_status"]
+    # 保留关键字段
+    sess = next(c for c in payload if c["name"] == "sessionid")
+    assert sess["httpOnly"] is True
+    assert sess["domain"] == ".doubao.com"
+
+
+def test_save_doubao_cookies_returns_false_when_context_closed(tmp_path: Path):
+    """context 已死 → cookies() 抛 PlaywrightError → 返回 False,不写盘"""
+    ctx = FakeContext(alive=False, cookies=[
+        {"name": "sessionid", "value": "x", "domain": ".doubao.com"},
+    ])
+
+    ok = _save_doubao_cookies_to_disk(ctx, tmp_path)
+
+    assert ok is False
+    assert not (tmp_path / "cookies.json").exists()
+
+
+def test_save_doubao_cookies_returns_false_when_no_doubao_cookie(tmp_path: Path):
+    """context 还活着但没有 doubao 域 cookie → 返回 False"""
+    ctx = FakeContext(alive=True, cookies=[
+        {"name": "_ga", "value": "x", "domain": ".google.com"},
+    ])
+
+    ok = _save_doubao_cookies_to_disk(ctx, tmp_path)
+
+    assert ok is False
+    assert not (tmp_path / "cookies.json").exists()
+
+
+def test_try_rescue_cookies_is_noop_when_profile_dir_none():
+    """profile_dir=None 时 _try_rescue_cookies 直接早退,不动 context"""
+    ctx = FakeContext(alive=True, cookies=[
+        {"name": "sessionid", "value": "x", "domain": ".doubao.com"},
+    ])
+
+    _try_rescue_cookies(ctx, None)  # 不抛异常,也不写盘
+
+    assert ctx._request_calls == 0  # 没动 request
+
+
+def test_wait_identity_rescues_cookies_before_raising_when_context_closed(tmp_path: Path):
+    """v0.2.5 关键路径:context 同毫秒 dispose → raise 之前抢救一次 cookies"""
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    page = FakePage(alive=True)
+    # context 已死 + cookies() 会抛 PlaywrightError(FakeContext 默认 alive=False 时抛)
+    ctx = FakeContext(alive=False)
+
+    try:
+        wait_for_identity(
+            lambda: [page], ready, identities, threading.Event(),
+            detector=DoubaoLoginDetector(), context=ctx,
+            profile_dir=tmp_path,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("应该 raise")
+
+    # cookies.json 不应被写入(context 已死,抢救必然失败)
+    assert not (tmp_path / "cookies.json").exists()
+
+
+def test_wait_identity_rescues_cookies_on_grace_timeout(tmp_path: Path):
+    """grace period 超时前抢救一次 cookies(此时 context 还活着)"""
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    cookies = [
+        {"name": "sessionid", "value": "abc", "domain": ".doubao.com",
+         "path": "/", "httpOnly": True, "secure": False, "expires": -1},
+    ]
+    ctx = FakeContext(alive=True, cookies=cookies)
+
+    try:
+        wait_for_identity(
+            lambda: [FakePage(alive=False)], ready, identities,
+            threading.Event(),
+            detector=DoubaoLoginDetector(), context=ctx,
+            profile_dir=tmp_path,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("应该 raise")
+
+    # grace period 超时后抢救应成功
+    target = tmp_path / "cookies.json"
+    assert target.exists()
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert any(c["name"] == "sessionid" for c in payload)
+
+
+# ---------------------------------------------------------------------------
+# _verify_from_disk 测试(httpx fallback)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_from_disk_returns_none_when_no_cookies_file(tmp_path: Path):
+    """cookies.json 不存在 → 返回 None"""
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_returns_none_on_malformed_json(tmp_path: Path):
+    """cookies.json 损坏 → 返回 None,不抛异常"""
+    (tmp_path / "cookies.json").write_text("not-json{", encoding="utf-8")
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_httpx_call(monkeypatch, tmp_path: Path):
+    """cookies.json + httpx mock 调通 → 返回 identity mapping"""
+    cookies = [
+        {"name": "sessionid", "value": "abc", "domain": ".doubao.com"},
+        {"name": "uid_tt", "value": "u-xyz", "domain": ".doubao.com"},
+    ]
+    (tmp_path / "cookies.json").write_text(
+        json.dumps(cookies), encoding="utf-8"
+    )
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "code": 0,
+                "data": {"user": {"user_id": "99999", "name": "disk-命中"}},
+            }
+
+    captured: dict[str, str] = {}
+
+    def fake_get(url, headers=None, timeout=None, follow_redirects=None):
+        captured["url"] = url
+        captured["cookie"] = headers["Cookie"]
+        return _FakeResp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    identity = _verify_from_disk(tmp_path)
+
+    assert identity is not None
+    assert identity["user_id"] == "99999"
+    assert identity["nickname"] == "disk-命中"
+    assert "sessionid=abc" in captured["cookie"]
+    assert "uid_tt=u-xyz" in captured["cookie"]
+    assert "passport/web/account/info/" in captured["url"]
+
+
+def test_verify_from_disk_returns_none_on_non_200(monkeypatch, tmp_path: Path):
+    """httpx 返回 401/302 → 返回 None"""
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([{"name": "x", "value": "y", "domain": ".doubao.com"}]),
+        encoding="utf-8",
+    )
+
+    class _FakeResp:
+        status_code = 401
+
+        def json(self):
+            return {}
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: _FakeResp())
+
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_returns_none_when_account_info_code_nonzero(monkeypatch, tmp_path: Path):
+    """account/info 返回 code=-1(未登录)→ 返回 None"""
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([{"name": "x", "value": "y", "domain": ".doubao.com"}]),
+        encoding="utf-8",
+    )
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"code": -1, "message": "not login"}
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: _FakeResp())
+
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_skips_non_doubao_cookies(monkeypatch, tmp_path: Path):
+    """只有 google 域 cookie → 没 Cookie 头 → 返回 None"""
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([{"name": "_ga", "value": "x", "domain": ".google.com"}]),
+        encoding="utf-8",
+    )
+
+    called = {"count": 0}
+
+    import httpx
+    def fake_get(*a, **kw):
+        called["count"] += 1
+        raise AssertionError("应该不调 httpx")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert _verify_from_disk(tmp_path) is None
+    assert called["count"] == 0
