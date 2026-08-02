@@ -95,7 +95,9 @@ playwright_browsers=ms-playwright
 
 Write-Host "==> Zip package"
 $plat = "windows-x86_64"
-$zipName = "DouStudio-$cleanVersion-$plat.zip"
+# zip 文件名保留 v 前缀 → 跟 build_exe.py / release.yml glob /
+# build-windows.yml glob / updater.py 全部对齐(v0.1.0 release 也用的这个格式)
+$zipName = "DouStudio-$version-$plat.zip"
 $zipPath = Join-Path $distDir $zipName
 if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
 Compress-Archive -Path $appDir -DestinationPath $zipPath -Force
