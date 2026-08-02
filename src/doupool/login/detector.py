@@ -71,11 +71,26 @@ class DoubaoLoginDetector:
                 return DoubaoIdentity(str(user_id))
         return None
 
-    def verify(self, page) -> DoubaoIdentity | None:
-        response = page.context.request.get(ACCOUNT_INFO_URL)
+    def verify(self, page_or_context) -> DoubaoIdentity | None:
+        """
+        用 cookie 直接调 /passport/web/account/info/ 验证是否已登录。
+
+        接受 page 或 context:登录成功后 doubao 前端常常会做 navigation,把
+        原始 page 关掉,但 context 还在(cookie 已经写入持久化 profile)。
+        这种情况用 context.request.get() 仍能验证身份,这就是 wait_for_identity
+        的 fallback 路径。
+        """
+        request_api = getattr(page_or_context, "context", page_or_context).request
+        try:
+            response = request_api.get(ACCOUNT_INFO_URL)
+        except Exception:
+            return None
         if not response.ok or response.status != 200:
             return None
-        payload = response.json()
+        try:
+            payload = response.json()
+        except Exception:
+            return None
         if payload.get("code") not in (0, None):
             return None
         data = payload.get("data") or {}
