@@ -23,7 +23,8 @@ it('renders and filters the video task table', async () => {
   }
   expect(screen.queryByRole('columnheader', { name: '额度' })).toBeNull();
   expect(screen.queryByRole('columnheader', { name: '模型参数' })).toBeNull();
-  expect(screen.getByText('2.0 · 5s · 16:9')).toBeTruthy();
+  // v0.2.11:std 改名为 Seedance Fast
+  expect(screen.getByText('Seedance Fast · 5s · 16:9')).toBeTruthy();
   expect(screen.getByRole('link', { name: /下载/ })).toBeTruthy();
 
   await fireEvent.update(screen.getByLabelText('搜索任务'), '橘猫');

@@ -4,6 +4,7 @@ import { Clapperboard, Download, ScrollText, Settings, UsersRound, Plus } from '
 import {
   createVideoTask,
   deleteAccount,
+  deleteVideoTask,
   fileToBase64,
   getSettings,
   listAccounts,
@@ -12,6 +13,7 @@ import {
   startLogin,
   updateAccount,
 } from './api';
+import { splitBySegmentMarkers } from './utils/promptParser';
 import AccountTable from './components/AccountTable.vue';
 import LogsPage from './components/LogsPage.vue';
 import ResultsTable from './components/ResultsTable.vue';
@@ -101,6 +103,8 @@ const results = computed(() => tasks.value.filter((t) => t.status === 'succeeded
 const activeAccounts = computed(() => accounts.value.filter((a) => a.enabled && a.status === 'active').length);
 /** 有图=图生，无图=文生 */
 const submitMode = computed(() => (imageFiles.value.length > 0 ? 'i2v' : 't2v'));
+// v0.2.11:实时算当前文本会被切成几段,给底部 char-hint 显示提示
+const segmentCount = computed(() => splitBySegmentMarkers(prompt.value).length);
 
 const pageMeta: Record<Page, [string, string]> = {
   accounts: ['账号池', '登录与会话管理'],
@@ -266,11 +270,10 @@ function closeTaskDialog() {
 }
 
 async function submitVideo() {
-  const promptLines = prompt.value
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (promptLines.length === 0) return;
+  // v0.2.11:不再按换行切分,按「第一段/第二段/段一/1.」段标记切。
+  // 整段没标记就当一个 prompt,避免用户原文写整段自然语言时被误切。
+  const promptSegments = splitBySegmentMarkers(prompt.value);
+  if (promptSegments.length === 0) return;
   if (imageFiles.value.length > MAX_I2V_IMAGES) {
     showToast('failed', `最多支持 ${MAX_I2V_IMAGES} 张图片`);
     return;
@@ -287,11 +290,11 @@ async function submitVideo() {
             })),
           )
         : [];
-    // 多行 prompt → 自动归组;单行 → 走原 prompt 字段(向后兼容)
-    const isGroup = promptLines.length > 1;
+    // 多段 → 自动归组;单段 → 走原 prompt 字段(向后兼容)
+    const isGroup = promptSegments.length > 1;
     await createVideoTask({
-      prompt: isGroup ? '' : promptLines[0],
-      prompts: isGroup ? promptLines : undefined,
+      prompt: isGroup ? '' : promptSegments[0],
+      prompts: isGroup ? promptSegments : undefined,
       model: model.value,
       ratio: ratio.value,
       duration: duration.value,
@@ -307,7 +310,7 @@ async function submitVideo() {
       mode === 'i2v'
         ? `图生任务已加入队列（${images.length} 张图）`
         : isGroup
-          ? `${promptLines.length} 段 prompt 已自动归组`
+          ? `${promptSegments.length} 段 prompt 已自动归组`
           : '文生任务已加入队列',
     );
     await refreshTasks();
@@ -315,6 +318,16 @@ async function submitVideo() {
     showToast('failed', error instanceof Error ? error.message : '创建任务失败');
   } finally {
     creating.value = false;
+  }
+}
+
+async function onDeleteVideoTask(task: VideoTask) {
+  try {
+    await deleteVideoTask(task.id);
+    showToast('succeeded', '任务已删除');
+    await refreshTasks();
+  } catch (error) {
+    showToast('failed', error instanceof Error ? error.message : '任务删除失败');
   }
 }
 
@@ -460,7 +473,7 @@ onBeforeUnmount(() => {
               ＋ 添加任务
             </DpButton>
           </div>
-          <VideoTaskTable :tasks="tasks" @retry="retryVideoTask" />
+          <VideoTaskTable :tasks="tasks" @retry="retryVideoTask" @delete="onDeleteVideoTask" />
         </template>
 
         <ResultsTable v-else-if="page === 'results'" :tasks="results" />
@@ -510,21 +523,22 @@ onBeforeUnmount(() => {
             :placeholder="
               imageFiles.length
                 ? '描述图片如何运动、镜头和氛围…'
-                : '描述主体、动作、场景、镜头和光线…\n\n一行一段 prompt 时自动归组到同一文件夹'
+                : '描述主体、动作、场景、镜头和光线…\n\n多段 prompt 用「第一段」「第二段」…分隔,自动归到同一组'
             "
           />
         </DpField>
         <div class="char-hint">
           {{ prompt.length }} / 2000 ·
-          {{ prompt.split(/\r?\n/).filter((l) => l.trim()).length }} 段(多段自动归组)
+          {{ segmentCount }} 段(用「第一段」「第二段」分隔自动归组)
         </div>
 
         <div class="form-grid">
           <DpField label="模型" for-id="video-model">
             <DpSelect id="video-model" v-model="model">
-              <option value="seedance_v2.0_mini">Seedance 2.0 Mini</option>
-              <option value="seedance_v2.0">Seedance 2.0 Fast</option>
-              <option value="seedance_v2.0_std">Seedance 2.0</option>
+              <!-- v0.2.11:去掉 seedance_v2.0(收费模型,只留 UI 选项)。
+                   std 改名为 Fast,跟用户口语对齐。 -->
+              <option value="seedance_v2.0_mini">Seedance Mini</option>
+              <option value="seedance_v2.0_std">Seedance Fast</option>
             </DpSelect>
           </DpField>
           <DpField label="时长" for-id="video-duration">

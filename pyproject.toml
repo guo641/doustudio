@@ -1,6 +1,6 @@
 [project]
 name = "doupool"
-version = "0.2.10"
+version = "0.2.11"
 description = "Local Doubao multi-account video manager (DoubaoManager)"
 requires-python = ">=3.12"
 dependencies = [

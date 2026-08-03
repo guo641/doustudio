@@ -175,11 +175,17 @@ class AccountRepository:
          )
          .where(Account.id == account_id).execute())
 
-    def increment_account_quota(self, account_id: str, model: str) -> None:
-        """v0.2.9:按 model 桶扣 +1。不传 model 抛 ValueError(避免悄悄扣错桶)。"""
+    def increment_account_quota(
+        self, account_id: str, model: str, *, by: int = 1
+    ) -> None:
+        """v0.2.9:按 model 桶扣。
+        v0.2.11:加 by 参数,默认 1 保持向后兼容;非法 by(<1)抛 ValueError。
+        非法 model 也抛 ValueError(避免悄悄扣错桶)。"""
+        if by < 1:
+            raise ValueError(f"increment by must be >= 1, got {by}")
         field_name = _quota_field(model)
         field = getattr(Account, field_name)
-        (Account.update(**{field_name: field + 1}, updated_at=utcnow())
+        (Account.update(**{field_name: field + by}, updated_at=utcnow())
          .where(Account.id == account_id).execute())
 
     def create_video_task(
@@ -286,3 +292,26 @@ class AccountRepository:
         return (VideoTask.select().where(
             (VideoTask.account == account_id) & VideoTask.status.in_(("starting", "generating", "resolving"))
         ).exists())
+
+    # ---------- v0.2.11:任务删除 ----------
+
+    _RUNNING_STATUSES: tuple[str, ...] = ("starting", "generating", "resolving")
+
+    def delete_video_task(self, task_id: str) -> None:
+        """v0.2.11:物理删除一条 VideoTask。
+
+        running 状态由调用方挡掉(API 层 → service.delete → ValueError / 409)。
+        这里只做 delete_instance,不要预检 status,避免事务竞争。
+        """
+        VideoTask.delete().where(VideoTask.id == task_id).execute()
+
+    def is_task_deletable(self, task_id: str) -> bool:
+        """v0.2.11:running 状态不可删(防正在生成的任务被打断)。
+        任务不存在也算不可删(False 让上层走 404 分支)。
+        """
+        row = VideoTask.select(VideoTask.status).where(
+            VideoTask.id == task_id
+        ).first()
+        if row is None:
+            return False
+        return row.status not in self._RUNNING_STATUSES

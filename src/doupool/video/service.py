@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from doupool.db.models import Account, VideoTask
 from doupool.db.repository import AccountRepository
 from doupool.prompt_reviser import classify_failure, revise_prompt
+from doupool.prompt_parser import split_by_segment_markers
 from doupool import callbacks as callbacks_mod
 from doupool.watermark import (
     ZhucekaConfigError,
@@ -23,6 +24,7 @@ from doupool.watermark import (
     resolve_clean_url as zhuceka_resolve,
 )
 
+from .cost import quota_cost
 from .protocol import DURATIONS, MAX_I2V_IMAGES, MODELS, RATIOS, TASK_MODES, DoubaoRateLimited
 
 
@@ -101,6 +103,8 @@ class VideoTaskService:
         prompt = prompt.strip()
         mode = (mode or "t2v").strip().lower()
         # 兼容: 同时支持单 prompt / prompts 列表
+        # v0.2.11:只有单 prompt 字段才后端切段(prompts 列表前端已切好,
+        # 再切会把"第一段"字样当成标记误伤 prompt 文本)。
         prompt_list: list[str] = []
         if prompts:
             for p in prompts:
@@ -108,7 +112,15 @@ class VideoTaskService:
                 if p2:
                     prompt_list.append(p2)
         if prompt:
-            prompt_list.insert(0, prompt)
+            if prompt_list:
+                # 同一调用里同时给 prompt 和 prompts,prompt 当作第一段前缀补在队首
+                prompt_list.insert(0, prompt)
+            else:
+                # 单 prompt 字段:防御性 — 后端再切一次,
+                # 兼容 curl / 老前端没切就发过来。
+                prompt_list = split_by_segment_markers(prompt)
+                if not prompt_list:
+                    prompt_list = [prompt]
         if not prompt_list:
             raise ValueError("请输入画面描述")
         if mode not in TASK_MODES:
@@ -289,6 +301,51 @@ class VideoTaskService:
         """
         return self.retry_result(task_id)
 
+    # ---------- v0.2.11 任务删除入口 ----------
+    def delete(self, task_id: str) -> None:
+        """v0.2.11:删除一条视频任务。
+
+        规则:
+          - 任务不存在 → ValueError(API 层 404)
+          - 状态在 {starting, generating, resolving} → RuntimeError(API 层 409)
+          - 其它状态(queued / rechecking / succeeded / failed / limited / cancelled)
+            → 取消可能还在跑的 callback / retry-result 协程,物理 delete_instance。
+
+        _run_inner 在 cancellation 触发后写 status 时若 row 已不存在,
+        peewee 会抛 DoesNotExist,但走不到这里(running 状态已被挡掉),
+        只对 queued 任务需要小心:_schedule 已经把 cancellation 注册好,
+        但 _run 里 cancellation.is_set() 后会返回,不会写 status,直接
+        delete_instance 安全。
+        """
+        try:
+            task = self.repository.get_video_task(task_id)
+        except Exception:  # VideoTask.DoesNotExist
+            raise ValueError("任务不存在") from None
+        if task is None:
+            raise ValueError("任务不存在")
+        if task.status in AccountRepository._RUNNING_STATUSES:
+            raise RuntimeError("任务正在生成中,请等待结束后再删除")
+
+        # 取消可能正在跑 / 排队等跑的 callback 协程,避免它拿着失效 task_id 跑
+        callback_task = self._callback_tasks.get(task_id)
+        if callback_task is not None and not callback_task.done():
+            callback_task.cancel()
+            self._callback_tasks.pop(task_id, None)
+
+        # 取消可能的 retry-result 后台协程
+        retry_task = self._retry_tasks.get(task_id)
+        if retry_task is not None and not retry_task.done():
+            self._retry_cancellations.get(task_id, threading.Event()).set()
+            retry_task.cancel()
+            self._retry_tasks.pop(task_id, None)
+            self._retry_cancellations.pop(task_id, None)
+
+        self.repository.delete_video_task(task_id)
+        self.logger.info(
+            "video task deleted",
+            extra={"event": "video_task_deleted", "task_id": task_id, "status": task.status},
+        )
+
     async def _retry_result_inner(
         self, task_id: str, profile_dir: str, cancellation: threading.Event
     ) -> None:
@@ -465,8 +522,12 @@ class VideoTaskService:
                     def update(**values) -> None:
                         nonlocal quota_recorded
                         if values.get("status") == "generating" and not quota_recorded:
-                            # v0.2.9:按 task.model 扣对应桶的额度。
-                            self.repository.increment_account_quota(account.id, model=task.model)
+                            # v0.2.11:按 model + duration 算 cost,扣对应桶。
+                            # 非法 duration 走兜底 max(1, duration)。
+                            cost = quota_cost(task.model, int(task.duration))
+                            self.repository.increment_account_quota(
+                                account.id, model=task.model, by=cost
+                            )
                             quota_recorded = True
                         self.repository.update_video_task(task_id, **values)
 

@@ -21,10 +21,12 @@ type ResultTask = {
 
 defineProps<{ tasks: ResultTask[] }>();
 
+// v0.2.11:去掉 seedance_v2.0(收费模型)label,std 改名为 Fast。
+// 如果有老任务用 v2,fallback 到原值给用户看,不静默消失。
 const models: Record<string, string> = {
-  'seedance_v2.0_std': '2.0',
-  'seedance_v2.0': '2.0 Fast',
-  'seedance_v2.0_mini': '2.0 Mini',
+  'seedance_v2.0_std': 'Seedance Fast',
+  'seedance_v2.0_mini': 'Seedance Mini',
+  'seedance_v2.0': 'Seedance 2.0',
 };
 
 async function copy(value: string) {

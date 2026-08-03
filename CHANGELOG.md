@@ -2,6 +2,19 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.11 - 2026-08-03
+
+### 主要变更
+
+- **任务删除**:`DELETE /api/requests/:task_id`。running 状态(`starting` / `generating` / `resolving`)拒绝(409),其余状态直接物理删除。前端任务列表每行加「删除」按钮,运行中自动隐藏
+- **额度按秒计费**(对齐豆包真实扣费):
+  - mini:`1` 点/秒(5s=5、10s=10)
+  - fast(`seedance_v2.0_std`):`1.5` 点/秒向上取整(5s=8、10s=15)
+  - 未知 model 兜底 = `duration`,避免被传 0
+  - `increment_account_quota(by=N)` 累加到对应桶,默认 `by=1` 保持向后兼容;`by < 1` 抛 `ValueError`
+- **prompt 分段改用「第一段」标记**:不再按换行切。识别 `第一段` / `段一` / `1.` / `1、` / `1)` 这五类行首标记(中文序数 + 阿拉伯数字 + 全/半角冒号),**只在行首匹配**避免误伤文本里出现的「第一段」字样。无标记整段当一个 prompt。前端 + 后端双重解析,后端只在单 `prompt` 字段时防御性切,`prompts` 列表已切好不再重复切
+- **去掉 seedance_v2.0 UI**:收费模型,前端模型下拉(任务创建 / 默认设置 / 结果列表 / 任务表)只保留 `Seedance Mini` 和 `Seedance Fast`(`std`)。后端 allow-list、DB `daily_quota_v2` / `video_quota_used_v2` 列保留兼容
+
 ## v0.2.10 - 2026-08-03
 
 ### 修复

@@ -83,6 +83,14 @@ export async function createVideoTask(body: {
   );
 }
 
+// v0.2.11:删除一条视频任务(running 状态服务端会 409)。
+export async function deleteVideoTask(taskId: string) {
+  return json(
+    await fetch(`/api/requests/${taskId}`, { method: 'DELETE', headers }),
+    '任务删除失败',
+  );
+}
+
 export async function listVideoTaskGroups(limit = 50) {
   return json(
     await fetch(`/api/video-task-groups?limit=${limit}`, { headers }),

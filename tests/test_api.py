@@ -322,3 +322,105 @@ def test_sse_events_accept_bearer_header(repository, tmp_path):
     assert client.get(
         "/api/login-attempts/whatever/events?access_token=wrong",
     ).status_code == 401
+
+
+# ---------- v0.2.11:DELETE /api/requests/:task_id ----------
+
+class FakeVideoServiceWithDelete(FakeVideoService):
+    """v0.2.11:复刻 service.delete 的最小契约,够 API 层路由测试用。"""
+
+    _RUNNING_STATUSES = ("starting", "generating", "resolving")
+
+    def delete(self, task_id: str) -> None:
+        try:
+            task = self.repository.get_video_task(task_id)
+        except Exception:
+            raise ValueError("任务不存在") from None
+        if task is None:
+            raise ValueError("任务不存在")
+        if task.status in self._RUNNING_STATUSES:
+            raise RuntimeError("任务正在生成中,请等待结束后再删除")
+        self.repository.delete_video_task(task_id)
+
+
+def test_delete_video_task_returns_204(repository, tmp_path):
+    """v0.2.11:删 queued/succeeded 状态的任务,assert 204。"""
+    task = repository.create_video_task(None, "可删任务", "seedance_v2.0_mini", "1:1", 5)
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(
+        create_app(
+            "secret", tmp_path / "missing", repository, login,
+            video_service=FakeVideoServiceWithDelete(repository),
+        )
+    )
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.delete(f"/api/requests/{task.id}", headers=headers)
+
+    assert response.status_code == 204
+    assert repository.list_video_tasks() == []
+
+
+def test_delete_video_task_running_returns_409(repository, tmp_path):
+    """v0.2.11:running 状态(starting/generating/resolving)不能删,409。"""
+    task = repository.create_video_task(None, "运行中", "seedance_v2.0_mini", "1:1", 5)
+    repository.update_video_task(task.id, status="generating")
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(
+        create_app(
+            "secret", tmp_path / "missing", repository, login,
+            video_service=FakeVideoServiceWithDelete(repository),
+        )
+    )
+
+    response = client.delete(f"/api/requests/{task.id}", headers={"X-DouPool-Token": "secret"})
+
+    assert response.status_code == 409
+    assert "正在生成中" in response.json()["detail"]
+    # 任务没被删
+    assert repository.get_video_task(task.id).status == "generating"
+
+
+def test_delete_video_task_missing_returns_404(repository, tmp_path):
+    """v0.2.11:不存在的 task_id → 404。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(
+        create_app(
+            "secret", tmp_path / "missing", repository, login,
+            video_service=FakeVideoServiceWithDelete(repository),
+        )
+    )
+
+    response = client.delete("/api/requests/does-not-exist", headers={"X-DouPool-Token": "secret"})
+
+    assert response.status_code == 404
+    assert "任务不存在" in response.json()["detail"]
+
+
+def test_delete_video_task_requires_auth(repository, tmp_path):
+    """v0.2.11:DELETE 也走 authorize 闸门,无 token → 401。"""
+    task = repository.create_video_task(None, "鉴权测试", "seedance_v2.0_mini", "1:1", 5)
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(
+        create_app(
+            "secret", tmp_path / "missing", repository, login,
+            video_service=FakeVideoServiceWithDelete(repository),
+        )
+    )
+
+    response = client.delete(f"/api/requests/{task.id}")
+
+    assert response.status_code == 401
+    assert repository.get_video_task(task.id).status == "queued"
+
+
+def test_delete_video_task_returns_503_when_service_down(repository, tmp_path):
+    """v0.2.11:video_service 未启动 → 503(不静默 200)。"""
+    task = repository.create_video_task(None, "服务未启动", "seedance_v2.0_mini", "1:1", 5)
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.delete(f"/api/requests/{task.id}", headers={"X-DouPool-Token": "secret"})
+
+    assert response.status_code == 503
+    assert repository.get_video_task(task.id).status == "queued"

@@ -420,6 +420,30 @@ def create_app(
         quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
         return _video_task_dict(task, quotas["mini"])
 
+    @app.delete("/api/requests/{task_id}", status_code=204)
+    def delete_video_task(
+        task_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.11:删除一条视频任务。
+
+        状态码:
+          - 204:成功删除
+          - 404:task_id 不存在
+          - 409:任务正在生成中(状态 starting / generating / resolving),不能删
+          - 503:video_service 未启动
+        """
+        authorize(x_doupool_token, authorization)
+        if video_service is None:
+            raise HTTPException(status_code=503, detail="视频服务未启动")
+        try:
+            video_service.delete(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     assets = frontend_dir / "assets"
     if assets.exists():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")

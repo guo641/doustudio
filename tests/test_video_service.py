@@ -42,7 +42,8 @@ async def test_service_runs_and_persists_video_result(repository, temp_profile):
     assert saved.status == "succeeded"
     assert saved.conversation_id == "conversation-1"
     assert saved.remote_task_id == "remote-1"
-    assert Account.get_by_id("account-1").video_quota_used_mini == 1
+    # v0.2.11:mini 1 点/秒,5 秒任务扣 5 点(老版本是 +1)
+    assert Account.get_by_id("account-1").video_quota_used_mini == 5
 
 
 @pytest.mark.asyncio
@@ -421,11 +422,56 @@ async def test_service_charges_correct_bucket_per_model(repository, temp_profile
     await asyncio.wait_for(service._tasks[task_std.id], timeout=2)
 
     account = Account.get_by_id("acc-iso")
-    # mini 桶只 +1(只跑了 1 个 mini 任务)
-    assert account.video_quota_used_mini == 1
-    # std 桶只 +1(只跑了 1 个 std 任务)
-    assert account.video_quota_used_std == 1
+    # v0.2.11:mini 5s → 5 点,std 5s → 8 点(ceil(7.5))
+    assert account.video_quota_used_mini == 5
+    assert account.video_quota_used_std == 8
     # v2 桶没碰
     assert account.video_quota_used_v2 == 0
     # runner 真的按 model 跑
     assert runner.calls == ["seedance_v2.0_mini", "seedance_v2.0_std"]
+
+
+# ---------- v0.2.11:service.delete() ----------
+
+def test_service_delete_removes_queued_task(repository, temp_profile):
+    """v0.2.11:queued 状态 → service.delete() 物理删除,无异常。"""
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(), account_poll_interval=0.01
+    )
+    queued_task = repository.create_video_task(
+        None, "纯排队", "seedance_v2.0_mini", "1:1", 5
+    )
+    assert queued_task.status == "queued"
+
+    service.delete(queued_task.id)
+    from doupool.db.models import VideoTask
+    assert VideoTask.select().count() == 0
+
+
+def test_service_delete_running_raises_runtime_error(repository, temp_profile):
+    """v0.2.11:generating 状态 → service.delete() 抛 RuntimeError,任务不动。"""
+    Account.create(
+        id="acc-r", display_name="r", doubao_user_id="u", profile_dir=temp_profile
+    )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(), account_poll_interval=0.01
+    )
+    task = repository.create_video_task(
+        None, "运行中", "seedance_v2.0_mini", "1:1", 5
+    )
+    repository.update_video_task(task.id, status="generating")
+
+    with pytest.raises(RuntimeError, match="正在生成中"):
+        service.delete(task.id)
+    # 任务还在
+    from doupool.db.models import VideoTask
+    assert VideoTask.get_by_id(task.id).status == "generating"
+
+
+def test_service_delete_missing_raises_value_error(repository, temp_profile):
+    """v0.2.11:不存在的 task_id → ValueError('任务不存在')。"""
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(), account_poll_interval=0.01
+    )
+    with pytest.raises(ValueError, match="任务不存在"):
+        service.delete("does-not-exist")

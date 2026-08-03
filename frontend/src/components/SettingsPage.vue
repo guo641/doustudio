@@ -124,9 +124,9 @@ async function onCheckUpdate() {
       <div class="fields">
         <DpField label="默认模型">
           <DpSelect v-model="settings.default_model">
-            <option value="seedance_v2.0_mini">Seedance 2.0 Mini</option>
-            <option value="seedance_v2.0">Seedance 2.0 Fast</option>
-            <option value="seedance_v2.0_std">Seedance 2.0</option>
+            <!-- v0.2.11:去掉 seedance_v2.0(收费模型),std 改名为 Fast -->
+            <option value="seedance_v2.0_mini">Seedance Mini</option>
+            <option value="seedance_v2.0_std">Seedance Fast</option>
           </DpSelect>
         </DpField>
         <DpField label="默认时长">

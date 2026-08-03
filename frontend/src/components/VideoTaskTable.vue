@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { Clapperboard, RotateCcw, ExternalLink, Download } from '@lucide/vue';
+import { Clapperboard, RotateCcw, ExternalLink, Download, Trash2 } from '@lucide/vue';
 import { DpBadge, DpButton, DpEmpty, DpLink, DpPanel, DpSearchInput, DpSelect, DpTable, DpTag } from '@/ui';
 
 type VideoTaskRow = {
@@ -30,7 +30,14 @@ type VideoTaskRow = {
 type TagVariant = 'accent' | 'success' | 'muted' | 'warning' | 'danger';
 
 const props = defineProps<{ tasks: VideoTaskRow[] }>();
-defineEmits<{ retry: [task: VideoTaskRow] }>();
+defineEmits<{
+  retry: [task: VideoTaskRow];
+  // v0.2.11:删除任务(running 状态服务端会 409,这里按钮直接不显示)
+  delete: [task: VideoTaskRow];
+}>();
+
+// v0.2.11:running 状态按钮不显示,与后端 is_task_deletable 保持一致
+const RUNNING_STATUSES = new Set(['starting', 'generating', 'resolving']);
 
 const query = ref('');
 const status = ref('');
@@ -48,9 +55,9 @@ const statusLabels: Record<string, string> = {
 };
 
 const modelLabels: Record<string, string> = {
-  'seedance_v2.0_std': '2.0',
-  'seedance_v2.0': '2.0 Fast',
-  'seedance_v2.0_mini': '2.0 Mini',
+  // v0.2.11:UI 删掉 seedance_v2.0(收费模型),std 改名为 Fast,跟用户口语一致
+  'seedance_v2.0_std': 'Seedance Fast',
+  'seedance_v2.0_mini': 'Seedance Mini',
 };
 const modeLabels: Record<string, string> = {
   t2v: '文生',
@@ -184,7 +191,19 @@ function paramsText(task: VideoTaskRow) {
                 <RotateCcw :size="12" />
                 重试
               </DpButton>
-              <span v-if="!task.result_url && !task.clean_video_url && task.status !== 'failed'" class="dash">—</span>
+              <!-- v0.2.11:删除任务。running 状态不显示按钮(后端 409)。 -->
+              <DpButton
+                v-if="!RUNNING_STATUSES.has(task.status)"
+                size="sm"
+                variant="ghost"
+                :aria-label="`删除任务 ${task.id}`"
+                title="删除任务"
+                @click="$emit('delete', task)"
+              >
+                <Trash2 :size="12" />
+                删除
+              </DpButton>
+              <span v-if="!task.result_url && !task.clean_video_url && task.status !== 'failed' && RUNNING_STATUSES.has(task.status)" class="dash">—</span>
             </td>
           </tr>
           <tr v-if="expanded.has(task.id)" class="detail-row">

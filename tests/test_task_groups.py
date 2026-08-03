@@ -149,3 +149,66 @@ def test_blank_prompts_filtered(service):
     )
     prompts = [t["prompt"] for t in repo.created]
     assert prompts == ["有效", "另一个有效"]
+
+
+# ---------- v0.2.11:「第一段」段标记 → 后端防御性 split ----------
+
+def test_prompt_field_with_chinese_markers_splits(service):
+    """v0.2.11:只传单 prompt 字段、文本里带「第一段 / 第二段」标记时,
+    后端会防御性地按标记切,自动归到同一 group_id。"""
+    svc, repo = service
+    svc.start(
+        prompt="第一段:猫在草地\n第二段:狗在花园",
+        model="seedance_v2.0_mini",
+        ratio="1:1",
+        duration=5,
+        account_id=None,
+    )
+    assert len(repo.created) == 2
+    prompts = [t["prompt"] for t in repo.created]
+    assert prompts == ["猫在草地", "狗在花园"]
+    assert {t["group_id"] for t in repo.created}.pop() is not None
+
+
+def test_prompt_field_without_marker_stays_single(service):
+    """v0.2.11:不带段标记的整段 → 当一个 prompt,不切。"""
+    svc, repo = service
+    svc.start(
+        prompt="一只橘猫在阳光下打滚,镜头慢慢拉近",
+        model="seedance_v2.0_mini",
+        ratio="1:1",
+        duration=5,
+        account_id=None,
+    )
+    assert len(repo.created) == 1
+    assert repo.created[0]["group_id"] is None
+
+
+def test_prompts_list_not_resplit(service):
+    """v0.2.11:已传 prompts 列表(前端已切好) → 后端不再切,
+    避免把 '第一段' 字样当成段标记误伤 prompt 文本。"""
+    svc, repo = service
+    svc.start(
+        prompt="",
+        prompts=["第一段:猫", "第二段:狗"],  # 内容里带「第一段」字样
+        model="seedance_v2.0_mini",
+        ratio="1:1",
+        duration=5,
+        account_id=None,
+    )
+    prompts = [t["prompt"] for t in repo.created]
+    assert prompts == ["第一段:猫", "第二段:狗"]
+
+
+def test_prompt_field_with_mixed_markers(service):
+    """v0.2.11:第一段 + 段二 + 3. 混用都识别。"""
+    svc, repo = service
+    svc.start(
+        prompt="第一段:猫\n段二:狗\n3. 鱼",
+        model="seedance_v2.0_mini",
+        ratio="1:1",
+        duration=5,
+        account_id=None,
+    )
+    prompts = [t["prompt"] for t in repo.created]
+    assert prompts == ["猫", "狗", "鱼"]

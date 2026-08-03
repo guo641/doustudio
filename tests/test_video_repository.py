@@ -157,3 +157,77 @@ def test_increment_account_quota_rejects_unknown_model(repository, temp_profile)
 
     with pytest.raises(ValueError, match="unsupported model"):
         repository.increment_account_quota(account.id, model="foobar_baz")
+
+
+# ---------- v0.2.11:per-model quota 按 by=N 增量 + 任务删除 ----------
+
+def test_increment_account_quota_by_accumulates(repository, temp_profile):
+    """v0.2.11:by=2/3/1 累加到对应桶,不是简单的 +1 循环。"""
+    account = Account.create(
+        id="acc-by", display_name="by", doubao_user_id="u", profile_dir=temp_profile,
+    )
+    repository.increment_account_quota(account.id, model="seedance_v2.0_mini", by=2)
+    repository.increment_account_quota(account.id, model="seedance_v2.0_mini", by=3)
+    repository.increment_account_quota(account.id, model="seedance_v2.0_std", by=1)
+
+    refreshed = Account.get_by_id(account.id)
+    assert refreshed.video_quota_used_mini == 5
+    assert refreshed.video_quota_used_std == 1
+    # v2 桶没碰
+    assert refreshed.video_quota_used_v2 == 0
+
+
+def test_increment_account_quota_by_default_is_one(repository, temp_profile):
+    """v0.2.11:不传 by 默认 1,保持向后兼容。"""
+    account = Account.create(
+        id="acc-d", display_name="d", doubao_user_id="u", profile_dir=temp_profile,
+    )
+    repository.increment_account_quota(account.id, model="seedance_v2.0_mini")
+    repository.increment_account_quota(account.id, model="seedance_v2.0_mini")
+
+    assert Account.get_by_id(account.id).video_quota_used_mini == 2
+
+
+def test_increment_account_quota_by_rejects_zero_or_negative(repository, temp_profile):
+    """v0.2.11:by 必须 >= 1,避免被传 0 静默无操作。"""
+    import pytest
+
+    account = Account.create(
+        id="acc-bad", display_name="bad", doubao_user_id="u", profile_dir=temp_profile,
+    )
+    with pytest.raises(ValueError, match="by must be >= 1"):
+        repository.increment_account_quota(account.id, model="seedance_v2.0_mini", by=0)
+    with pytest.raises(ValueError, match="by must be >= 1"):
+        repository.increment_account_quota(account.id, model="seedance_v2.0_mini", by=-3)
+
+
+def test_delete_video_task_removes_row(repository):
+    """v0.2.11:delete_video_task 物理删除。"""
+    from doupool.db.models import VideoTask
+
+    task = repository.create_video_task(
+        None, "删我", "seedance_v2.0_mini", "1:1", 5,
+    )
+    repository.delete_video_task(task.id)
+    assert VideoTask.select().count() == 0
+
+
+def test_is_task_deletable_true_for_terminal_and_queued(repository):
+    """v0.2.11:queued/succeeded/failed/cancelled 都能删。"""
+    for status in ("queued", "succeeded", "failed", "limited", "cancelled", "rechecking"):
+        task = repository.create_video_task(None, status, "seedance_v2.0_mini", "1:1", 5)
+        repository.update_video_task(task.id, status=status)
+        assert repository.is_task_deletable(task.id) is True, status
+
+
+def test_is_task_deletable_false_for_running(repository):
+    """v0.2.11:starting/generating/resolving 不能删。"""
+    for status in ("starting", "generating", "resolving"):
+        task = repository.create_video_task(None, status, "seedance_v2.0_mini", "1:1", 5)
+        repository.update_video_task(task.id, status=status)
+        assert repository.is_task_deletable(task.id) is False, status
+
+
+def test_is_task_deletable_false_for_missing(repository):
+    """v0.2.11:不存在的 task_id 返回 False(让上层走 404 分支)。"""
+    assert repository.is_task_deletable("nonexistent") is False
