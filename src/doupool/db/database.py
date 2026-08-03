@@ -28,7 +28,7 @@ class DatabaseManager:
         if version is None:
             with self.database.atomic():
                 self.database.create_tables(ALL_MODELS)
-                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (9)")
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (10)")
             return
         if version < 2:
             with self.database.atomic():
@@ -143,6 +143,33 @@ class DatabaseManager:
                         "WHERE video_quota_used_mini = 0 AND video_quota_used > 0"
                     )
                 self.database.execute_sql("INSERT INTO schema_version(version) VALUES (9)")
+        if version < 10:
+            # v0.2.10:补 e4ced5a 漏掉的 callbackUrl 迁移。VideoTask 加 4 个 callback
+            # 列(callback_url / status / attempts / last_error),幂等 ALTER 兜住
+            # v9 DB(已升 v9 但还没建 callback 列的用户)。v0.2.9 双击 exe 就崩的根因
+            # 就在这里 — peewee 在 lifespan 里 SELECT 全部 VideoTask 字段,旧 DB 没
+            # callback_url 直接 OperationalError。
+            task_columns = {
+                row[1] for row in self.database.execute_sql("PRAGMA table_info(videotask)").fetchall()
+            }
+            with self.database.atomic():
+                if "callback_url" not in task_columns:
+                    self.database.execute_sql(
+                        "ALTER TABLE videotask ADD COLUMN callback_url TEXT"
+                    )
+                if "callback_status" not in task_columns:
+                    self.database.execute_sql(
+                        "ALTER TABLE videotask ADD COLUMN callback_status VARCHAR(255)"
+                    )
+                if "callback_attempts" not in task_columns:
+                    self.database.execute_sql(
+                        "ALTER TABLE videotask ADD COLUMN callback_attempts INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "callback_last_error" not in task_columns:
+                    self.database.execute_sql(
+                        "ALTER TABLE videotask ADD COLUMN callback_last_error TEXT"
+                    )
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (10)")
 
     def _make_video_account_nullable(self) -> None:
         self.database.execute_sql("""
