@@ -2,6 +2,22 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.12 - 2026-08-03
+
+### 修复
+
+- **「等待可用账号」永久卡死修复**:`v0.2.9` 起 `mark_account_limited` 在豆包 423 时会把三桶 quota 都 cap 到 `quota_limit`,直到跨天 `reset_daily_quotas` 才清。如果 `limited_until` 落在当天内(短时封号),账号就会永远选不到 —— 因为 `choose_available_account` 的 `field < quota_limit` 永远是 False,UI 一直显示「等待可用账号」。
+  - `reset_daily_quotas` 顺带清 limited_until 已过期的桶,让当天内封的账号自动恢复
+  - `choose_available_account` 返 None 时区分两种情况:
+    - 没有启用账号 → "暂无账号,请先在账号面板添加账号"
+    - 全部桶满 → "全部账号今日 {model} 额度已用完,明天自动恢复"
+    - 其它(单账号限流中) → 原来的"等待可用账号"
+  - 加 `summarize_account_availability` helper + 单测覆盖
+
+### UI
+
+- **账号面板去掉 v2 段**:v0.2.11 已经删了 v2 模型下拉,账号面板额度条还显示三段(mini / v2 / std)。v0.2.12 改成两段(mini / fast),`Bucket` 类型和 BUCKETS 数组同步收敛;表头文案从「今日额度(mini / v2 / std)」改成「今日额度(mini / fast)」
+
 ## v0.2.11 - 2026-08-03
 
 ### 主要变更

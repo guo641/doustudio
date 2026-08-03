@@ -508,7 +508,17 @@ class VideoTaskService:
                 strategy=settings.get("scheduler_strategy", "least_used"),
             )
             if account is None:
-                self.repository.update_video_task(task_id, status="queued", error_message="等待可用账号")
+                # v0.2.12:区分两种 None ——「没有账号」vs 「账号全满」,UI 才能给出准确指引。
+                stats = self.repository.summarize_account_availability(
+                    daily_quotas, model=task.model
+                )
+                if stats["enabled_total"] == 0:
+                    msg = "暂无账号,请先在账号面板添加账号"
+                elif stats["bucket_full"] >= stats["enabled_total"]:
+                    msg = f"全部账号今日 {task.model} 额度已用完,明天自动恢复"
+                else:
+                    msg = "等待可用账号"
+                self.repository.update_video_task(task_id, status="queued", error_message=msg)
                 await asyncio.sleep(self.account_poll_interval)
                 continue
             self.repository.assign_video_task(task_id, account.id)

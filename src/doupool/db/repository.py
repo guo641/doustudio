@@ -146,8 +146,53 @@ class AccountRepository:
             query = query.order_by(field.asc(), Account.updated_at.asc())
         return query.first()
 
-    def reset_daily_quotas(self, business_date: date) -> None:
-        # v0.2.9:三桶一起 reset(日切不区分模型,豆包对所有模型额度统一重置)。
+    def summarize_account_availability(
+        self,
+        daily_quotas: dict[str, int],
+        model: str,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """v0.2.12:给前端清晰的等待原因 —— 「没有账号」vs 「全部用完」。
+
+        不直接返回 Account,只统计数字。choose_available_account 返 None
+        时,前端拿这两个数字决定提示文案。
+        """
+        field_name = _quota_field(model)
+        bucket = field_name.removeprefix("video_quota_used_")
+        quota_limit = int(daily_quotas[bucket])
+        field = getattr(Account, field_name)
+        now = now or utcnow()
+        enabled_total = (
+            Account.select()
+            .where((Account.enabled == True) & (Account.status == "active"))  # noqa: E712
+            .count()
+        )
+        bucket_full = (
+            Account.select()
+            .where(
+                (Account.enabled == True)  # noqa: E712
+                & (Account.status == "active")
+                & (
+                    (field >= quota_limit)
+                    | ((Account.video_limited_until.is_null(False))
+                       & (Account.video_limited_until > now))
+                )
+            )
+            .count()
+        )
+        return {"enabled_total": enabled_total, "bucket_full": bucket_full}
+
+    def reset_daily_quotas(self, business_date: date, now: datetime | None = None) -> None:
+        """三桶一起 reset(日切不区分模型,豆包对所有模型额度统一重置)。
+
+        v0.2.12 顺带清 limited_until 已过期但桶被 cap 死的账号:
+        `mark_account_limited` 会把三桶 cap 到 quota_limit,直到 `reset_daily_quotas`
+        在跨天时才清。如果 limited_until 落在当天内(豆包 423 短时封号),
+        旧实现会让账号永久不可选 —— 因为 `< quota_limit` 永远是 False。
+        现在即使还没跨天,只要 limited_until <= now,就把桶清回 0 + 撤掉
+        limited_until,让账号恢复可用。
+        """
+        now = now or utcnow()
         (Account.update(
             video_quota_used_mini=0,
             video_quota_used_v2=0,
@@ -156,6 +201,22 @@ class AccountRepository:
             video_limited_until=None,
          )
          .where((Account.video_quota_date.is_null(True)) | (Account.video_quota_date != business_date))
+         .execute())
+        # v0.2.12:同一天内 limited_until 已到期 → 桶已 cap 死,清桶让账号恢复。
+        # 注意只清 limited_until <= now 且 date == business_date 的行,
+        # date 不一致说明跨天了,上面的 reset 已经处理过,这里跳过避免双写竞态。
+        (Account.update(
+            video_quota_used_mini=0,
+            video_quota_used_v2=0,
+            video_quota_used_std=0,
+            video_limited_until=None,
+            updated_at=now,
+         )
+         .where(
+             (Account.video_limited_until.is_null(False))
+             & (Account.video_limited_until <= now)
+             & (Account.video_quota_date == business_date)
+         )
          .execute())
 
     def mark_account_limited(

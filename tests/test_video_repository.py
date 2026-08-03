@@ -148,6 +148,78 @@ def test_mark_account_limited_zeroes_all_buckets(repository, temp_profile):
     assert repository.choose_available_account(quotas, model="seedance_v2.0_std") is None
 
 
+def test_reset_daily_quotas_clears_expired_limited_until(repository, temp_profile):
+    """v0.2.12:`mark_account_limited` 把桶 cap 到 quota_limit,
+    如果 limited_until 在当天内到期,旧实现会让账号永久不可选。
+    `reset_daily_quotas` 现在顺带清掉已过期的 limited_until + 三桶归零。"""
+    account = Account.create(
+        id="acc-recover", display_name="r", doubao_user_id="u-recover",
+        profile_dir=temp_profile, video_quota_date=date(2026, 7, 13),
+    )
+    quotas = {"mini": 5, "v2": 5, "std": 5}
+    # 假设豆包 423 封到 16:00
+    repository.mark_account_limited(account.id, datetime(2026, 7, 13, 16, 0), quotas)
+    assert repository.choose_available_account(quotas, model="seedance_v2.0_mini") is None
+
+    # 当天 21:00 — limited_until 已过期 5 小时
+    repository.reset_daily_quotas(date(2026, 7, 13), now=datetime(2026, 7, 13, 21, 0))
+
+    refreshed = Account.get_by_id(account.id)
+    assert refreshed.video_quota_used_mini == 0
+    assert refreshed.video_quota_used_v2 == 0
+    assert refreshed.video_quota_used_std == 0
+    assert refreshed.video_limited_until is None
+    # 账号重新可选
+    picked = repository.choose_available_account(quotas, model="seedance_v2.0_mini")
+    assert picked is not None
+    assert picked.id == account.id
+
+
+def test_reset_daily_quotas_does_not_touch_active_limited_until(repository, temp_profile):
+    """v0.2.12:limited_until 还在未来时不要清桶,封号期别被中途放出来。"""
+    account = Account.create(
+        id="acc-active-lim", display_name="a", doubao_user_id="u-al",
+        profile_dir=temp_profile, video_quota_date=date(2026, 7, 13),
+    )
+    quotas = {"mini": 5, "v2": 5, "std": 5}
+    future = datetime(2026, 7, 14, 0, 0)  # 次日凌晨才到期
+    repository.mark_account_limited(account.id, future, quotas)
+
+    repository.reset_daily_quotas(date(2026, 7, 13), now=datetime(2026, 7, 13, 21, 0))
+
+    refreshed = Account.get_by_id(account.id)
+    assert refreshed.video_limited_until == future
+    assert refreshed.video_quota_used_mini == 5
+    assert repository.choose_available_account(quotas, model="seedance_v2.0_mini") is None
+
+
+def test_summarize_account_availability_counts_buckets(repository, temp_profile):
+    """v0.2.12:UI 需要区分「没有账号」vs「全部用完」,summary 计数要准。"""
+    quotas = {"mini": 5, "v2": 5, "std": 5}
+    now = datetime(2026, 7, 13, 12, 0)
+    # 0 个账号
+    assert repository.summarize_account_availability(quotas, "seedance_v2.0_mini", now=now) == {
+        "enabled_total": 0, "bucket_full": 0
+    }
+    # 1 个活跃账号,桶空
+    Account.create(id="acc-ok", display_name="ok", doubao_user_id="ok", profile_dir=temp_profile)
+    assert repository.summarize_account_availability(quotas, "seedance_v2.0_mini", now=now) == {
+        "enabled_total": 1, "bucket_full": 0
+    }
+    # 1 个 disabled + 1 个 active 桶满
+    Account.create(
+        id="acc-dis", display_name="dis", doubao_user_id="dis",
+        profile_dir=temp_profile, enabled=False,
+    )
+    full = Account.create(
+        id="acc-full", display_name="full", doubao_user_id="full", profile_dir=temp_profile,
+    )
+    repository.mark_account_limited(full.id, datetime(2026, 7, 13, 16, 0), quotas)
+    stats = repository.summarize_account_availability(quotas, "seedance_v2.0_mini", now=now)
+    assert stats["enabled_total"] == 2  # ok + full(dis 不算)
+    assert stats["bucket_full"] == 1
+
+
 def test_increment_account_quota_rejects_unknown_model(repository, temp_profile):
     """v0.2.9:非法 model 不能悄悄扣错桶。"""
     account = Account.create(

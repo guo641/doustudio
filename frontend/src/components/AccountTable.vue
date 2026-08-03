@@ -15,18 +15,15 @@ type Account = {
   video_quota_total?: number;
   video_quota_used_mini?: number;
   video_quota_total_mini?: number;
-  video_quota_used_v2?: number;
-  video_quota_total_v2?: number;
   video_quota_used_std?: number;
   video_quota_total_std?: number;
   video_limited_until?: string;
 };
 
-type Bucket = 'mini' | 'v2' | 'std';
+type Bucket = 'mini' | 'std';
 const BUCKETS: { key: Bucket; label: string }[] = [
   { key: 'mini', label: 'mini' },
-  { key: 'v2', label: 'v2.0' },
-  { key: 'std', label: 'std' },
+  { key: 'std', label: 'fast' },
 ];
 
 defineProps<{ accounts: Account[]; loading?: boolean; busy?: boolean }>();
@@ -96,7 +93,7 @@ function formatRecovery(value?: string) {
         <tr>
           <th style="width: 24%">账号</th>
           <th style="width: 12%">状态</th>
-          <th style="width: 26%">今日额度(mini / v2 / std)</th>
+          <th style="width: 26%">今日额度(mini / fast)</th>
           <th style="width: 16%">限额恢复</th>
           <th style="width: 10%">参与调度</th>
           <th style="width: 12%">操作</th>
