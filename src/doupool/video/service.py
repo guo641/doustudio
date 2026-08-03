@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from doupool.db.models import Account, VideoTask
 from doupool.db.repository import AccountRepository
 from doupool.prompt_reviser import classify_failure, revise_prompt
+from doupool import callbacks as callbacks_mod
 from doupool.watermark import (
     ZhucekaConfigError,
     ZhucekaError,
@@ -72,6 +73,9 @@ class VideoTaskService:
         # shutdown 时也不强制 cancel(用户主动 retry 的话让他跑完)。
         self._retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._retry_cancellations: dict[str, threading.Event] = {}
+        # v0.2.9:callback 任务池 —— 每个 task 最多一个 callback 在跑,
+        # 重试 retry-result 不重复发回执(只在最终 terminal 状态发一次)。
+        self._callback_tasks: dict[str, asyncio.Task[None]] = {}
         self._account_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._global_semaphore: asyncio.Semaphore | None = None
         self._semaphore_limit = 0
@@ -86,6 +90,7 @@ class VideoTaskService:
         mode: str = "t2v",
         images: list[dict] | None = None,
         prompts: list[str] | None = None,
+        callback_url: str | None = None,
     ):
         prompt = prompt.strip()
         mode = (mode or "t2v").strip().lower()
@@ -135,6 +140,7 @@ class VideoTaskService:
                 image_paths=image_paths or None,
                 group_id=group_id,
                 group_index=index if group_id else 0,
+                callback_url=callback_url,
             )
             self._schedule(task.id)
             if first_task is None:
@@ -196,6 +202,47 @@ class VideoTaskService:
         cancellation = threading.Event()
         self._cancellations[task_id] = cancellation
         self._tasks[task_id] = asyncio.create_task(self._run(task_id, cancellation))
+
+    def _schedule_callback(self, task_id: str) -> None:
+        """v0.2.9:任务到 terminal 状态后异步派发 callback。
+
+        同步 fire-and-forget —— 不 await。callback 失败/超时由 dispatcher
+        内部退避重试,不影响主任务状态。每个 task 只发一次(retry-result
+        拿新 result 后也会复用这个方法,这时旧 callback task 还没跑完的
+        就让它跑完,用最新 payload 再发一次)。
+        """
+        # 同 task 已有 callback 在跑 → 取消,避免旧 payload 先发到 callback_url
+        if task_id in self._callback_tasks and not self._callback_tasks[task_id].done():
+            self._callback_tasks[task_id].cancel()
+        self._callback_tasks[task_id] = asyncio.create_task(
+            self._dispatch_callback(task_id)
+        )
+
+    async def _dispatch_callback(self, task_id: str) -> None:
+        try:
+            task = self.repository.get_video_task(task_id)
+            if task is None:
+                return
+            # 没设 callback_url → 直接标 disabled,跳过 dispatcher。
+            if not (task.callback_url or "").strip():
+                if task.callback_status != "disabled":
+                    self.repository.update_video_task(
+                        task_id, callback_status="disabled", callback_last_error=None
+                    )
+                return
+            await callbacks_mod.dispatch(
+                task,
+                lambda **values: self.repository.update_video_task(task_id, **values),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception(
+                "callback 调度异常",
+                extra={"event": "callback_dispatch_crashed", "task_id": task_id},
+            )
+        finally:
+            self._callback_tasks.pop(task_id, None)
 
     # ---------- v0.2.9 retry-result 入口 ----------
     def retry_result(self, task_id: str) -> VideoTask:
@@ -337,6 +384,10 @@ class VideoTaskService:
             self.logger.exception(
                 "retry-result 后去水印异常", extra={"task_id": task_id}
             )
+        # v0.2.9:retry-result 拿到新 result 也发 callback —— callback_url
+        # 之前可能已经发过"旧 succeeded"的回执,但拿到的 result_url 已更新,
+        # 重新发一次让接收方能拉到最新下载链接。
+        self._schedule_callback(task_id)
 
     async def resume_queued(self) -> None:
         for task in self.repository.list_queued_video_tasks():
@@ -445,6 +496,9 @@ class VideoTaskService:
                                 "去水印过程出现未捕获异常,任务保留 succeeded 状态",
                                 extra={"event": "watermark_unexpected_error", "task_id": task_id},
                             )
+                        # v0.2.9:succeeded 后异步发 callback —— 拿到最新 task 行
+                        # (含 result_url / clean_video_url)再发,前端收到时就能直接用。
+                        self._schedule_callback(task_id)
                         return
                     except DoubaoRateLimited:
                         self.repository.mark_account_limited(
@@ -491,6 +545,8 @@ class VideoTaskService:
                         self.logger.exception(
                             "视频任务失败", extra={"event": "video_failed", "account_id": account.id}
                         )
+                        # v0.2.9:failed 也触发 callback —— 让 callback_url 知道最终落点。
+                        self._schedule_callback(task_id)
                         return
 
     async def _run_watermark(self, task_id: str, result: dict, settings: dict) -> None:
@@ -544,6 +600,18 @@ class VideoTaskService:
             done, pending = await asyncio.wait(
                 list(self._retry_tasks.values()),
                 timeout=10,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        # callback 任务同理 —— 关停时让最后一次 retry 发完,免得接收方误以为
+        # 任务中断。timeout 给到重试总时间上限(5+25=30s),别让 UI 卡死。
+        if self._callback_tasks:
+            done, pending = await asyncio.wait(
+                list(self._callback_tasks.values()),
+                timeout=35,
                 return_when=asyncio.ALL_COMPLETED,
             )
             for task in pending:

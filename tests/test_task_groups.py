@@ -30,6 +30,7 @@ class _StubRepo:
         image_paths=None,
         group_id=None,
         group_index=0,
+        callback_url=None,
     ):
         record = {
             "id": f"task-{len(self.created) + 1}",

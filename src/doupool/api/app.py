@@ -32,6 +32,10 @@ class CreateVideoTaskBody(BaseModel):
     account_id: str | None = None
     mode: str = "t2v"
     images: list[ImageAttachmentBody] = Field(default_factory=list, max_length=9)
+    # v0.2.9:外部异步回执 URL。任务到 terminal 状态后服务 POST JSON
+    # {task_id, status, result_url, ...}。必须是 http:// 或 https://,
+    # 其它 scheme 静默忽略(避免 file:// / gopher://)。
+    callback_url: str | None = None
 
 
 class UpdateAccountBody(BaseModel):
@@ -357,6 +361,9 @@ def create_app(
                 {"name": item["name"], "data_base64": item["data_base64"]}
                 for item in payload.get("images") or []
             ]
+            # v0.2.9:callback_url 直接透传给 service,service 负责入库
+            # 与异步派发;这里不做 scheme 校验(让 dispatcher 留痕 callback_status=
+            # 'failed' 即可,422 拒绝会让前端拿不到任务 ID,反而难排查)。
             task = video_service.start(**payload)
         except (ValueError, NoAvailableAccount) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

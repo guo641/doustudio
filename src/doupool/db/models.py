@@ -95,6 +95,13 @@ class VideoTask(BaseModel):
     created_at = DateTimeField(default=utcnow)
     updated_at = DateTimeField(default=utcnow)
     completed_at = DateTimeField(null=True)
+    # v0.2.9:callbackUrl 异步回执状态。callback_url 在提交时一次性写入,
+    # callback_status / callback_attempts / callback_last_error 由 service
+    # 在任务 terminal 后异步维护,前端只在排查时查询(暂未暴露给前端)。
+    callback_url = TextField(null=True)
+    callback_status = CharField(null=True)  # pending / sending / succeeded / failed / disabled
+    callback_attempts = IntegerField(default=0)
+    callback_last_error = TextField(null=True)
 
 
 class AppSetting(BaseModel):

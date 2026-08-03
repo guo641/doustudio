@@ -141,6 +141,7 @@ class AccountRepository:
         image_paths: list[str] | None = None,
         group_id: str | None = None,
         group_index: int = 0,
+        callback_url: str | None = None,
     ) -> VideoTask:
         with self.database.atomic():
             task = VideoTask.create(
@@ -156,6 +157,8 @@ class AccountRepository:
                 image_paths=json.dumps(image_paths or [], ensure_ascii=False) if image_paths else None,
                 group_id=group_id,
                 group_index=group_index,
+                callback_url=callback_url,
+                callback_status="pending" if callback_url else None,
             )
             if account_id:
                 Account.update(updated_at=utcnow()).where(Account.id == account_id).execute()
