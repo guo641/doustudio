@@ -1,9 +1,11 @@
-"""v0.2.7:沿 yaonieyo/doubao-account-pool 双轨判定测试。
+"""v0.2.7:沿 yaonieyo/doubao-account-pool 双轨判定测试 + v0.2.8 加 sessionid 闸门。
 
 不再测试 on_response / /passport/web/account/info/ 调用 —— 字节系 aegis 风控
 把所有非浏览器指纹请求拒为 1011。我们只信 Chromium 自己看到的:
   Tier 1: context.cookies() doubao.com cookie 计数
   Tier 2: page.evaluate DOM innerText 不含登录关键词
+  v0.2.8 闸门 1: 主循环起 ≥3s 才接受 identity(排除 page.goto 假阳性窗口)
+  v0.2.8 闸门 2: sessionid cookie(32-hex)是字节系唯一登录凭证
   user_id: page.evaluate localStorage.__tea_cache_tokens_497858.user_unique_id
 """
 import json
@@ -14,10 +16,12 @@ from doupool.login.browser import (
     LOGGED_OUT_KEYWORDS,
     _context_doubao_cookie_count,
     _extract_user_id_from_cookies,
+    _has_valid_sessionid,
     _is_doubao_cookie,
     _page_looks_logged_in,
     _read_user_unique_id_from_page,
     _save_doubao_cookies_to_disk,
+    _sessionid_cookie_value,
     _try_rescue_for_fallback,
     wait_for_identity,
 )
@@ -95,8 +99,18 @@ class _FakeCancelingPage(FakePage):
     """每次 evaluate 后调一次 after_evaluate(callback)。用于测试"等待 N 次
     evaluate 后用户取消"的场景,避免主循环真死锁卡 pytest。"""
 
-    def __init__(self, alive=True, evaluate_payload=None, after_evaluate=None):
-        super().__init__(alive=alive, evaluate_payload=evaluate_payload)
+    def __init__(
+        self,
+        alive=True,
+        evaluate_payload=None,
+        evaluate_queue=None,
+        after_evaluate=None,
+    ):
+        super().__init__(
+            alive=alive,
+            evaluate_payload=evaluate_payload,
+            evaluate_queue=evaluate_queue,
+        )
         self._after_evaluate = after_evaluate
 
     def evaluate(self, script):
@@ -252,6 +266,87 @@ def test_extract_user_id_from_cookies_skips_empty_value():
     assert _extract_user_id_from_cookies(cookies) is None
 
 
+# ---------------------------------------------------------------------------
+# v0.2.8:sessionid cookie 闸门(主循环和 rescue 路径共用)
+# ---------------------------------------------------------------------------
+
+_VALID_SESSIONID = "deadbeef" * 4  # 32 chars, all hex
+
+
+def test_sessionid_returns_true_for_32hex_sessionid():
+    cookies = [{"name": "sessionid", "value": _VALID_SESSIONID, "domain": ".doubao.com"}]
+    ctx = FakeContext(alive=True, cookies=cookies)
+    assert _has_valid_sessionid(ctx) is True
+
+
+def test_sessionid_returns_true_for_sessionid_ss():
+    """byteDance 还有 sessionid_ss(secure session,server 端同步用)。"""
+    cookies = [{"name": "sessionid_ss", "value": _VALID_SESSIONID, "domain": ".doubao.com"}]
+    ctx = FakeContext(alive=True, cookies=cookies)
+    assert _has_valid_sessionid(ctx) is True
+
+
+def test_sessionid_returns_false_when_only_tracking_cookies():
+    """v0.2.7 假阳性场景:只有 tracking cookies(s_v_web_id/odin_tt/ttwid/n_mh)→ 拒绝。"""
+    cookies = [
+        {"name": "s_v_web_id", "value": "verify_ms_xxxx", "domain": ".doubao.com"},
+        {"name": "odin_tt", "value": "a719bf" * 8, "domain": ".doubao.com"},
+        {"name": "ttwid", "value": "1|abc|123|def", "domain": ".doubao.com"},
+        {"name": "n_mh", "value": "9-mIe" * 8, "domain": ".doubao.com"},
+    ]
+    ctx = FakeContext(alive=True, cookies=cookies)
+    assert _has_valid_sessionid(ctx) is False
+
+
+def test_sessionid_returns_false_for_short_value():
+    cookies = [{"name": "sessionid", "value": "abc", "domain": ".doubao.com"}]
+    ctx = FakeContext(alive=True, cookies=cookies)
+    assert _has_valid_sessionid(ctx) is False
+
+
+def test_sessionid_returns_false_for_non_hex_value():
+    cookies = [{"name": "sessionid", "value": "z" * 32, "domain": ".doubao.com"}]
+    ctx = FakeContext(alive=True, cookies=cookies)
+    assert _has_valid_sessionid(ctx) is False
+
+
+def test_sessionid_returns_false_for_empty_value():
+    cookies = [{"name": "sessionid", "value": "", "domain": ".doubao.com"}]
+    ctx = FakeContext(alive=True, cookies=cookies)
+    assert _has_valid_sessionid(ctx) is False
+
+
+def test_sessionid_returns_false_for_non_doubao_cookie():
+    """sessionid 只在 doubao.com 域才算,其它域同名不算。"""
+    cookies = [
+        {"name": "sessionid", "value": _VALID_SESSIONID, "domain": ".google.com"},
+    ]
+    ctx = FakeContext(alive=True, cookies=cookies)
+    assert _has_valid_sessionid(ctx) is False
+
+
+def test_sessionid_returns_false_when_context_closed():
+    cookies = [{"name": "sessionid", "value": _VALID_SESSIONID, "domain": ".doubao.com"}]
+    ctx = FakeContext(alive=False, cookies=cookies)
+    assert _has_valid_sessionid(ctx) is False
+
+
+def test_sessionid_cookie_value_returns_first_match():
+    cookies = [
+        {"name": "sessionid", "value": "abcdef01" * 4, "domain": ".doubao.com"},
+        {"name": "sessionid_ss", "value": "12345678" * 4, "domain": ".doubao.com"},
+    ]
+    ctx = FakeContext(alive=True, cookies=cookies)
+    assert _sessionid_cookie_value(ctx) == "abcdef01" * 4
+
+
+def test_sessionid_cookie_value_returns_none_when_absent():
+    ctx = FakeContext(alive=True, cookies=[
+        {"name": "s_v_web_id", "value": "tracking", "domain": ".doubao.com"},
+    ])
+    assert _sessionid_cookie_value(ctx) is None
+
+
 def test_logged_out_keywords_contains_yaonieyo_set():
     """对标 yaonieyo electron/executor.ts:326-334 关键词集合。"""
     for kw in ("扫码登录", "手机号登录", "验证码登录", "登录/注册"):
@@ -309,9 +404,10 @@ def test_save_doubao_cookies_returns_false_when_no_doubao_cookie(tmp_path: Path)
 
 def test_rescue_for_fallback_writes_cookies_and_identity(tmp_path: Path):
     """v0.2.7 关键路径:context 还活着 + 有 doubao cookie + localStorage 有
-    user_unique_id → 抢救后 cookies.json 和 identity.json 都写盘。"""
+    user_unique_id → 抢救后 cookies.json 和 identity.json 都写盘。
+    v0.2.8:sessionid 必须 32-hex 才写 identity.json(rescue 同步闸门)。"""
     cookies = [
-        {"name": "sessionid", "value": "abc", "domain": ".doubao.com",
+        {"name": "sessionid", "value": "deadbeef" * 4, "domain": ".doubao.com",
          "path": "/", "httpOnly": True, "secure": False, "expires": -1},
     ]
     page = FakePage(
@@ -385,12 +481,129 @@ def test_wait_identity_returns_when_already_set():
     assert identity.user_id == "u-fast"
 
 
+# ---------------------------------------------------------------------------
+# v0.2.8:wait_for_identity 主循环闸门测试
+# ---------------------------------------------------------------------------
+
+
+def test_wait_identity_continues_when_sessionid_absent():
+    """v0.2.7 假阳性场景重放:DOM pass + localStorage 有 user_id + 无 sessionid。
+    v0.2.8 闸门 2 必须拒绝并继续轮询,直到 cancel 才退出。"""
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    cancel = threading.Event()
+
+    # 只有 tracking cookies,没有 sessionid(典型首访)
+    cookies = [
+        {"name": "s_v_web_id", "value": "verify_x", "domain": ".doubao.com"},
+        {"name": "odin_tt", "value": "abcd" * 16, "domain": ".doubao.com"},
+        {"name": "ttwid", "value": "1|x|1|x", "domain": ".doubao.com"},
+    ]
+    # 每次 evaluate 都返相同 payload:DOM pass + localStorage 有 user_id
+    page = _FakeCancelingPage(
+        alive=True,
+        evaluate_payload=None,  # 用 evaluate_queue 模式
+        evaluate_queue=[
+            "欢迎使用豆包 AI",  # DOM 探测
+            {"ok": True, "value": "7669336097453426239"},  # tracking ID
+        ],
+        after_evaluate=lambda _script: cancel.set(),
+    )
+    ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
+
+    try:
+        wait_for_identity(
+            lambda: [page], ready, identities, cancel, context=ctx,
+        )
+    except RuntimeError as exc:
+        assert "登录已取消" in str(exc)
+
+    # 关键断言:identity 永远不应该被设(闸门 2 拒绝)
+    assert identities == []
+
+
+def test_wait_identity_requires_minimum_elapsed_time():
+    """v0.2.8 闸门 1:主循环起 <3s 不接受 identity,即使 sessionid 已经合法。
+    因为 _FakeCancelingPage 第一次 evaluate 就 cancel,会触发"主循环才过
+    0.0s,小于 3s 冷却"的拒绝路径。"""
+    ready = threading.Event()
+    identities: list[DoubaoIdentity] = []
+    cancel = threading.Event()
+
+    cookies = [{
+        "name": "sessionid", "value": _VALID_SESSIONID, "domain": ".doubao.com",
+    }]
+    page = _FakeCancelingPage(
+        alive=True,
+        evaluate_queue=[
+            "欢迎使用豆包 AI",  # DOM 通过
+            {"ok": True, "value": "u-real-7777"},  # 即使有也不该被接受
+        ],
+        after_evaluate=lambda _script: cancel.set(),
+    )
+    ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
+
+    try:
+        wait_for_identity(
+            lambda: [page], ready, identities, cancel, context=ctx,
+        )
+    except RuntimeError as exc:
+        assert "登录已取消" in str(exc)
+
+    # 闸门 1 拒绝:identity 不该被设
+    assert identities == []
+
+
+def test_wait_identity_accepts_when_sessionid_present():
+    """完整主路径 happy-path:DOM pass + sessionid 32-hex + 3s 后 + localStorage
+    有 user_id → 命中。已在 test_wait_identity_returns_via_cookie_dom_localstorage
+    覆盖;这里加一个更明确的、聚焦 sessionid 的变体。"""
+    # 这是 happy-path,主测试已经覆盖。这里只断言:_has_valid_sessionid
+    # 对 cookie 列表里只有 sessionid 32-hex 的返回 True
+    cookies = [{"name": "sessionid", "value": _VALID_SESSIONID, "domain": ".doubao.com"}]
+    ctx = FakeContext(alive=True, cookies=cookies)
+    assert _has_valid_sessionid(ctx) is True
+    # 同时 _sessionid_cookie_value 能取回
+    assert _sessionid_cookie_value(ctx) == _VALID_SESSIONID
+
+
+def test_wait_identity_rescue_skips_identity_without_sessionid(tmp_path: Path):
+    """v0.2.8:rescue 也走 sessionid 闸门 —— 没有 sessionid 不写 identity.json。
+    cookies.json 仍写(供调试 / 后续重试)。"""
+    cookies = [
+        # 只有 tracking cookies,没有 sessionid(假阳性场景的磁盘回收)
+        {"name": "s_v_web_id", "value": "verify_x", "domain": ".doubao.com",
+         "path": "/", "httpOnly": False, "secure": False, "expires": -1},
+        {"name": "ttwid", "value": "1|x|1|x", "domain": ".doubao.com",
+         "path": "/", "httpOnly": False, "secure": False, "expires": -1},
+    ]
+    page = FakePage(
+        alive=True,
+        # 即使 localStorage 有 tracking user_unique_id,rescue 也不该写 identity
+        evaluate_payload={"ok": True, "value": "7669336097453426239"},
+    )
+    ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
+
+    _try_rescue_for_fallback(ctx, tmp_path)
+
+    # cookies.json 写(抢救出来供调试 / 后续重试用)
+    assert (tmp_path / "cookies.json").exists()
+    # identity.json 不写(闸门拦截)
+    assert not (tmp_path / "identity.json").exists()
+
+
 def test_wait_identity_returns_via_cookie_dom_localstorage():
-    """完整主路径:cookie 出现 + DOM 通过 + localStorage user_unique_id → 命中。"""
+    """完整主路径:cookie 出现 + DOM 通过 + sessionid 32-hex + localStorage
+    user_unique_id → 主循环过 3s 后命中。"""
     ready = threading.Event()
     identities: list[DoubaoIdentity] = []
 
-    cookies = [{"name": "sessionid", "value": "abc", "domain": ".doubao.com"}]
+    # v0.2.8:sessionid 必须是 32-hex 才会被主循环接受
+    cookies = [{
+        "name": "sessionid",
+        "value": "deadbeef" * 4,  # 32 chars hex
+        "domain": ".doubao.com",
+    }]
     # evaluate_queue 第一次返 DOM 文本(无登录关键词),第二次返 user_unique_id。
     # 注意 LOGGED_OUT_KEYWORDS 含 "登录" 兜底词,DOM payload 必须避开这两个字。
     page = FakePage(
@@ -408,29 +621,6 @@ def test_wait_identity_returns_via_cookie_dom_localstorage():
     )
     assert identity.user_id == "u-from-tea"
     assert identity.nickname is None
-
-
-def test_wait_identity_skips_when_dom_still_has_login_keywords():
-    """cookie 有但 DOM 仍含登录关键词 → 不读 localStorage,继续等。"""
-    ready = threading.Event()
-    identities: list[DoubaoIdentity] = []
-
-    cookies = [{"name": "sessionid", "value": "abc", "domain": ".doubao.com"}]
-    page = FakePage(
-        alive=True,
-        evaluate_payload="请使用 豆包 APP 扫码登录",  # 永远包含登录关键词
-    )
-    ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
-
-    try:
-        wait_for_identity(
-            lambda: [page], ready, identities, threading.Event(),
-            context=ctx,
-        )
-    except RuntimeError:
-        pass  # grace period 过了 raise
-    # 不论怎样,identity 永远不该被设(因为 DOM 不通过)
-    assert identities == []
 
 
 def test_wait_identity_skips_when_dom_still_has_login_keywords():
@@ -522,11 +712,14 @@ def test_wait_identity_raises_on_cancel():
 
 
 def test_wait_identity_rescues_on_grace_timeout(tmp_path: Path):
-    """v0.2.7:grace period 超时前抢救 cookies + identity(若 active page 在抢救时存在)。"""
+    """v0.2.7:grace period 超时前抢救 cookies + identity(若 active page 在抢救时存在)。
+    v0.2.8:sessionid 必须 32-hex 才写 identity.json(rescue 同步闸门)。
+    """
     ready = threading.Event()
     identities: list[DoubaoIdentity] = []
     cookies = [
-        {"name": "sessionid", "value": "abc", "domain": ".doubao.com",
+        # v0.2.8:32-hex sessionid 才能让 rescue 写 identity.json
+        {"name": "sessionid", "value": "deadbeef" * 4, "domain": ".doubao.com",
          "path": "/", "httpOnly": True, "secure": False, "expires": -1},
     ]
     # 用 evaluate_queue:第一次给 DOM(避开"登录"二字),第二次给 localStorage
@@ -553,6 +746,8 @@ def test_wait_identity_rescues_on_grace_timeout(tmp_path: Path):
 
     # grace period 超时后 _try_rescue_for_fallback 应该写盘
     assert (tmp_path / "cookies.json").exists()
+    # v0.2.8:rescue 同步 sessionid 闸门,32-hex 在 → identity.json 也写
+    assert (tmp_path / "identity.json").exists()
 
 
 def test_wait_identity_raises_when_context_arg_missing():
@@ -576,14 +771,18 @@ def test_wait_identity_raises_when_context_arg_missing():
 
 
 def test_verify_from_disk_prefers_identity_json(tmp_path: Path):
-    """identity.json 存在且有 user_id → 直接返回,不看 cookies.json。"""
+    """v0.2.7:identity.json 存在且有 user_id → 直接返回(若 sessionid 闸门过)。
+    v0.2.8.1:cookies.json 必须有合法 sessionid 才算登录。
+    """
     (tmp_path / "identity.json").write_text(
         json.dumps({"user_id": "u-from-identity", "rescued_at": "2026-08-02T00:00:00Z"}),
         encoding="utf-8",
     )
-    # 也写 cookies.json 但应该不被读到
     (tmp_path / "cookies.json").write_text(
-        json.dumps([{"name": "sessionid", "value": "abc", "domain": ".doubao.com"}]),
+        json.dumps([
+            # 32-hex sessionid —— 让闸门通过,identity.json.user_id 才能返回
+            {"name": "sessionid", "value": "deadbeef" * 4, "domain": ".doubao.com"},
+        ]),
         encoding="utf-8",
     )
     identity = _verify_from_disk(tmp_path)
@@ -593,10 +792,12 @@ def test_verify_from_disk_prefers_identity_json(tmp_path: Path):
 
 
 def test_verify_from_disk_falls_back_to_cookies_user_unique_id(tmp_path: Path):
-    """没有 identity.json,cookies.json 有 user_unique_id hint → 命中。"""
+    """v0.2.7:没有 identity.json,cookies.json 有 user_unique_id hint → 命中。
+    v0.2.8.1:sessionid 必须 32-hex 闸门通过。
+    """
     (tmp_path / "cookies.json").write_text(
         json.dumps([
-            {"name": "sessionid", "value": "abc", "domain": ".doubao.com"},
+            {"name": "sessionid", "value": "deadbeef" * 4, "domain": ".doubao.com"},
             {"name": "user_unique_id", "value": "u-from-cookie", "domain": "doubao.com"},
         ]),
         encoding="utf-8",
@@ -646,12 +847,129 @@ def test_verify_from_disk_handles_corrupt_cookies_json(tmp_path: Path):
 
 
 def test_verify_from_disk_falls_through_identity_to_cookies(tmp_path: Path):
-    """identity.json 损坏 → 跳过,继续读 cookies.json(且命中 user_id hint)。"""
+    """identity.json 损坏 → 跳过,继续读 cookies.json(且命中 user_id hint)。
+    v0.2.8.1:sessionid 闸门必须过。
+    """
     (tmp_path / "identity.json").write_text("{not-json", encoding="utf-8")
     (tmp_path / "cookies.json").write_text(
-        json.dumps([{"name": "user_unique_id", "value": "u-fallthrough", "domain": ".doubao.com"}]),
+        json.dumps([
+            {"name": "sessionid", "value": "deadbeef" * 4, "domain": ".doubao.com"},
+            {"name": "user_unique_id", "value": "u-fallthrough", "domain": ".doubao.com"},
+        ]),
         encoding="utf-8",
     )
     identity = _verify_from_disk(tmp_path)
     assert identity is not None
     assert identity["user_id"] == "u-fallthrough"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.8.1:sessionid 闸门专用测试
+# ---------------------------------------------------------------------------
+
+
+def test_verify_from_disk_rejects_identity_without_sessionid(tmp_path: Path):
+    """v0.2.8.1:identity.json 有 user_id 但 cookies.json 无合法 sessionid → 拒绝。
+
+    这是修复 v0.2.7 假阳性的关键场景:v0.2.7 会把 identity.json 里的
+    user_unique_id(tracking ID,首访即下发)当作 user_id 接受,v0.2.8.1 必须
+    在没有 sessionid cookie 时整体拒绝。
+    """
+    (tmp_path / "identity.json").write_text(
+        json.dumps({"user_id": "u-tracking-only", "rescued_at": "2026-08-02T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    # cookies.json 只有 tracking cookies,无 sessionid
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([
+            {"name": "s_v_web_id", "value": "verify_ms_xxxx", "domain": ".doubao.com"},
+            {"name": "odin_tt", "value": "a719bf" * 8, "domain": ".doubao.com"},
+            {"name": "ttwid", "value": "1|abc|123|def", "domain": ".doubao.com"},
+        ]),
+        encoding="utf-8",
+    )
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_accepts_identity_with_valid_sessionid(tmp_path: Path):
+    """v0.2.8.1:identity.json 有 user_id 且 cookies.json 有合法 32-hex sessionid → 通过。"""
+    (tmp_path / "identity.json").write_text(
+        json.dumps({"user_id": "u-real-login", "rescued_at": "2026-08-02T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([
+            {"name": "sessionid", "value": "deadbeef" * 4, "domain": ".doubao.com"},
+        ]),
+        encoding="utf-8",
+    )
+    identity = _verify_from_disk(tmp_path)
+    assert identity is not None
+    assert identity["user_id"] == "u-real-login"
+
+
+def test_verify_from_disk_accepts_cookies_with_sessionid_and_user_id(tmp_path: Path):
+    """v0.2.8.1:无 identity.json,cookies.json 有合法 sessionid + user_id hint → 兜底通过。"""
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([
+            {"name": "sessionid", "value": "deadbeef" * 4, "domain": ".doubao.com"},
+            {"name": "user_unique_id", "value": "u-from-cookie", "domain": "doubao.com"},
+        ]),
+        encoding="utf-8",
+    )
+    identity = _verify_from_disk(tmp_path)
+    assert identity is not None
+    assert identity["user_id"] == "u-from-cookie"
+
+
+def test_verify_from_disk_rejects_sessionid_wrong_format(tmp_path: Path):
+    """v0.2.8.1:sessionid 存在但不是 32-hex(可能被注入垃圾) → 拒绝。"""
+    (tmp_path / "identity.json").write_text(
+        json.dumps({"user_id": "u-attempt", "rescued_at": "2026-08-02T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([
+            # sessionid 名字对但值不是 32-hex
+            {"name": "sessionid", "value": "abc123", "domain": ".doubao.com"},
+        ]),
+        encoding="utf-8",
+    )
+    assert _verify_from_disk(tmp_path) is None
+
+
+def test_verify_from_disk_accepts_sessionid_ss_variant(tmp_path: Path):
+    """v0.2.8.1:sessionid_ss(secure session 变种)同样能过闸门。"""
+    (tmp_path / "identity.json").write_text(
+        json.dumps({"user_id": "u-via-ss", "rescued_at": "2026-08-02T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([
+            {"name": "sessionid_ss", "value": "deadbeef" * 4, "domain": ".doubao.com"},
+        ]),
+        encoding="utf-8",
+    )
+    identity = _verify_from_disk(tmp_path)
+    assert identity is not None
+    assert identity["user_id"] == "u-via-ss"
+
+
+def test_verify_from_disk_rejects_non_doubao_sessionid(tmp_path: Path):
+    """v0.2.8.1:别域 cookie 里有 sessionid 32-hex → 不算 doubao 登录,拒绝。
+
+    防 fail-open:用户在第三方域名(如某个 doubao 嵌入页)写了个巧合的 32-hex
+    sessionid 字段,不应该让 disk fallback 误以为真登录。
+    """
+    (tmp_path / "identity.json").write_text(
+        json.dumps({"user_id": "u-cross-domain", "rescued_at": "2026-08-02T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "cookies.json").write_text(
+        json.dumps([
+            # domain 不是 doubao.com
+            {"name": "sessionid", "value": "deadbeef" * 4, "domain": ".example.com"},
+        ]),
+        encoding="utf-8",
+    )
+    assert _verify_from_disk(tmp_path) is None

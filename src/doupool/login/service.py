@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
@@ -12,6 +13,19 @@ from typing import Protocol
 from doupool.db.repository import AccountRepository
 
 from .state import LoginState, LoginStateMachine, TERMINAL_STATES
+
+
+# v0.2.8.1:sessionid 闸门常量副本 —— 不能从 .browser 导入,会与
+# browser.py 顶部的 `from .service import VerifiedLogin` 形成循环 import。
+# 这两份必须与 browser.py 同名常量保持同步:byteDance 改 sessionid 格式时,
+# 改 browser.SESSIONID_VALUE_PATTERN 后,这里也要跟着改一行。
+_SESSIONID_NAME_HINTS = ("sessionid", "sessionid_ss")
+_SESSIONID_VALUE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _is_doubao_cookie(cookie: dict) -> bool:
+    """对标 browser._is_doubao_cookie,小工具不足以拆公共模块。"""
+    return "doubao.com" in (cookie.get("domain") or "")
 
 
 def _extract_user_id_from_cookies(cookies: list[dict]) -> str | None:
@@ -25,6 +39,25 @@ def _extract_user_id_from_cookies(cookies: list[dict]) -> str | None:
             if c.get("name") == hint and c.get("value"):
                 return str(c["value"])
     return None
+
+
+def _has_valid_sessionid_in_cookies(cookies: list[dict]) -> bool:
+    """v0.2.8.1:disk fallback 闸门。
+
+    与 browser._has_valid_sessionid 同一规则,但接收纯 dict 列表
+    (从 cookies.json 读出来的)而非 Playwright context。sessionid /
+    sessionid_ss 必须 32-hex 才算登录,这是字节系唯一可信的登录凭证。
+    tracking cookies(s_v_web_id/odin_tt/ttwid/n_mh)首访即下发,
+    即便不是 cookie、即便出现在 cookies.json 里也不算登录。
+    """
+    for c in cookies:
+        if not _is_doubao_cookie(c):
+            continue
+        name = c.get("name", "")
+        value = c.get("value", "")
+        if name in _SESSIONID_NAME_HINTS and _SESSIONID_VALUE_PATTERN.match(value or ""):
+            return True
+    return False
 
 
 class LoginAlreadyRunning(RuntimeError):
@@ -48,20 +81,46 @@ _LOG = logging.getLogger("doupool.login")
 
 
 def _verify_from_disk(profile_dir: Path) -> Mapping[str, str | None] | None:
-    """v0.2.7 disk fallback:单路径,完全不调 /passport/web/account/info/。
+    """v0.2.7 + v0.2.8.1 disk fallback:加 sessionid 闸门。
 
-    优先级:
-      1. profile_dir/identity.json —— browser.py 在 context 死之前通过
-         page.evaluate 读 localStorage.__tea_cache_tokens_497858.user_unique_id
-         写下的。最权威(Chromium 进程自己读,继承完整浏览器指纹,无 aegis 风险)。
-      2. profile_dir/cookies.json 里 user_unique_id / user_id / uid cookie 兜底
-         (字节通常不把 user_id 放进 cookie,命中率低,留作最后一道防线)。
+    v0.2.7 的实现从 identity.json 拿到 user_id 就直接接受 —— 但 v0.2.7 救援
+    路径会写入 tracking ID(首访 doubao.com 时 localStorage.__tea_cache_tokens_497858
+    里 19 位 user_unique_id),这是 byteDance 全站通用 analytics token,与登录
+    无关。v0.2.8.1 加 sessionid 闸门:cookies.json 必须有 32-hex sessionid 才
+    算登录,tracking 态直接拒绝。
+
+    优先级(全部要过 sessionid 闸门):
+      1. 读 cookies.json → 必须有合法 sessionid(否则整路径拒绝,无论
+         identity.json 写了什么)→ 否则 v0.2.7 写入的 tracking 会复活
+      2. cookies.json + identity.json 都有 → 取 identity.json.user_id
+      3. cookies.json 有合法 sessionid + cookies 有 user_unique_id 兜底
+         cookie → 取 cookie hint(字节通常不写这种 cookie,命中率低)
 
     v0.2.6 之前的三条路径(浏览器内 fetch account_info.json / httpx 重发 /
     重启 Chromium)全部下线 —— 字节系 aegis 风控把所有非浏览器指纹请求拒为
     1011(用户未登录),唯一权威判定只能在 Chromium 自己进程内做(已合并到
     browser.py:wait_for_identity 主循环)。
     """
+    cookies_file = profile_dir / "cookies.json"
+    cookies: list[dict] = []
+    if cookies_file.exists():
+        try:
+            cookies = json.loads(cookies_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _LOG.warning("读 cookies.json 失败(%s):%s", cookies_file, exc)
+            return None
+        if not isinstance(cookies, list):
+            _LOG.warning("cookies.json 顶层不是 list,放弃 fallback")
+            return None
+
+    # v0.2.8.1:sessionid 闸门 —— tracking cookies 写在 cookies.json 里也算
+    if not _has_valid_sessionid_in_cookies(cookies):
+        _LOG.warning(
+            "disk fallback: cookies.json 无合法 sessionid(32-hex),"
+            "判定为 tracking / 未登录,拒绝 fallback"
+        )
+        return None
+
     id_file = profile_dir / "identity.json"
     if id_file.exists():
         try:
@@ -75,18 +134,10 @@ def _verify_from_disk(profile_dir: Path) -> Mapping[str, str | None] | None:
                 return {"user_id": uid, "nickname": None}
             _LOG.info("disk fallback identity.json 不是登录态,fallback 到 cookies.json")
 
-    cookies_file = profile_dir / "cookies.json"
-    if cookies_file.exists():
-        try:
-            cookies = json.loads(cookies_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            _LOG.warning("读 cookies.json 失败(%s):%s", cookies_file, exc)
-            return None
-        if isinstance(cookies, list):
-            uid = _extract_user_id_from_cookies(cookies)
-            if uid:
-                _LOG.info("disk fallback(cookies)命中 user_id=%s", uid)
-                return {"user_id": uid, "nickname": None}
+    uid = _extract_user_id_from_cookies(cookies)
+    if uid:
+        _LOG.info("disk fallback(cookies)命中 user_id=%s", uid)
+        return {"user_id": uid, "nickname": None}
     return None
 
 

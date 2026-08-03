@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,11 +19,26 @@ _LOG = logging.getLogger("doupool.login")
 # /passport/web/account/info/ 调用 —— 字节系 aegis 风控会把浏览器外任何
 # 客户端(包括 page.evaluate 内的 fetch)判为指纹不合法,返回 1011。
 #
-# 我们只信 Chromium 进程自己看到的东西:
-#   Tier 1: context.cookies() 是否有 doubao.com 域 cookie
-#   Tier 2: page.evaluate 读 document.body.innerText,不含登录关键词
-#   user_id: page.evaluate 读 localStorage.__tea_cache_tokens_497858.user_unique_id
-#            (本项目 video/browser.py:28 已验证该字段真实存在,兜底 web_id)
+# v0.2.8 重大补丁:加 sessionid cookie 闸门 + 最小冷却。
+# v0.2.7 上线后用户报"点添加账号,浏览器窗口刚打开就自动关闭,状态显示已
+# 登录但没扫码"。日志显示 4 次假阳性都在 1.4-2.0 秒内命中 identity。
+# 根因:字节系前端 JS 在**首次访问** doubao.com 时,就会在
+# localStorage.__tea_cache_tokens_497858 写入 19 位 tracking ID
+# (user_unique_id 字段)。这是 byteDance 全站通用的 analytics token,
+# 与登录无关,v0.2.7 的 _read_user_unique_id_from_page 无脑读这个字段
+# 就把它当成真 user_id 接受了。
+#
+# sessionid cookie 是字节系登录凭证:**只有服务端响应才会下发,首访不存在**。
+# 日志中所有 v0.2.6/v0.2.5 真登录(scan QR 后)的 sessionid 都是
+# 32 字符十六进制格式,无例外。我们现在用它作硬闸门:
+#   Tier 1: context.cookies() 有 doubao.com cookie(可能含 tracking)
+#   Tier 2: page.evaluate 读 DOM innerText 不含登录关键词
+#   闸门 1: 主循环起 N 秒内不接收任何 identity(给 page.goto + tracking 写入留时间)
+#   闸门 2: sessionid cookie 必须存在且格式合法(否则视为 tracking)
+#   user_id: localStorage.__tea_cache_tokens_497858.user_unique_id
+#
+# 视频流程安全不受影响(video/browser.py 把 user_unique_id 当 route metadata,
+# 真登录靠 persistent profile 里的 sessionid cookie 单独保证)。
 #
 # Playwright sync API 必须在创建 sync_playwright() 的同一 OS thread 内调用
 # (gevent 实现,跨线程会触发 "Cannot switch to a different thread")。所有
@@ -31,6 +47,23 @@ GRACE_PERIOD_SECONDS = 6.0  # 页面全部关闭后的等待窗口(给新 page /
 LOOP_TICK_MS = 250  # 主循环 sleep 间隔(同时 pump Playwright 事件)
 VERIFY_RETRY_BACKOFF = 0.3  # user_id 重读退避
 USER_ID_LOCALSTORAGE_KEY = "__tea_cache_tokens_497858"
+
+# v0.2.8:sessionid 闸门常量。
+# byteDance 登录凭证 sessionid(以及带 _ss 后缀的 secure-session 版本)是
+# 32 字符十六进制。日志 v0.2.6 真登录会话里全部命中,如
+#   sessionid=ded34fe0089ace6b55d2701b52d7cabb
+#   sessionid=5db19d22654e3bdca3e333a8fe804156
+# tracking cookies(s_v_web_id/odin_tt/ttwid/n_mh)首访即下发但没有这个格式。
+#
+# v0.2.8.1:升级成模块公共符号 —— service._verify_from_disk 也需要同一组
+# 规则做 disk fallback 闸门,避免在两个文件里各写一遍正则导致漂移。
+SESSIONID_NAME_HINTS = ("sessionid", "sessionid_ss")
+SESSIONID_VALUE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+# v0.2.8:主循环最小冷却。page.goto(domcontentloaded)+ tracking ID 写入
+# 最快 ~1.5 秒(假阳性窗口);真 QR 扫码确认 ≥3 秒才发生。这里设 3 秒
+# 是给前端留点缓冲,让"刚刚打开浏览器"这个阶段完全被排除。
+_MIN_LOOP_SECONDS_BEFORE_IDENTITY = 3.0
 
 # DOM 关键词集合 —— 任一命中即视为未登录。
 # 集中维护:doubao 文案改了改这里一处。
@@ -149,6 +182,51 @@ def _extract_user_id_from_cookies(cookies: list[dict]) -> str | None:
     return None
 
 
+def _has_valid_sessionid(context) -> bool:
+    """v0.2.8:登录凭证闸门。返回 True 当 context 内任意 doubao.com 域
+    cookie 名字是 sessionid / sessionid_ss 且值是 32-char hex。
+
+    这是字节系唯一可信的登录证据 —— tracking cookies + localStorage
+    tracking ID 都不算。日志中所有 v0.2.6 真登录会话都满足这个格式,
+    无例外。若字节系未来改 sessionid 格式,改 SESSIONID_VALUE_PATTERN
+    一行即可。
+    """
+    if not _context_is_alive(context):
+        return False
+    try:
+        cookies = context.cookies()
+    except PlaywrightError:
+        return False
+    for c in cookies:
+        if not _is_doubao_cookie(c):
+            continue
+        name = c.get("name", "")
+        value = c.get("value", "")
+        if name in SESSIONID_NAME_HINTS and SESSIONID_VALUE_PATTERN.match(value or ""):
+            return True
+    return False
+
+
+def _sessionid_cookie_value(context) -> str | None:
+    """v0.2.8:调试 / 日志用 —— 返回第一个匹配的 sessionid 值,无则 None。
+    不抛错(与 _has_valid_sessionid 行为一致)。
+    """
+    if not _context_is_alive(context):
+        return None
+    try:
+        cookies = context.cookies()
+    except PlaywrightError:
+        return None
+    for c in cookies:
+        if not _is_doubao_cookie(c):
+            continue
+        name = c.get("name", "")
+        value = c.get("value", "")
+        if name in SESSIONID_NAME_HINTS and SESSIONID_VALUE_PATTERN.match(value or ""):
+            return value
+    return None
+
+
 def _iso_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -200,9 +278,12 @@ def _save_doubao_cookies_to_disk(context, profile_dir: Path) -> bool:
 
 def _try_rescue_for_fallback(context, profile_dir: Path | None) -> None:
     """v0.2.7 抢救 helper:同时抢救 cookies 和 identity。
+    v0.2.8 补丁:rescue 也走 sessionid 闸门 —— 不写 tracking ID 进
+    identity.json,否则 service._verify_from_disk 兜底还会假阳性。
 
     - cookies 由 Chromium CookieMonster 持有,可直接 context.cookies() 取
     - identity(user_unique_id)必须 page.evaluate 读 localStorage
+    - v0.2.8:_has_valid_sessionid(context) 为真才写 identity.json
 
     抢救对象是 service 层 disk fallback,只读 identity.json / cookies.json。
     context 已死 → 全失败,静默返回(不抛错,让上层正常处理)。
@@ -210,6 +291,11 @@ def _try_rescue_for_fallback(context, profile_dir: Path | None) -> None:
     if profile_dir is None or not _context_is_alive(context):
         return
     _save_doubao_cookies_to_disk(context, profile_dir)
+    # v0.2.8:sessionid 闸门 —— 没有 sessionid cookie 视为 tracking 态,
+    # 不写 identity.json。cookies.json 仍写(供 service 调试 / 后续重试)。
+    if not _has_valid_sessionid(context):
+        _LOG.info("rescue: sessionid cookie 未下发,跳过 identity.json")
+        return
     active_pages = [
         p for p in getattr(context, "pages", []) if _page_is_alive(p)
     ]
@@ -230,7 +316,10 @@ def _try_rescue_for_fallback(context, profile_dir: Path | None) -> None:
             encoding="utf-8",
         )
         tmp.replace(target)
-        _LOG.info("rescue identity: user_unique_id=%s → %s", user_id, target)
+        _LOG.info(
+            "rescue identity: user_unique_id=%s (sessionid=%s) → %s",
+            user_id, _sessionid_cookie_value(context), target,
+        )
     except OSError as exc:
         _LOG.warning("rescue identity 写盘失败: %s", exc)
 
@@ -267,27 +356,34 @@ def wait_for_identity(
     context=None,
     profile_dir: Path | None = None,
 ) -> DoubaoIdentity:
-    """v0.2.7 重写主循环。
+    """v0.2.7 重写主循环 + v0.2.8 加 sessionid 闸门 + 最小冷却。
 
     不再监听 on_response(被 Connection.cleanup() 短路吞),不再调
     /passport/web/account/info/(aegis 风控拒一切非浏览器指纹请求)。
 
-    判定链(Tier 1 + Tier 2 + localStorage 三件套):
+    判定链(Tier 1 + Tier 2 + 闸门 + localStorage 四件套):
       1. context.cookies() 有 doubao.com cookie → 可能已登录
       2. active page 的 DOM innerText 不含登录关键词 → 真的已登录
-      3. page.evaluate 读 localStorage.__tea_cache_tokens_497858.user_unique_id → 拿到 identity
+      3. v0.2.8 闸门 1:主循环起 ≥_MIN_LOOP_SECONDS_BEFORE_IDENTITY 秒
+         → 排除 page.goto + tracking ID 写入的假阳性窗口
+      4. v0.2.8 闸门 2:_has_valid_sessionid(context) 为 True
+         → sessionid cookie(32-hex)是字节系登录凭证,tracking 没有
+      5. page.evaluate 读 localStorage.__tea_cache_tokens_497858.user_unique_id
+         → 拿到 identity
 
     容错:
       - 每步独立 try/except
       - 所有 page 关闭后给 GRACE_PERIOD_SECONDS 时间等新 page / cookie 生效
       - 放弃前 _try_rescue_for_fallback 把 cookies + user_id 写盘,
         让 service 层 disk fallback 能用 identity.json / cookies.json 兜底
+        (v0.2.8:rescue 也走 sessionid 闸门,不写 tracking ID 进 identity.json)
     """
     if context is None:
         raise RuntimeError("wait_for_identity 必须在 owner thread 调用且需要 context")
 
     last_user_id_attempt = 0.0
     page_closed_since: float | None = None
+    loop_started_at = _monotonic()  # v0.2.8:主循环起跑时间,用于最小冷却
 
     while not cancel_event.is_set():
         # 1. 已经有 identity(其他路径设的)→ 立刻返回
@@ -316,19 +412,37 @@ def wait_for_identity(
             else:
                 _LOG.info("cookie 有但 DOM 仍含登录关键词,继续等")
 
-        # 5. localStorage user_id 探针
+        # 5. localStorage user_id 探针(三道闸门:v0.2.8 新增 1 + 2)
         now = _monotonic()
         if looks_logged_in and (now - last_user_id_attempt) >= VERIFY_RETRY_BACKOFF:
-            last_user_id_attempt = now
-            user_id = _read_user_unique_id_from_page(active[0])
-            if user_id:
-                identity = DoubaoIdentity(user_id=user_id, nickname=None)
-                with _lock_identities():
-                    if not identities:
-                        identities.append(identity)
-                        identity_ready.set()
-                _LOG.info("wait_for_identity: 命中 identity user_id=%s", user_id)
-                return identities[0]
+            # 闸门 1:v0.2.8 最小冷却,排除 page 刚加载的 tracking ID 假阳性
+            elapsed = now - loop_started_at
+            if elapsed < _MIN_LOOP_SECONDS_BEFORE_IDENTITY:
+                _LOG.debug(
+                    "wait_for_identity: 主循环才过 %.1fs,小于最小冷却 %.1fs,继续等",
+                    elapsed, _MIN_LOOP_SECONDS_BEFORE_IDENTITY,
+                )
+            # 闸门 2:v0.2.8 sessionid cookie 必须是 32-hex 才接受身份
+            elif not _has_valid_sessionid(context):
+                _LOG.debug(
+                    "wait_for_identity: localStorage user_unique_id 有但 sessionid cookie "
+                    "未下发(疑似 tracking ID),继续等"
+                )
+            else:
+                # 闸门 3:实际读 user_id,接受 identity
+                last_user_id_attempt = now
+                user_id = _read_user_unique_id_from_page(active[0])
+                if user_id:
+                    identity = DoubaoIdentity(user_id=user_id, nickname=None)
+                    with _lock_identities():
+                        if not identities:
+                            identities.append(identity)
+                            identity_ready.set()
+                    _LOG.info(
+                        "wait_for_identity: 命中 identity user_id=%s sessionid=%s",
+                        user_id, _sessionid_cookie_value(context),
+                    )
+                    return identities[0]
 
         # 6. grace period —— 全部 page 关闭后等新 page / cookie 生效
         if not any_alive:
