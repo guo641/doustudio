@@ -39,6 +39,21 @@ class UpdateAccountBody(BaseModel):
     enabled: bool | None = None
 
 
+def _extract_bearer(authorization: str | None) -> str | None:
+    """v0.2.9:从 Authorization 头里解析 Bearer token。
+
+    只认大小写不敏感的 'Bearer ' 前缀(RFC 6750 §2.1),前后空白 trim
+    后空字符串视为 None。Bearer 之外的 scheme(Basic / Digest / 其它自定义
+    scheme)都不解,避免误把任意头当成 token 撞 hash。
+    """
+    if not authorization:
+        return None
+    parts = authorization.strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    return parts[1].strip() or None
+
+
 def _account_dict(account: Account, daily_quota: int = 5) -> dict:
     return {
         "id": account.id,
@@ -115,8 +130,18 @@ def create_app(
     app = FastAPI(title="DouPool", docs_url=None, redoc_url=None, lifespan=lifespan)
     frontend_dir = Path(frontend_dir)
 
-    def authorize(x_doupool_token: str | None = Header(default=None)) -> None:
-        if x_doupool_token is None or not secrets.compare_digest(x_doupool_token, token):
+    def authorize(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        """v0.2.9:同时接受 X-Doupool-Token(前端 legacy)和 Authorization: Bearer
+        (对齐 yaonieyo 默认 key 的 curl / 外部集成风格)。
+
+        优先级:Authorization: Bearer > X-Doupool-Token。两者都为 None 或都错误
+        才 401。secrets.compare_digest 抗计时攻击。
+        """
+        candidate = _extract_bearer(authorization) or x_doupool_token
+        if not candidate or not secrets.compare_digest(candidate, token):
             raise HTTPException(status_code=401, detail="invalid local token")
 
     @app.get("/api/health")
@@ -124,8 +149,11 @@ def create_app(
         return {"status": "ok", "version": current_version}
 
     @app.get("/api/update-check")
-    async def update_check(x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    async def update_check(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         info = await check_for_update(current_version)
         return {
             "current_version": info.current_version,
@@ -137,14 +165,20 @@ def create_app(
         }
 
     @app.get("/api/accounts", dependencies=[])
-    def accounts(x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    def accounts(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
         return [_account_dict(item, quota) for item in repository.list_accounts()]
 
     @app.post("/api/accounts/login-attempts", status_code=202)
-    async def create_login(x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    async def create_login(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         try:
             attempt = login_service.start()
         except LoginAlreadyRunning as exc:
@@ -152,16 +186,27 @@ def create_app(
         return {"id": attempt.id, "state": attempt.state}
 
     @app.get("/api/login-attempts/{attempt_id}")
-    def get_attempt(attempt_id: str, x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    def get_attempt(
+        attempt_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         attempt = LoginAttempt.get_or_none(LoginAttempt.id == attempt_id)
         if not attempt:
             raise HTTPException(status_code=404, detail="login attempt not found")
         return {"id": attempt.id, "state": attempt.state, "error": attempt.error_message}
 
     @app.get("/api/login-attempts/{attempt_id}/events")
-    async def login_events(attempt_id: str, access_token: str = Query(default="")):
-        if not secrets.compare_digest(access_token, token):
+    async def login_events(
+        attempt_id: str,
+        access_token: str = Query(default=""),
+        authorization: str | None = Header(default=None),
+    ):
+        # v0.2.9:SSE 同时接受 ?access_token= 旧约定(浏览器 EventSource 不能
+        # 自定义 Header)和 Authorization: Bearer 新约定(curl / 集成友好)。
+        candidate = _extract_bearer(authorization) or access_token
+        if not candidate or not secrets.compare_digest(candidate, token):
             raise HTTPException(status_code=401, detail="invalid local token")
 
         async def stream():
@@ -178,8 +223,9 @@ def create_app(
         account_id: str,
         body: UpdateAccountBody,
         x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token)
+        authorize(x_doupool_token, authorization)
         account = Account.get_or_none(Account.id == account_id)
         if not account:
             raise HTTPException(status_code=404, detail="account not found")
@@ -191,8 +237,12 @@ def create_app(
         return _account_dict(account, quota)
 
     @app.delete("/api/accounts/{account_id}", status_code=204)
-    def delete_account(account_id: str, x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    def delete_account(
+        account_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         account = Account.get_or_none(Account.id == account_id)
         if not account:
             raise HTTPException(status_code=404, detail="account not found")
@@ -203,8 +253,11 @@ def create_app(
         shutil.rmtree(profile_dir, ignore_errors=True)
 
     @app.get("/api/logs")
-    def logs(x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    def logs(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         if settings_service:
             repository.prune_logs(int(settings_service.get()["log_retention_days"]))
         return [{"id": row.id, "level": row.level, "module": row.module,
@@ -212,20 +265,30 @@ def create_app(
                  "created_at": row.created_at.isoformat()} for row in repository.list_logs()]
 
     @app.delete("/api/logs", status_code=204)
-    def clear_logs(x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    def clear_logs(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         repository.clear_logs()
 
     @app.get("/api/settings")
-    def get_settings(x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    def get_settings(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         if settings_service is None:
             raise HTTPException(status_code=503, detail="设置服务未启动")
         return settings_service.get()
 
     @app.put("/api/settings")
-    def update_settings(body: dict, x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    def update_settings(
+        body: dict,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         if settings_service is None:
             raise HTTPException(status_code=503, detail="设置服务未启动")
         try:
@@ -236,8 +299,11 @@ def create_app(
         return updated
 
     @app.post("/api/settings/backup", status_code=201)
-    def backup_settings(x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    def backup_settings(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         if settings_service is None:
             raise HTTPException(status_code=503, detail="设置服务未启动")
         try:
@@ -247,27 +313,42 @@ def create_app(
         return {"path": str(path)}
 
     @app.get("/api/video-tasks")
-    def video_tasks(x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    def video_tasks(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
         return [_video_task_dict(task, quota) for task in repository.list_video_tasks()]
 
     @app.get("/api/video-task-groups")
-    def video_task_groups(limit: int = 50, x_doupool_token: str | None = Header(default=None)):
+    def video_task_groups(
+        limit: int = 50,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
         """按 group_id 聚合返回最近的任务组(每个组首条 + 任务数)"""
-        authorize(x_doupool_token)
+        authorize(x_doupool_token, authorization)
         return repository.list_task_groups(limit=limit)
 
     @app.get("/api/video-task-groups/{group_id}")
-    def video_task_group_detail(group_id: str, x_doupool_token: str | None = Header(default=None)):
+    def video_task_group_detail(
+        group_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
         """返回某 group 下所有任务,按 group_index 排序"""
-        authorize(x_doupool_token)
+        authorize(x_doupool_token, authorization)
         quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
         return [_video_task_dict(t, quota) for t in repository.list_tasks_by_group(group_id)]
 
     @app.post("/api/video-tasks", status_code=202)
-    async def create_video_task(body: CreateVideoTaskBody, x_doupool_token: str | None = Header(default=None)):
-        authorize(x_doupool_token)
+    async def create_video_task(
+        body: CreateVideoTaskBody,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
         if video_service is None:
             raise HTTPException(status_code=503, detail="视频服务未启动")
         try:

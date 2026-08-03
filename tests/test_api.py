@@ -186,3 +186,119 @@ def test_deleting_account_preserves_completed_video_history(repository, tmp_path
     preserved = VideoTask.get_by_id(task.id)
     assert preserved.account_id is None
     assert preserved.result_url == "https://example.com/video.mp4"
+
+
+# ---------- v0.2.9 Bearer Token 鉴权 ----------
+# 主鉴权头从 X-Doupool-Token 升级成同时支持 Authorization: Bearer,
+# 保持向后兼容(前端 / 现有集成零改动),并对齐 yaonieyo 默认 key 风格
+# 便于本机 curl / 外部脚本直连。下方测试同时覆盖三种来源:旧 header、
+# 标准 Bearer(大小写不敏感)、拒绝非法 scheme / 空 token。
+
+def test_bearer_token_authenticates(repository, tmp_path):
+    service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, service))
+
+    response = client.get("/api/accounts", headers={"Authorization": "Bearer secret"})
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_bearer_token_is_case_insensitive(repository, tmp_path):
+    """RFC 6750 §2.1:scheme 名大小写不敏感,客户端写 "bearer" / "BEARER" 都得认。"""
+    service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, service))
+
+    assert client.get("/api/accounts", headers={"Authorization": "bearer secret"}).status_code == 200
+    assert client.get("/api/accounts", headers={"Authorization": "BEARER secret"}).status_code == 200
+    assert client.get("/api/accounts", headers={"Authorization": "BeArEr secret"}).status_code == 200
+
+
+def test_bearer_token_trims_whitespace(repository, tmp_path):
+    """实操里经常多打空格,容忍一下,避免误判。"""
+    service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, service))
+
+    assert client.get("/api/accounts", headers={"Authorization": "Bearer    secret"}).status_code == 200
+
+
+def test_authorization_header_with_wrong_scheme_is_rejected(repository, tmp_path):
+    """Basic / Digest / 自定义 scheme 一律不当成 token,避免误把任意头撞 hash。"""
+    service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, service))
+
+    assert client.get("/api/accounts", headers={"Authorization": "Basic secret"}).status_code == 401
+    assert client.get("/api/accounts", headers={"Authorization": "Token secret"}).status_code == 401
+    assert client.get("/api/accounts", headers={"Authorization": "secret"}).status_code == 401  # 没 scheme 前缀
+
+
+def test_bearer_with_empty_token_is_rejected(repository, tmp_path):
+    """Bearer 后是空白 / 空串,等同于没传,必须 401。"""
+    service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, service))
+
+    assert client.get("/api/accounts", headers={"Authorization": "Bearer "}).status_code == 401
+    assert client.get("/api/accounts", headers={"Authorization": "Bearer"}).status_code == 401
+
+
+def test_bearer_with_wrong_value_is_rejected(repository, tmp_path):
+    service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, service))
+
+    assert client.get("/api/accounts", headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+
+def test_bearer_takes_precedence_over_legacy_header(repository, tmp_path):
+    """同时传两个头时,Bearer 优先;但如果 Bearer 错,即使 legacy 对也 401。
+    优先级策略明确,免得中间一拨人改 token 后两边撞不上。"""
+    service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, service))
+
+    ok = {"X-DouPool-Token": "wrong", "Authorization": "Bearer secret"}
+    assert client.get("/api/accounts", headers=ok).status_code == 200
+
+    bad = {"X-DouPool-Token": "secret", "Authorization": "Bearer wrong"}
+    assert client.get("/api/accounts", headers=bad).status_code == 401
+
+
+def test_legacy_x_doupool_token_still_works(repository, tmp_path):
+    """向后兼容:前端 / 老集成继续用 X-DouPool-Token 头不能被这次升级打断。"""
+    service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, service))
+
+    assert client.get("/api/accounts", headers={"X-DouPool-Token": "secret"}).status_code == 200
+
+
+def test_sse_events_accept_bearer_header(repository, tmp_path):
+    """SSE 端点同样接受 Authorization: Bearer(EventSource 不能自定义 Header,
+    但 curl / 集成测试能用;旧 ?access_token= 保留)。
+
+    测试只断言鉴权层(401 vs 通过):通过鉴权的请求会进入 events() 流,
+    attempt_id 不存在会触发 KeyError / 500,这是 login_service 的问题
+    而非鉴权问题——所以这里用 not-401 判断鉴权层已放行。
+    raise_server_exceptions=False 让 TestClient 不把 SSE 流里的 500 当
+    测试异常抛出来,我们只看 HTTP 状态码。
+    """
+    service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(
+        create_app("secret", tmp_path / "missing", repository, service),
+        raise_server_exceptions=False,
+    )
+
+    # query 路径保留(旧约定)
+    qs = client.get("/api/login-attempts/whatever/events?access_token=secret")
+    assert qs.status_code != 401
+    # Bearer 路径新增
+    bearer = client.get(
+        "/api/login-attempts/whatever/events",
+        headers={"Authorization": "Bearer secret"},
+    )
+    assert bearer.status_code != 401
+    # 错 token 都得 401(鉴权层挡住,根本进不到 events())
+    assert client.get(
+        "/api/login-attempts/whatever/events",
+        headers={"Authorization": "Bearer wrong"},
+    ).status_code == 401
+    assert client.get(
+        "/api/login-attempts/whatever/events?access_token=wrong",
+    ).status_code == 401
