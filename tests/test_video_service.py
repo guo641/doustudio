@@ -19,7 +19,13 @@ class SuccessfulVideoRunner:
 
 class StaticSettings:
     def get(self):
-        return {"daily_quota": 5, "quota_reset_time": "00:00", "max_concurrency": 1}
+        return {
+            "daily_quota_mini": 5, "daily_quota_v2": 5, "daily_quota_std": 5,
+            "quota_reset_time": "00:00", "max_concurrency": 1,
+        }
+
+    def get_daily_quotas(self):
+        return {"mini": 5, "v2": 5, "std": 5}
 
 
 @pytest.mark.asyncio
@@ -36,7 +42,7 @@ async def test_service_runs_and_persists_video_result(repository, temp_profile):
     assert saved.status == "succeeded"
     assert saved.conversation_id == "conversation-1"
     assert saved.remote_task_id == "remote-1"
-    assert Account.get_by_id("account-1").video_quota_used == 1
+    assert Account.get_by_id("account-1").video_quota_used_mini == 1
 
 
 @pytest.mark.asyncio
@@ -75,7 +81,7 @@ async def test_service_cools_limited_account_and_fails_over(repository, tmp_path
     saved = repository.get_video_task(task.id)
     assert saved.status == "succeeded"
     assert saved.account.id == "account-2"
-    assert Account.get_by_id("account-1").video_quota_used == 5
+    assert Account.get_by_id("account-1").video_quota_used_mini == 5
     assert Account.get_by_id("account-1").video_limited_until is not None
 
 
@@ -238,7 +244,7 @@ async def test_retry_result_refreshes_succeeded_task_without_charging_quota(
         id="acc-r", display_name="acc", doubao_user_id="u", profile_dir=temp_profile
     )
     account = Account.get_by_id("acc-r")
-    account.video_quota_used = 2  # 假装此前已扣过两次
+    account.video_quota_used_mini = 2  # 假装此前已扣过两次
     account.save()
 
     task = repository.create_video_task("acc-r", "测试", "seedance_v2.0_mini", "1:1", 5)
@@ -264,7 +270,7 @@ async def test_retry_result_refreshes_succeeded_task_without_charging_quota(
     assert saved.result_url == "https://new.example/video.mp4"
     assert saved.cover_url == "https://new.example/cover.jpg"
     # 关键:不扣额度
-    assert Account.get_by_id("acc-r").video_quota_used == 2
+    assert Account.get_by_id("acc-r").video_quota_used_mini == 2
     assert runner.calls and runner.calls[0]["conversation_id"] == "conversation-r"
     assert runner.calls[0]["profile_dir"] == temp_profile
 
@@ -354,3 +360,72 @@ async def test_retry_result_rejects_concurrent_call(repository, temp_profile):
         await service.schedule_retry_result(task.id)
     block.set()  # 让第一次收尾
     service._retry_tasks[task.id].cancel()
+
+
+# ---------- v0.2.9 per-model quota 隔离 ----------
+
+class MiniOnlyLimitedRunner:
+    """v0.2.9:模型互不影响 — 跑 std 任务时,mini 桶满的账号应该仍可被选中。"""
+    def __init__(self):
+        self.calls = []
+
+    def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        self.calls.append(model)
+        update(status="generating", conversation_id="conv-iso")
+        return {
+            "remote_task_id": "remote-iso",
+            "result_url": "https://example.test/iso.mp4",
+        }
+
+
+@pytest.mark.asyncio
+async def test_quota_per_model_isolation_in_repository(repository, temp_profile, tmp_path):
+    """v0.2.9:不同 model 的 quota 独立计数 — repo 层硬契约。"""
+    quotas = {"mini": 2, "v2": 2, "std": 2}
+    # 账号 A:mini 桶用完,v2/std 桶全空
+    Account.create(
+        id="a", display_name="A", doubao_user_id="ua",
+        profile_dir=str(tmp_path / "a"), video_quota_used_mini=2,
+    )
+    # 账号 B:所有桶都空
+    Account.create(
+        id="b", display_name="B", doubao_user_id="ub",
+        profile_dir=str(tmp_path / "b"),
+    )
+
+    # std 任务:账号 A 的 std 桶是 0 → 应优先被选
+    picked_std = repository.choose_available_account(quotas, model="seedance_v2.0_std")
+    assert picked_std.id == "a"
+    # mini 任务:账号 A 的 mini 桶已满 → 退到 B
+    picked_mini = repository.choose_available_account(quotas, model="seedance_v2.0_mini")
+    assert picked_mini.id == "b"
+
+
+@pytest.mark.asyncio
+async def test_service_charges_correct_bucket_per_model(repository, temp_profile):
+    """v0.2.9:不同 model 的任务只扣对应桶,不串号。"""
+    Account.create(
+        id="acc-iso", display_name="iso", doubao_user_id="u-iso", profile_dir=temp_profile
+    )
+    runner = MiniOnlyLimitedRunner()
+    service = VideoTaskService(
+        repository, runner, StaticSettings(), account_poll_interval=0.01
+    )
+
+    # 第一个 mini 任务
+    task_mini = service.start("mini 任务", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task_mini.id], timeout=2)
+
+    # 第二个 std 任务
+    task_std = service.start("std 任务", "seedance_v2.0_std", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task_std.id], timeout=2)
+
+    account = Account.get_by_id("acc-iso")
+    # mini 桶只 +1(只跑了 1 个 mini 任务)
+    assert account.video_quota_used_mini == 1
+    # std 桶只 +1(只跑了 1 个 std 任务)
+    assert account.video_quota_used_std == 1
+    # v2 桶没碰
+    assert account.video_quota_used_v2 == 0
+    # runner 真的按 model 跑
+    assert runner.calls == ["seedance_v2.0_mini", "seedance_v2.0_std"]

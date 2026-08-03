@@ -64,7 +64,7 @@ def test_version_three_database_migrates_without_losing_related_rows(tmp_path):
     manager = DatabaseManager(path)
     manager.initialize()
     try:
-        assert manager.database.execute_sql("SELECT MAX(version) FROM schema_version").fetchone()[0] == 8
+        assert manager.database.execute_sql("SELECT MAX(version) FROM schema_version").fetchone()[0] == 9
         assert manager.database.execute_sql("SELECT COUNT(*) FROM account").fetchone()[0] == 1
         assert manager.database.execute_sql("SELECT COUNT(*) FROM loginattempt").fetchone()[0] == 1
         columns = {row[1] for row in manager.database.execute_sql("PRAGMA table_info(videotask)")}
@@ -73,5 +73,91 @@ def test_version_three_database_migrates_without_losing_related_rows(tmp_path):
         assert "mode" in columns
         assert "image_paths" in columns
         assert manager.database.execute_sql("SELECT mode FROM videotask WHERE id='t1'").fetchone()[0] == "t2v"
+    finally:
+        manager.close()
+
+
+# ---------- v0.2.9 schema v9:per-model quota 三桶迁移 ----------
+
+def test_version_eight_database_migrates_to_v9_adding_three_quota_columns(tmp_path):
+    """v0.2.9:从 v8 升 v9 给 account 表加 3 个 quota 列,并把老 video_quota_used
+    落到 mini 桶(老数据无 model 信息,mini 是默认模型)。"""
+    import sqlite3
+    from doupool.db.database import DatabaseManager
+
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY);
+        INSERT INTO schema_version VALUES (8);
+        CREATE TABLE account (
+          id TEXT PRIMARY KEY,
+          display_name TEXT NOT NULL,
+          doubao_user_id TEXT,
+          doubao_nickname TEXT,
+          profile_dir TEXT NOT NULL,
+          status TEXT NOT NULL,
+          enabled INTEGER NOT NULL,
+          last_verified_at DATETIME,
+          last_error TEXT,
+          video_quota_used INTEGER NOT NULL DEFAULT 0,
+          video_quota_date DATE,
+          video_limited_until DATETIME,
+          callback_url TEXT,
+          callback_status TEXT,
+          callback_attempts INTEGER NOT NULL DEFAULT 0,
+          callback_last_error TEXT,
+          callback_last_at DATETIME,
+          created_at DATETIME NOT NULL,
+          updated_at DATETIME NOT NULL
+        );
+        INSERT INTO account VALUES (
+          'a1','老账号','u1',NULL,'/tmp/profile','active',1,NULL,NULL,
+          4,NULL,NULL,NULL,NULL,0,NULL,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+        );
+        """)
+
+    manager = DatabaseManager(path)
+    manager.initialize()
+    try:
+        # 升级到 v9
+        assert manager.database.execute_sql(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone()[0] == 9
+        # 三列都已加
+        columns = {row[1] for row in manager.database.execute_sql("PRAGMA table_info(account)")}
+        assert "video_quota_used_mini" in columns
+        assert "video_quota_used_v2" in columns
+        assert "video_quota_used_std" in columns
+        # 老 used 自动落到 mini 桶
+        assert manager.database.execute_sql(
+            "SELECT video_quota_used_mini FROM account WHERE id='a1'"
+        ).fetchone()[0] == 4
+        # v2/std 默认 0
+        assert manager.database.execute_sql(
+            "SELECT video_quota_used_v2 FROM account WHERE id='a1'"
+        ).fetchone()[0] == 0
+        assert manager.database.execute_sql(
+            "SELECT video_quota_used_std FROM account WHERE id='a1'"
+        ).fetchone()[0] == 0
+    finally:
+        manager.close()
+
+
+def test_v9_migration_is_idempotent(tmp_path):
+    """v0.2.9:重跑 initialize() 不能报错 / 重复加列(幂等迁移,老 DB 双开安全)。"""
+    from doupool.db.database import DatabaseManager
+
+    path = tmp_path / "double-init.sqlite3"
+    manager = DatabaseManager(path)
+    try:
+        # 第二次 initialize 不应炸
+        manager.initialize()
+        manager.initialize()
+        # schema_version 只升到 v9,没有重复行
+        rows = list(manager.database.execute_sql(
+            "SELECT version FROM schema_version ORDER BY version"
+        ).fetchall())
+        assert [r[0] for r in rows] == [9]
     finally:
         manager.close()

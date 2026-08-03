@@ -28,7 +28,7 @@ class DatabaseManager:
         if version is None:
             with self.database.atomic():
                 self.database.create_tables(ALL_MODELS)
-                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (8)")
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (9)")
             return
         if version < 2:
             with self.database.atomic():
@@ -122,6 +122,27 @@ class DatabaseManager:
                         "ALTER TABLE videotask ADD COLUMN group_index INTEGER NOT NULL DEFAULT 0"
                     )
                 self.database.execute_sql("INSERT INTO schema_version(version) VALUES (8)")
+            version = 8
+        if version < 9:
+            # v0.2.9:按 seedance 模型拆 daily_quota。Account 加 3 个 used 列
+            # (mini / v2 / std),老 video_quota_used 单列保留做兼容字段。
+            account_columns = {
+                row[1] for row in self.database.execute_sql("PRAGMA table_info(account)").fetchall()
+            }
+            with self.database.atomic():
+                for name in ("video_quota_used_mini", "video_quota_used_v2", "video_quota_used_std"):
+                    if name not in account_columns:
+                        self.database.execute_sql(
+                            f"ALTER TABLE account ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
+                        )
+                # 老数据归到 mini 桶(无 model 信息,mini 是默认模型)。
+                # 只迁未置的(避免覆盖新装分支已写入的值)。
+                if "video_quota_used" in account_columns:
+                    self.database.execute_sql(
+                        "UPDATE account SET video_quota_used_mini = video_quota_used "
+                        "WHERE video_quota_used_mini = 0 AND video_quota_used > 0"
+                    )
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (9)")
 
     def _make_video_account_nullable(self) -> None:
         self.database.execute_sql("""

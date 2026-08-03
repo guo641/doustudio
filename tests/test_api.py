@@ -114,11 +114,20 @@ def test_settings_round_trip_backup_and_validation(repository, database_manager,
     ))
     headers = {"X-DouPool-Token": "secret"}
 
-    assert client.get("/api/settings", headers=headers).json()["daily_quota"] == 5
-    updated = client.put("/api/settings", headers=headers, json={"daily_quota": 7})
+    initial = client.get("/api/settings", headers=headers).json()
+    assert initial["daily_quota"] == 5
+    # v0.2.9:三个新桶都在 defaults 里
+    assert initial["daily_quota_mini"] == 5
+    assert initial["daily_quota_v2"] == 5
+    assert initial["daily_quota_std"] == 5
+    # 三个桶独立更新
+    updated = client.put("/api/settings", headers=headers, json={"daily_quota_mini": 7, "daily_quota_std": 2})
     assert updated.status_code == 200
-    assert updated.json()["daily_quota"] == 7
+    assert updated.json()["daily_quota_mini"] == 7
+    assert updated.json()["daily_quota_std"] == 2
+    assert updated.json()["daily_quota_v2"] == 5  # 未动
     assert client.put("/api/settings", headers=headers, json={"max_concurrency": 0}).status_code == 422
+    assert client.put("/api/settings", headers=headers, json={"daily_quota_mini": 200}).status_code == 422
     backup = client.post("/api/settings/backup", headers=headers)
     assert backup.status_code == 201
     assert backup.json()["path"].endswith(".sqlite3")
@@ -144,7 +153,9 @@ def test_account_payload_has_quota_and_active_task_blocks_delete(repository, tmp
 
     account = Account.create(
         id="account-quota", display_name="额度账号", doubao_user_id="quota-user",
-        profile_dir=temp_profile, video_quota_used=3, video_quota_date=date(2026, 7, 13),
+        profile_dir=temp_profile,
+        video_quota_used_mini=3, video_quota_used_v2=2, video_quota_used_std=1,
+        video_quota_date=date(2026, 7, 13),
     )
     repository.create_video_task(account.id, "运行中", "seedance_v2.0_mini", "1:1", 5)
     task = repository.list_video_tasks()[0]
@@ -154,7 +165,16 @@ def test_account_payload_has_quota_and_active_task_blocks_delete(repository, tmp
     headers = {"X-DouPool-Token": "secret"}
 
     payload = client.get("/api/accounts", headers=headers).json()[0]
+    # v0.2.9:旧 video_quota_used alias 到 mini 桶,前端缓存兼容
     assert payload["video_quota_used"] == 3
+    # 三桶全部暴露
+    assert payload["video_quota_used_mini"] == 3
+    assert payload["video_quota_used_v2"] == 2
+    assert payload["video_quota_used_std"] == 1
+    # total 来自 settings(无 settings_service 时默认 5)
+    assert payload["video_quota_total_mini"] == 5
+    assert payload["video_quota_total_v2"] == 5
+    assert payload["video_quota_total_std"] == 5
     assert client.delete(f"/api/accounts/{account.id}", headers=headers).status_code == 409
 
 

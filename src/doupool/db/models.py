@@ -41,6 +41,11 @@ class Account(BaseModel):
     video_quota_used = IntegerField(default=0)
     video_quota_date = DateField(null=True)
     video_limited_until = DateTimeField(null=True)
+    # v0.2.9:按 seedance 模型分桶计费(mini / v2 / std 各算各的当日额度)。
+    # 老 video_quota_used 列保留(只读,不再写入),留给老 DB 导出兼容。
+    video_quota_used_mini = IntegerField(default=0)
+    video_quota_used_v2 = IntegerField(default=0)
+    video_quota_used_std = IntegerField(default=0)
     created_at = DateTimeField(default=utcnow)
     updated_at = DateTimeField(default=utcnow)
 

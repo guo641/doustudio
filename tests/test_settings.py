@@ -8,12 +8,17 @@ from doupool.settings.service import SettingsService
 def test_settings_defaults_update_and_persist(repository, database_manager, tmp_path):
     service = SettingsService(repository, tmp_path, database_manager.path)
 
-    assert service.get()["daily_quota"] == 5
-    assert service.get()["default_model"] == "seedance_v2.0_mini"
+    # v0.2.9:三个新桶都默认 5,旧 daily_quota 保留做 legacy fallback
+    defaults = service.get()
+    assert defaults["daily_quota"] == 5
+    assert defaults["daily_quota_mini"] == 5
+    assert defaults["daily_quota_v2"] == 5
+    assert defaults["daily_quota_std"] == 5
+    assert defaults["default_model"] == "seedance_v2.0_mini"
 
-    updated = service.update({"daily_quota": 8, "log_level": "DEBUG"})
+    updated = service.update({"daily_quota_mini": 8, "log_level": "DEBUG"})
 
-    assert updated["daily_quota"] == 8
+    assert updated["daily_quota_mini"] == 8
     assert SettingsService(repository, tmp_path, database_manager.path).get()["log_level"] == "DEBUG"
 
 
@@ -24,6 +29,47 @@ def test_settings_reject_invalid_values(repository, database_manager, tmp_path):
         service.update({"max_concurrency": 0})
     with pytest.raises(ValueError, match="重置时间"):
         service.update({"quota_reset_time": "25:00"})
+
+
+def test_get_daily_quotas_returns_model_buckets(repository, database_manager, tmp_path):
+    """v0.2.9:SettingsService 暴露三桶给上层(API / 调度)用。"""
+    service = SettingsService(repository, tmp_path, database_manager.path)
+
+    # 全 default → 三个 5
+    assert service.get_daily_quotas() == {"mini": 5, "v2": 5, "std": 5}
+
+    # 单独改 mini,v2/std 不动
+    service.update({"daily_quota_mini": 7})
+    assert service.get_daily_quotas() == {"mini": 7, "v2": 5, "std": 5}
+
+    # 三个独立
+    service.update({"daily_quota_v2": 4, "daily_quota_std": 6})
+    assert service.get_daily_quotas() == {"mini": 7, "v2": 4, "std": 6}
+
+
+def test_get_daily_quotas_falls_back_to_legacy_daily_quota(repository, database_manager, tmp_path):
+    """v0.2.9:老 DB 还没升过三桶,fallback 用单 daily_quota 让三桶一致。
+    一旦用户在前端任意改一个桶,自动写入新键,从此摆脱 fallback。"""
+    service = SettingsService(repository, tmp_path, database_manager.path)
+    # 模拟"老 DB":只写 daily_quota=8,新三桶都没落库
+    repository.set_setting("daily_quota", 8)
+    # 验证 fallback
+    assert service.get_daily_quotas() == {"mini": 8, "v2": 8, "std": 8}
+
+    # 用户改任一桶 → 应写入新键,从此走新三桶
+    service.update({"daily_quota_std": 99})
+    assert service.get_daily_quotas() == {"mini": 8, "v2": 8, "std": 99}
+
+
+def test_settings_reject_per_model_quota_out_of_range(repository, database_manager, tmp_path):
+    """v0.2.9:daily_quota_mini/v2/std 都 1-100。"""
+    service = SettingsService(repository, tmp_path, database_manager.path)
+
+    for key in ("daily_quota_mini", "daily_quota_v2", "daily_quota_std"):
+        with pytest.raises(ValueError, match=key):
+            service.update({key: 0})
+        with pytest.raises(ValueError, match=key):
+            service.update({key: 101})
 
 
 def test_database_backup_is_consistent(repository, database_manager, tmp_path):

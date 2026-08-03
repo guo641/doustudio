@@ -10,6 +10,23 @@ from peewee import JOIN, SqliteDatabase
 from .models import Account, AppLog, AppSetting, LoginAttempt, VideoTask, utcnow
 
 
+# v0.2.9:seedance 模型 → quota 列名后缀。Account 列名 video_quota_used_<suffix>
+# 必须和这里一致。校验非法 model 时 raise ValueError。
+MODEL_QUOTA_FIELD: dict[str, str] = {
+    "seedance_v2.0_mini": "video_quota_used_mini",
+    "seedance_v2.0": "video_quota_used_v2",
+    "seedance_v2.0_std": "video_quota_used_std",
+}
+
+
+def _quota_field(model: str) -> str:
+    """模型名 → Account quota 列名。非法 model 抛 ValueError。"""
+    try:
+        return MODEL_QUOTA_FIELD[model]
+    except KeyError as exc:
+        raise ValueError(f"unsupported model for quota: {model}") from exc
+
+
 class AccountRepository:
     def __init__(self, database: SqliteDatabase):
         self.database = database
@@ -98,35 +115,71 @@ class AccountRepository:
         ).execute()
 
     def choose_available_account(
-        self, daily_quota: int = 5, now: datetime | None = None, strategy: str = "least_used"
+        self,
+        daily_quotas: dict[str, int],
+        model: str,
+        now: datetime | None = None,
+        strategy: str = "least_used",
     ) -> Account | None:
+        """v0.2.9:按 model 桶过滤 quota。返回该桶还有额度的最早账号。
+
+        daily_quotas: SettingsService.get_daily_quotas() 返回的 {'mini': int, ...}
+        model: 任务模型(seedance_v2.0_mini / seedance_v2.0 / seedance_v2.0_std)
+        """
+        field_name = _quota_field(model)
+        bucket = field_name.removeprefix("video_quota_used_")
+        quota_limit = int(daily_quotas[bucket])
+        field = getattr(Account, field_name)
         now = now or utcnow()
         query = (
             Account.select()
             .where(
                 (Account.enabled == True)  # noqa: E712
                 & (Account.status == "active")
-                & (Account.video_quota_used < daily_quota)
+                & (field < quota_limit)
                 & ((Account.video_limited_until.is_null(True)) | (Account.video_limited_until <= now))
             )
         )
         if strategy == "round_robin":
             query = query.order_by(Account.updated_at.asc())
         else:
-            query = query.order_by(Account.video_quota_used.asc(), Account.updated_at.asc())
+            query = query.order_by(field.asc(), Account.updated_at.asc())
         return query.first()
 
     def reset_daily_quotas(self, business_date: date) -> None:
-        (Account.update(video_quota_used=0, video_quota_date=business_date, video_limited_until=None)
+        # v0.2.9:三桶一起 reset(日切不区分模型,豆包对所有模型额度统一重置)。
+        (Account.update(
+            video_quota_used_mini=0,
+            video_quota_used_v2=0,
+            video_quota_used_std=0,
+            video_quota_date=business_date,
+            video_limited_until=None,
+         )
          .where((Account.video_quota_date.is_null(True)) | (Account.video_quota_date != business_date))
          .execute())
 
-    def mark_account_limited(self, account_id: str, limited_until: datetime, daily_quota: int) -> None:
-        (Account.update(video_quota_used=daily_quota, video_limited_until=limited_until, updated_at=utcnow())
+    def mark_account_limited(
+        self,
+        account_id: str,
+        limited_until: datetime,
+        daily_quotas: dict[str, int],
+    ) -> None:
+        # v0.2.9:豆包 423 限流封整号(不区分模型),三桶一并 cap 到各自 quota,
+        # 配合 choose_available_account 的 < 比较,该账号任何模型都不可再选。
+        (Account.update(
+            video_quota_used_mini=daily_quotas["mini"],
+            video_quota_used_v2=daily_quotas["v2"],
+            video_quota_used_std=daily_quotas["std"],
+            video_limited_until=limited_until,
+            updated_at=utcnow(),
+         )
          .where(Account.id == account_id).execute())
 
-    def increment_account_quota(self, account_id: str) -> None:
-        (Account.update(video_quota_used=Account.video_quota_used + 1, updated_at=utcnow())
+    def increment_account_quota(self, account_id: str, model: str) -> None:
+        """v0.2.9:按 model 桶扣 +1。不传 model 抛 ValueError(避免悄悄扣错桶)。"""
+        field_name = _quota_field(model)
+        field = getattr(Account, field_name)
+        (Account.update(**{field_name: field + 1}, updated_at=utcnow())
          .where(Account.id == account_id).execute())
 
     def create_video_task(

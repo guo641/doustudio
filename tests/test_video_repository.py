@@ -54,7 +54,7 @@ def test_choose_available_account_ignores_disabled(repository, temp_profile):
         profile_dir=temp_profile,
     )
 
-    assert repository.choose_available_account().id == expected.id
+    assert repository.choose_available_account({"mini": 5, "v2": 5, "std": 5}, model="seedance_v2.0_mini").id == expected.id
 
 
 def test_queued_task_can_wait_without_an_account(repository):
@@ -73,7 +73,7 @@ def test_queued_task_can_wait_without_an_account(repository):
 def test_account_quota_reset_and_assignment(repository, temp_profile):
     account = Account.create(
         id="quota-account", display_name="额度账号", doubao_user_id="quota-user",
-        profile_dir=temp_profile, video_quota_used=5, video_quota_date=date(2026, 7, 12),
+        profile_dir=temp_profile, video_quota_used_mini=5, video_quota_date=date(2026, 7, 12),
         video_limited_until=datetime(2026, 7, 12, 16, 0),
     )
     task = repository.create_video_task(None, "测试", "seedance_v2.0_mini", "1:1", 5)
@@ -83,6 +83,77 @@ def test_account_quota_reset_and_assignment(repository, temp_profile):
 
     account = Account.get_by_id(account.id)
     task = repository.get_video_task(task.id)
-    assert account.video_quota_used == 0
+    assert account.video_quota_used_mini == 0
+    assert account.video_quota_used_v2 == 0
+    assert account.video_quota_used_std == 0
     assert account.video_limited_until is None
     assert task.account.id == account.id
+
+
+# ---------- v0.2.9:per-model quota bucket ----------
+
+def test_choose_available_account_filters_by_model_bucket(repository, temp_profile):
+    """v0.2.9:mini 桶满员的账号,不该被 std 任务选中(每个模型独立 quota)。"""
+    full_mini = Account.create(
+        id="full-mini", display_name="mini 满", doubao_user_id="u1",
+        profile_dir=temp_profile, video_quota_used_mini=5,
+    )
+    open_std = Account.create(
+        id="open-std", display_name="std 满", doubao_user_id="u2",
+        profile_dir=temp_profile, video_quota_used_std=4,
+    )
+    quotas = {"mini": 5, "v2": 5, "std": 5}
+
+    # std 任务:full_mini 还在 mini 桶满,std 桶 0 → 应当被选中
+    assert repository.choose_available_account(quotas, model="seedance_v2.0_std").id == full_mini.id
+    # mini 任务:open_std 还没用 mini 桶,但 mini 桶已被选走(full_mini 是 5)→ 退到 open_std
+    assert repository.choose_available_account(quotas, model="seedance_v2.0_mini").id == open_std.id
+
+
+def test_increment_account_quota_targets_model_bucket(repository, temp_profile):
+    """v0.2.9:不同 model 互不影响桶。"""
+    account = Account.create(
+        id="acc", display_name="a", doubao_user_id="u", profile_dir=temp_profile,
+    )
+    repository.increment_account_quota(account.id, model="seedance_v2.0_mini")
+    repository.increment_account_quota(account.id, model="seedance_v2.0_mini")
+    repository.increment_account_quota(account.id, model="seedance_v2.0_std")
+
+    refreshed = Account.get_by_id(account.id)
+    # 增量按桶分别计
+    assert refreshed.video_quota_used_mini == 2
+    # v2 桶不受 mini/std 任务影响
+    assert refreshed.video_quota_used_v2 == 0
+    assert refreshed.video_quota_used_std == 1
+
+
+def test_mark_account_limited_zeroes_all_buckets(repository, temp_profile):
+    """v0.2.9:豆包 423 限流封整号 — 三桶一并 cap,任意模型都不可再选。"""
+    account = Account.create(
+        id="acc-l", display_name="l", doubao_user_id="u", profile_dir=temp_profile,
+        video_quota_used_mini=1, video_quota_used_v2=2, video_quota_used_std=3,
+    )
+    quotas = {"mini": 5, "v2": 5, "std": 5}
+    until = datetime(2026, 7, 13, 16, 0)
+    repository.mark_account_limited(account.id, until, quotas)
+
+    refreshed = Account.get_by_id(account.id)
+    assert refreshed.video_quota_used_mini == 5
+    assert refreshed.video_quota_used_v2 == 5
+    assert refreshed.video_quota_used_std == 5
+    assert refreshed.video_limited_until == until
+    # 任意桶都不可再选
+    assert repository.choose_available_account(quotas, model="seedance_v2.0_mini") is None
+    assert repository.choose_available_account(quotas, model="seedance_v2.0") is None
+    assert repository.choose_available_account(quotas, model="seedance_v2.0_std") is None
+
+
+def test_increment_account_quota_rejects_unknown_model(repository, temp_profile):
+    """v0.2.9:非法 model 不能悄悄扣错桶。"""
+    account = Account.create(
+        id="acc-nk", display_name="nk", doubao_user_id="u", profile_dir=temp_profile,
+    )
+    import pytest
+
+    with pytest.raises(ValueError, match="unsupported model"):
+        repository.increment_account_quota(account.id, model="foobar_baz")

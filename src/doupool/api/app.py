@@ -58,7 +58,12 @@ def _extract_bearer(authorization: str | None) -> str | None:
     return parts[1].strip() or None
 
 
-def _account_dict(account: Account, daily_quota: int = 5) -> dict:
+def _account_dict(account: Account, daily_quotas: dict[str, int] | None = None) -> dict:
+    """v0.2.9:返回按 seedance 模型分桶的当日额度。旧 video_quota_used /
+    video_quota_total 字段保留,alias 到 mini 桶,前端老代码 / 缓存兜底用。
+    daily_quotas 缺省时(老 API 调用方)用 mini 默认 5。
+    """
+    quotas = daily_quotas or {"mini": 5, "v2": 5, "std": 5}
     return {
         "id": account.id,
         "display_name": account.display_name,
@@ -66,8 +71,16 @@ def _account_dict(account: Account, daily_quota: int = 5) -> dict:
         "status": account.status,
         "enabled": account.enabled,
         "last_verified_at": account.last_verified_at.isoformat() if account.last_verified_at else None,
-        "video_quota_used": account.video_quota_used,
-        "video_quota_total": daily_quota,
+        # 老字段:alias 到 mini 桶,前端缓存 / 老测试兜底
+        "video_quota_used": account.video_quota_used_mini,
+        "video_quota_total": quotas["mini"],
+        # v0.2.9 新三桶
+        "video_quota_used_mini": account.video_quota_used_mini,
+        "video_quota_total_mini": quotas["mini"],
+        "video_quota_used_v2": account.video_quota_used_v2,
+        "video_quota_total_v2": quotas["v2"],
+        "video_quota_used_std": account.video_quota_used_std,
+        "video_quota_total_std": quotas["std"],
         "video_quota_date": account.video_quota_date.isoformat() if account.video_quota_date else None,
         "video_limited_until": account.video_limited_until.isoformat() if account.video_limited_until else None,
     }
@@ -174,8 +187,8 @@ def create_app(
         authorization: str | None = Header(default=None),
     ):
         authorize(x_doupool_token, authorization)
-        quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
-        return [_account_dict(item, quota) for item in repository.list_accounts()]
+        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
+        return [_account_dict(item, quotas) for item in repository.list_accounts()]
 
     @app.post("/api/accounts/login-attempts", status_code=202)
     async def create_login(
@@ -237,8 +250,8 @@ def create_app(
             account.enabled = body.enabled
             account.status = "active" if account.enabled else "disabled"
             account.save()
-        quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
-        return _account_dict(account, quota)
+        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
+        return _account_dict(account, quotas)
 
     @app.delete("/api/accounts/{account_id}", status_code=204)
     def delete_account(
@@ -322,8 +335,8 @@ def create_app(
         authorization: str | None = Header(default=None),
     ):
         authorize(x_doupool_token, authorization)
-        quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
-        return [_video_task_dict(task, quota) for task in repository.list_video_tasks()]
+        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
+        return [_video_task_dict(task, quotas["mini"]) for task in repository.list_video_tasks()]
 
     @app.get("/api/video-task-groups")
     def video_task_groups(
@@ -343,8 +356,8 @@ def create_app(
     ):
         """返回某 group 下所有任务,按 group_index 排序"""
         authorize(x_doupool_token, authorization)
-        quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
-        return [_video_task_dict(t, quota) for t in repository.list_tasks_by_group(group_id)]
+        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
+        return [_video_task_dict(t, quotas["mini"]) for t in repository.list_tasks_by_group(group_id)]
 
     @app.post("/api/video-tasks", status_code=202)
     async def create_video_task(
@@ -367,8 +380,8 @@ def create_app(
             task = video_service.start(**payload)
         except (ValueError, NoAvailableAccount) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
-        return _video_task_dict(task, quota)
+        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
+        return _video_task_dict(task, quotas["mini"])
 
     @app.post("/api/requests/{task_id}/retry-result", status_code=202)
     async def retry_result(
@@ -404,8 +417,8 @@ def create_app(
             raise HTTPException(status_code=409, detail=msg) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
-        return _video_task_dict(task, quota)
+        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
+        return _video_task_dict(task, quotas["mini"])
 
     assets = frontend_dir / "assets"
     if assets.exists():

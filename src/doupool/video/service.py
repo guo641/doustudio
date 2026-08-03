@@ -32,7 +32,13 @@ class NoAvailableAccount(RuntimeError):
 
 class _DefaultSettings:
     def get(self):
-        return {"daily_quota": 5, "quota_reset_time": "00:00", "max_concurrency": 1}
+        return {
+            "daily_quota_mini": 5, "daily_quota_v2": 5, "daily_quota_std": 5,
+            "quota_reset_time": "00:00", "max_concurrency": 1,
+        }
+
+    def get_daily_quotas(self):
+        return {"mini": 5, "v2": 5, "std": 5}
 
 
 def quota_window(now: datetime, reset_value: str) -> tuple[date, datetime]:
@@ -437,8 +443,12 @@ class VideoTaskService:
             business_date, next_reset = quota_window(datetime.now(UTC), settings["quota_reset_time"])
             self.repository.reset_daily_quotas(business_date)
             task = self.repository.get_video_task(task_id)
+            # v0.2.9:按 task.model 找对应桶还有额度的账号。
+            daily_quotas = self.settings_service.get_daily_quotas()
             account = task.account if task.account_id else self.repository.choose_available_account(
-                int(settings["daily_quota"]), strategy=settings.get("scheduler_strategy", "least_used")
+                daily_quotas,
+                model=task.model,
+                strategy=settings.get("scheduler_strategy", "least_used"),
             )
             if account is None:
                 self.repository.update_video_task(task_id, status="queued", error_message="等待可用账号")
@@ -455,7 +465,8 @@ class VideoTaskService:
                     def update(**values) -> None:
                         nonlocal quota_recorded
                         if values.get("status") == "generating" and not quota_recorded:
-                            self.repository.increment_account_quota(account.id)
+                            # v0.2.9:按 task.model 扣对应桶的额度。
+                            self.repository.increment_account_quota(account.id, model=task.model)
                             quota_recorded = True
                         self.repository.update_video_task(task_id, **values)
 
@@ -502,7 +513,7 @@ class VideoTaskService:
                         return
                     except DoubaoRateLimited:
                         self.repository.mark_account_limited(
-                            account.id, next_reset, int(settings["daily_quota"])
+                            account.id, next_reset, daily_quotas
                         )
                         self.repository.assign_video_task(task_id, None)
                         self.repository.update_video_task(
