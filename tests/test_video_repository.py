@@ -351,3 +351,71 @@ def test_is_task_deletable_false_for_running(repository):
 def test_is_task_deletable_false_for_missing(repository):
     """v0.2.11:不存在的 task_id 返回 False(让上层走 404 分支)。"""
     assert repository.is_task_deletable("nonexistent") is False
+
+
+def test_complete_login_resets_quota_buckets_for_existing_account(repository, temp_profile):
+    """v0.2.14:已存在账号重新登录成功后,把三桶 quota 清零 + 清 limited_until。
+
+    v0.2.12 时代被 mark_account_limited cap 死的桶,v0.2.13 修了 reset_daily_quotas
+    两段清桶,但装上 v0.2.13 之前已经死锁的桶只会等下次 423 / 跨天才解。
+    「重新登录」是最稳的恢复点 —— 反正账号刚扫完码就能用,
+    把桶清掉让账号立刻可调度,而不是让用户以为「登录失败」。
+    """
+    account = Account.create(
+        id="acc-relogin", display_name="旧昵称", doubao_user_id="u-relogin",
+        profile_dir=temp_profile,
+        # 模拟 v0.2.12 时代被 cap 死的状态
+        video_quota_used_mini=5, video_quota_used_v2=5, video_quota_used_std=5,
+        video_limited_until=datetime(2026, 8, 3, 16, 0),
+        video_quota_date=date(2026, 8, 3),
+        status="limited",
+    )
+    attempt = repository.create_login_attempt()
+    quotas = {"mini": 5, "v2": 5, "std": 5}
+
+    # 重登录前:桶满、limited_until 在未来 → 任何模型都选不到
+    assert repository.choose_available_account(quotas, model="seedance_v2.0_mini") is None
+    assert repository.choose_available_account(quotas, model="seedance_v2.0_std") is None
+
+    # 重新登录成功(沿用原 doubao_user_id 命中现有账号,走 else 分支)
+    refreshed = repository.complete_login(
+        attempt.id,
+        identity={"user_id": "u-relogin", "nickname": "新昵称"},
+        profile_dir=temp_profile,
+    )
+
+    # 三桶清零、limited_until 清空、昵称/状态都更新
+    assert refreshed.video_quota_used_mini == 0
+    assert refreshed.video_quota_used_v2 == 0
+    assert refreshed.video_quota_used_std == 0
+    assert refreshed.video_limited_until is None
+    assert refreshed.status == "active"
+    assert refreshed.doubao_nickname == "新昵称"
+
+    # 登录后立刻可调度
+    picked = repository.choose_available_account(quotas, model="seedance_v2.0_mini")
+    assert picked is not None
+    assert picked.id == account.id
+
+
+def test_complete_login_creates_new_account_without_touching_others(repository, temp_profile):
+    """v0.2.14:首次登录的新账号走 if 分支,不该动别的账号 quota。"""
+    # 已存在的老账号,quota 满
+    Account.create(
+        id="acc-old", display_name="老", doubao_user_id="u-old",
+        profile_dir=temp_profile,
+        video_quota_used_mini=5, video_quota_used_v2=5, video_quota_used_std=5,
+        video_limited_until=datetime(2026, 8, 3, 16, 0),
+    )
+    attempt = repository.create_login_attempt()
+
+    repository.complete_login(
+        attempt.id,
+        identity={"user_id": "u-new", "nickname": "新号"},
+        profile_dir=temp_profile,
+    )
+
+    # 老账号 quota 不应该被新账号登录牵连清掉
+    old = Account.get_by_id("acc-old")
+    assert old.video_quota_used_mini == 5
+    assert old.video_limited_until == datetime(2026, 8, 3, 16, 0)

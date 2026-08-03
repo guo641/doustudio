@@ -83,6 +83,16 @@ class AccountRepository:
                 account.status = "active"
                 account.last_verified_at = now
                 account.last_error = None
+                # v0.2.14:重新登录成功时重置 quota 桶。
+                # v0.2.12 时代的账号被 mark_account_limited cap 到 quota_limit,
+                # 即便 v0.2.13 的 reset_daily_quotas 修了跨天+同天到期两段清桶,
+                # 用户已经死锁的桶也只会等下次 423 / 跨天才解 —— 而登录是最稳的
+                # 恢复点,反正账号刚扫完码就能用。把 3 个桶清零、清 limited_until,
+                # 让重新登录过的账号立刻可调度。
+                account.video_quota_used_mini = 0
+                account.video_quota_used_v2 = 0
+                account.video_quota_used_std = 0
+                account.video_limited_until = None
                 account.updated_at = now
                 account.save()
             attempt = LoginAttempt.get_by_id(attempt_id)
