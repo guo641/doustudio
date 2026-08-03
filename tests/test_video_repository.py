@@ -128,24 +128,41 @@ def test_increment_account_quota_targets_model_bucket(repository, temp_profile):
 
 
 def test_mark_account_limited_zeroes_all_buckets(repository, temp_profile):
-    """v0.2.9:豆包 423 限流封整号 — 三桶一并 cap,任意模型都不可再选。"""
+    """v0.2.9:豆包 423 限流封整号 — 三桶一并 cap,任意模型都不可再选。
+    v0.2.13:同时写 video_quota_date=business_date,确保 reset_daily_quotas 跨天能清。"""
     account = Account.create(
         id="acc-l", display_name="l", doubao_user_id="u", profile_dir=temp_profile,
         video_quota_used_mini=1, video_quota_used_v2=2, video_quota_used_std=3,
     )
     quotas = {"mini": 5, "v2": 5, "std": 5}
     until = datetime(2026, 7, 13, 16, 0)
-    repository.mark_account_limited(account.id, until, quotas)
+    repository.mark_account_limited(
+        account.id, until, quotas, business_date=date(2026, 7, 13)
+    )
 
     refreshed = Account.get_by_id(account.id)
     assert refreshed.video_quota_used_mini == 5
     assert refreshed.video_quota_used_v2 == 5
     assert refreshed.video_quota_used_std == 5
     assert refreshed.video_limited_until == until
+    assert refreshed.video_quota_date == date(2026, 7, 13)  # v0.2.13 锚定
     # 任意桶都不可再选
     assert repository.choose_available_account(quotas, model="seedance_v2.0_mini") is None
     assert repository.choose_available_account(quotas, model="seedance_v2.0") is None
     assert repository.choose_available_account(quotas, model="seedance_v2.0_std") is None
+
+
+def test_mark_account_limited_without_business_date_is_backward_compatible(repository, temp_profile):
+    """v0.2.13:business_date=None 时不写 video_quota_date,跟老调用兼容。"""
+    account = Account.create(
+        id="acc-bc", display_name="bc", doubao_user_id="bc", profile_dir=temp_profile,
+        video_quota_date=date(2026, 7, 10),  # 故意写一个旧值
+    )
+    quotas = {"mini": 5, "v2": 5, "std": 5}
+    repository.mark_account_limited(account.id, datetime(2026, 7, 13, 16, 0), quotas)
+    refreshed = Account.get_by_id(account.id)
+    # 没传 business_date → video_quota_date 保持原值不动
+    assert refreshed.video_quota_date == date(2026, 7, 10)
 
 
 def test_reset_daily_quotas_clears_expired_limited_until(repository, temp_profile):
@@ -191,6 +208,37 @@ def test_reset_daily_quotas_does_not_touch_active_limited_until(repository, temp
     assert refreshed.video_limited_until == future
     assert refreshed.video_quota_used_mini == 5
     assert repository.choose_available_account(quotas, model="seedance_v2.0_mini") is None
+
+
+def test_reset_daily_quotas_clears_expired_regardless_of_date(repository, temp_profile):
+    """v0.2.13:用户改 quota_reset_time 后,旧 limited_until 落在当天未来,跨天第一段
+    命中靠 video_quota_date=business_date 锚定;但若 date 不匹配 + limited_until 已
+    过期的极端组合,第二段(纯看 limited_until <= now)也要清桶,不能漏。"""
+    account = Account.create(
+        id="acc-mismatch", display_name="m", doubao_user_id="u-mm",
+        profile_dir=temp_profile,
+        video_quota_date=date(2026, 7, 12),  # 故意旧 date,跟 business_date 不匹配
+    )
+    quotas = {"mini": 5, "v2": 5, "std": 5}
+    # 旧的 limited_until 已经过期(13 号 16:00 < 14 号中午)
+    repository.mark_account_limited(
+        account.id, datetime(2026, 7, 13, 16, 0), quotas,
+        business_date=date(2026, 7, 12),
+    )
+    # 跨天 + limited_until 已过期 —— 第一段(date != business_date)和第二段
+    # (limited_until <= now)都会命中;两段都做清桶,幂等无副作用
+    repository.reset_daily_quotas(date(2026, 7, 14), now=datetime(2026, 7, 14, 12, 0))
+
+    refreshed = Account.get_by_id(account.id)
+    assert refreshed.video_quota_used_mini == 0
+    assert refreshed.video_quota_used_v2 == 0
+    assert refreshed.video_quota_used_std == 0
+    assert refreshed.video_limited_until is None
+    assert refreshed.video_quota_date == date(2026, 7, 14)
+    # 账号重新可选
+    picked = repository.choose_available_account(quotas, model="seedance_v2.0_mini")
+    assert picked is not None
+    assert picked.id == account.id
 
 
 def test_summarize_account_availability_counts_buckets(repository, temp_profile):

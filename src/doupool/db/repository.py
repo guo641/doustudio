@@ -203,8 +203,9 @@ class AccountRepository:
          .where((Account.video_quota_date.is_null(True)) | (Account.video_quota_date != business_date))
          .execute())
         # v0.2.12:同一天内 limited_until 已到期 → 桶已 cap 死,清桶让账号恢复。
-        # 注意只清 limited_until <= now 且 date == business_date 的行,
-        # date 不一致说明跨天了,上面的 reset 已经处理过,这里跳过避免双写竞态。
+        # v0.2.13:去掉 date == business_date 限制 —— 任何 limited_until <= now
+        # 都清桶,跟第一段(日切)互不依赖更安全。mark_account_limited 现在会
+        # 同步写 video_quota_date,跨天时第一段也会命中,两段协同不会重复写。
         (Account.update(
             video_quota_used_mini=0,
             video_quota_used_v2=0,
@@ -215,7 +216,6 @@ class AccountRepository:
          .where(
              (Account.video_limited_until.is_null(False))
              & (Account.video_limited_until <= now)
-             & (Account.video_quota_date == business_date)
          )
          .execute())
 
@@ -224,16 +224,26 @@ class AccountRepository:
         account_id: str,
         limited_until: datetime,
         daily_quotas: dict[str, int],
+        business_date: date | None = None,
     ) -> None:
         # v0.2.9:豆包 423 限流封整号(不区分模型),三桶一并 cap 到各自 quota,
         # 配合 choose_available_account 的 < 比较,该账号任何模型都不可再选。
-        (Account.update(
+        # v0.2.13:同步把 video_quota_date 写成业务日,确保 reset_daily_quotas
+        # 跨天时第一段(日期不匹配)一定能命中,把桶清回 0。否则如果调用方传
+        # 的 limited_until 是「当天未来某点」(quota_window 在 reset_time > now
+        # 时的产物),且用户在设置面板改了 quota_reset_time,新 next_reset 已经
+        # 跳到次日,但旧的 limited_until 还指向当天未来时间,跨天/同日两段都
+        # 不会清桶,账号就 cap 死选不到了。
+        update_kwargs: dict = dict(
             video_quota_used_mini=daily_quotas["mini"],
             video_quota_used_v2=daily_quotas["v2"],
             video_quota_used_std=daily_quotas["std"],
             video_limited_until=limited_until,
             updated_at=utcnow(),
-         )
+        )
+        if business_date is not None:
+            update_kwargs["video_quota_date"] = business_date
+        (Account.update(**update_kwargs)
          .where(Account.id == account_id).execute())
 
     def increment_account_quota(

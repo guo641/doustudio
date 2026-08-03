@@ -515,7 +515,7 @@ class VideoTaskService:
                 if stats["enabled_total"] == 0:
                     msg = "暂无账号,请先在账号面板添加账号"
                 elif stats["bucket_full"] >= stats["enabled_total"]:
-                    msg = f"全部账号今日 {task.model} 额度已用完,明天自动恢复"
+                    msg = f"全部账号今日 {task.model} 额度已用完,明早 00:00 自动恢复"
                 else:
                     msg = "等待可用账号"
                 self.repository.update_video_task(task_id, status="queued", error_message=msg)
@@ -584,7 +584,8 @@ class VideoTaskService:
                         return
                     except DoubaoRateLimited:
                         self.repository.mark_account_limited(
-                            account.id, next_reset, daily_quotas
+                            account.id, next_reset, daily_quotas,
+                            business_date=business_date,
                         )
                         self.repository.assign_video_task(task_id, None)
                         self.repository.update_video_task(
