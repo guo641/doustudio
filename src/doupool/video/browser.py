@@ -303,6 +303,70 @@ class PlaywrightVideoRunner:
         self.timeout = timeout
         self.poll_interval = poll_interval
 
+    def recheck_result(
+        self,
+        profile_dir: Path,
+        conversation_id: str,
+        update: Callable[..., None],
+        cancel_event: threading.Event,
+        *,
+        deadline_seconds: float = 90,
+    ) -> dict[str, str] | None:
+        """v0.2.9:不重提交,只重解析 —— 复用已存的 conversation_id,
+        重新打开 /chat/<id> 拉一次 CHAIN_SCRIPT,parse 出最新 result。
+
+        用于 retry-result 端点:用户报告"succeeded 但 result_url 失效"
+        或 "卡在 generating 很久不动了",想再查一次远端而不消耗豆包额度
+        (不调 COMPLETION_SCRIPT,只查 chain)。
+
+        返回 None = 还在生成中 / 远端还没出 result;
+        返回 dict = parse_creation_result 出的 result 字段(result_url /
+        backup_result_url / fallback_result_url / vid / cover_url 等),
+        调用方负责写回 VideoTask。
+        """
+        with sync_playwright() as playwright:
+            context = playwright.chromium.launch_persistent_context(
+                str(profile_dir),
+                headless=False,
+                viewport={"width": 940, "height": 650},
+                args=["--window-size=1000,720", "--window-position=-2000,-2000"],
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                # 必须先打开 doubao.com 拿到 aegis 风控指纹,否则 CHAIN_SCRIPT
+                # 会被字节拒为 1011(用户未登录)——和首次提交一样的硬约束。
+                page.goto(
+                    "https://www.doubao.com/chat/",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+                page.wait_for_timeout(2_000)
+                # 切到指定 conversation(只读,不发新请求)
+                page.evaluate(
+                    "id => history.replaceState({}, '', '/chat/' + id)",
+                    conversation_id,
+                )
+                update(status="rechecking")
+                deadline = time.monotonic() + deadline_seconds
+                while time.monotonic() < deadline:
+                    if cancel_event.is_set():
+                        raise RuntimeError("任务已取消")
+                    chain = page.evaluate(
+                        CHAIN_SCRIPT, {"conversationId": conversation_id}
+                    )
+                    if chain["status"] != 200:
+                        raise RuntimeError(
+                            f"豆包结果接口返回 HTTP {chain['status']}"
+                        )
+                    result = parse_creation_result(chain["data"])
+                    if result:
+                        update(status="resolving", **result)
+                        return self._resolve_original_download(page, result, cancel_event)
+                    page.wait_for_timeout(self.poll_interval * 1000)
+                return None
+            finally:
+                context.close()
+
     def run(
         self,
         profile_dir: Path,

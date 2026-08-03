@@ -68,6 +68,10 @@ class VideoTaskService:
         self.logger = logging.getLogger("doupool.video")
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancellations: dict[str, threading.Event] = {}
+        # v0.2.9:retry-result 独立 task 池 —— 不和正常生成 task 混,
+        # shutdown 时也不强制 cancel(用户主动 retry 的话让他跑完)。
+        self._retry_tasks: dict[str, asyncio.Task[None]] = {}
+        self._retry_cancellations: dict[str, threading.Event] = {}
         self._account_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._global_semaphore: asyncio.Semaphore | None = None
         self._semaphore_limit = 0
@@ -192,6 +196,147 @@ class VideoTaskService:
         cancellation = threading.Event()
         self._cancellations[task_id] = cancellation
         self._tasks[task_id] = asyncio.create_task(self._run(task_id, cancellation))
+
+    # ---------- v0.2.9 retry-result 入口 ----------
+    def retry_result(self, task_id: str) -> VideoTask:
+        """同步入口:做参数校验 + 调度后台协程,本身不 await。
+
+        asyncio.create_task 需要 running event loop,FastAPI route / pytest-asyncio
+        测试都在 loop 内,所以这一层是安全的;为了让 service 测试能在没 loop
+        的上下文里跑参数校验逻辑,这里把 create_task 拆出来,API 路由侧负责
+        await 包了一层。
+        """
+        try:
+            task = self.repository.get_video_task(task_id)
+        except Exception:  # VideoTask.DoesNotExist —— peewee 抛错而非返回 None
+            raise ValueError("任务不存在") from None
+        if task is None:
+            raise ValueError("任务不存在")
+        if not task.conversation_id:
+            raise ValueError("任务缺少 conversation_id,请重新提交")
+        if task.account_id is None:
+            raise ValueError("原账号不可用,无法重解析")
+        account = Account.get_or_none(Account.id == task.account_id)
+        if account is None or not Path(account.profile_dir).exists():
+            raise ValueError("原账号不可用,无法重解析")
+        # 每个 task 一次只允许一个重解析在跑,避免双开浏览器把同一 chain
+        # 抓两遍互相打架。
+        if task_id in self._retry_tasks and not self._retry_tasks[task_id].done():
+            raise RuntimeError("已有 retry-result 在运行")
+        cancellation = threading.Event()
+        self._retry_cancellations[task_id] = cancellation
+        self._retry_tasks[task_id] = asyncio.create_task(
+            self._retry_result_inner(task_id, account.profile_dir, cancellation)
+        )
+        return task
+
+    async def schedule_retry_result(self, task_id: str) -> VideoTask:
+        """异步入口:在 running event loop 里安全 schedule,供 FastAPI 调用。
+        pytest 没起 loop 的同步测试直接用 retry_result()。
+        """
+        return self.retry_result(task_id)
+
+    async def _retry_result_inner(
+        self, task_id: str, profile_dir: str, cancellation: threading.Event
+    ) -> None:
+        """retry-result 后台协程。和 _run_inner 解耦,不复用其配额 / 调度逻辑。
+
+        错误兜底同 _run:不抛到外层,失败时把 task 标 failed 留痕。
+        """
+        try:
+            await self._retry_result_body(task_id, profile_dir, cancellation)
+        except asyncio.CancelledError:
+            self.repository.update_video_task(
+                task_id,
+                status="failed",
+                error_message="retry-result 已取消",
+            )
+            raise
+        except Exception as exc:
+            self.logger.exception(
+                "retry-result 出现未捕获异常",
+                extra={"event": "video_retry_crashed", "task_id": task_id},
+            )
+            try:
+                self.repository.update_video_task(
+                    task_id,
+                    status="failed",
+                    error_message=f"retry-result 异常:{exc}",
+                )
+            except Exception:
+                self.logger.exception(
+                    "retry-result 兜底写 failed 也失败", extra={"task_id": task_id}
+                )
+        finally:
+            self._retry_tasks.pop(task_id, None)
+            self._retry_cancellations.pop(task_id, None)
+
+    async def _retry_result_body(
+        self, task_id: str, profile_dir: str, cancellation: threading.Event
+    ) -> None:
+        task = self.repository.get_video_task(task_id)
+        if task is None:
+            return
+        conversation_id = task.conversation_id or ""
+        # 进入重解析流程,状态标记 rechecking 但要记住"原本是什么状态",
+        # 抛错回滚时还原 —— 否则 succeeded 任务一旦重解析失败会被强标 failed,
+        # 把旧 result_url 也覆盖掉,用户连已下载的链接都拿不回来。
+        previous_status = task.status
+        self.repository.update_video_task(
+            task_id, status="rechecking", error_message=None
+        )
+
+        def update(**values) -> None:
+            # 注意:不调用 increment_account_quota —— 重解析不消耗额度。
+            self.repository.update_video_task(task_id, **values)
+
+        try:
+            result = await asyncio.to_thread(
+                self.runner.recheck_result,
+                profile_dir,
+                conversation_id,
+                update,
+                cancellation,
+            )
+        except Exception as exc:
+            # recheck_result 抛错 = 远端确实没 result / 网络挂了 / 风控拒了
+            # 回退到 previous_status(原本可能是 succeeded),不强行标 failed。
+            # 仅在 error_message 留痕 —— 已 succeeded 的旧 result_url 仍能让
+            # 用户下载。
+            self.repository.update_video_task(
+                task_id,
+                status=previous_status,
+                error_message=f"重解析失败:{exc}",
+            )
+            return
+        if result is None:
+            # 还在生成中:回退到 generating(若原本是 queued 也合理)。
+            # 失败 / succeeded 都覆盖成 generating 较激进,所以按 previous 决定:
+            # terminal 状态保留,非 terminal 推到 generating。
+            fallback = previous_status if previous_status in {"succeeded", "failed"} else "generating"
+            self.repository.update_video_task(
+                task_id,
+                status=fallback,
+                error_message="重解析超时,远端尚未生成完成",
+            )
+            return
+        # 拿到新 result:把 succeeded 字段更新。watermark 异步清洗照常跑。
+        self.repository.update_video_task(
+            task_id, status="succeeded", error_message=None, **result
+        )
+        self.logger.info(
+            "retry-result 拿到新 result_url", extra={"event": "video_retry_succeeded", "task_id": task_id}
+        )
+        settings = self.settings_service.get()
+        try:
+            await self._run_watermark(task_id, result, settings)
+        except Exception as watermark_exc:
+            self.repository.update_video_task(
+                task_id, clean_error=f"去水印过程异常:{watermark_exc}"
+            )
+            self.logger.exception(
+                "retry-result 后去水印异常", extra={"task_id": task_id}
+            )
 
     async def resume_queued(self) -> None:
         for task in self.repository.list_queued_video_tasks():
@@ -393,3 +538,15 @@ class VideoTaskService:
             cancellation.set()
         if self._tasks:
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        # retry-result 任务不强制 cancel —— 让它跑完,免得用户白白浪费
+        # 一次浏览器重开 / 风控校验。但等一个上限,避免僵尸卡住关停。
+        if self._retry_tasks:
+            done, pending = await asyncio.wait(
+                list(self._retry_tasks.values()),
+                timeout=10,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)

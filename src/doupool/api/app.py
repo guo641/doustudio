@@ -363,6 +363,43 @@ def create_app(
         quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
         return _video_task_dict(task, quota)
 
+    @app.post("/api/requests/{task_id}/retry-result", status_code=202)
+    async def retry_result(
+        task_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.9:只重解析不重提交,不扣额度。
+
+        yaonieyo 风格路径 /api/requests/:id/retry-result —— 外部脚本
+        (n8n / Airflow / 各种 batch runner)用同一个 task_id 轮询结果时,
+        卡住或下载链接失效就 POST 这个端点让服务再查一次远端 chain。
+
+        路径风格刻意保持 /api/requests/<task_id>/...,和 /api/video-tasks
+        并存而不是合并 —— 这样老集成(直接读 /api/video-tasks)不动,
+        新集成的"用 task_id 跟踪单个任务"心智模型也清晰。
+
+        状态码:
+          - 202:已接收,后台开始重解析(返回当前 task 字典,前端可继续轮询)
+          - 404:task_id 不存在
+          - 409:缺少 conversation_id / 原账号不可用 / 已有 retry 在跑
+          - 503:video_service 未启动
+        """
+        authorize(x_doupool_token, authorization)
+        if video_service is None:
+            raise HTTPException(status_code=503, detail="视频服务未启动")
+        try:
+            task = await video_service.schedule_retry_result(task_id)
+        except ValueError as exc:
+            msg = str(exc)
+            if "任务不存在" in msg:
+                raise HTTPException(status_code=404, detail=msg) from exc
+            raise HTTPException(status_code=409, detail=msg) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        quota = int(settings_service.get()["daily_quota"]) if settings_service else 5
+        return _video_task_dict(task, quota)
+
     assets = frontend_dir / "assets"
     if assets.exists():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")
