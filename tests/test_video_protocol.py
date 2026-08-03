@@ -56,6 +56,18 @@ def test_parse_sse_ack_raises_typed_rate_limit():
         parse_sse_ack(text)
 
 
+def test_parse_sse_ack_attaches_response_text_to_rate_limit():
+    """v0.2.15:DoubaoRateLimited 带 response_text,video/service 写日志时
+    能看到豆包真正的 SSE 响应原文,排查「额度误报」(指纹 / IP / 风控)时
+    不再是黑盒。
+    """
+    text = 'event: STREAM_ERROR\ndata: {"error_msg":"rate limited","error_code":429}\n\n'
+    with pytest.raises(DoubaoRateLimited) as excinfo:
+        parse_sse_ack(text)
+    assert "rate limited" in str(excinfo.value)
+    assert excinfo.value.response_text == text
+
+
 def test_parse_creation_result_extracts_video():
     content = json.dumps([{
         "block_type": 2074,

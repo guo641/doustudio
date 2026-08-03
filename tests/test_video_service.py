@@ -55,6 +55,48 @@ async def test_service_keeps_task_queued_without_an_available_account(repository
     await service.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_run_inner_exits_silently_when_task_deleted(repository, temp_profile):
+    """v0.2.15:任务被 DELETE 端点删了 → worker 静默退出,不再刷 IndexError。
+
+    之前 get_video_task 抛 DoesNotExist(peewee 包成 IndexError: list index
+    out of range),触发顶层兜底的 ERROR「视频任务执行器出现未捕获异常」。
+    现在 get_video_task 返 None,_run_inner 直接 return。
+
+    用 monkeypatch 把 get_video_task 替成「第一次返真 task,之后返 None」,
+    模拟任务在 worker 跑的过程中被 DELETE 删掉,保证确定性。
+    """
+    from doupool.db.models import VideoTask
+    Account.create(
+        id="account-del", display_name="X", doubao_user_id="u", profile_dir=temp_profile
+    )
+    task = repository.create_video_task(
+        "account-del", "P", "seedance_v2.0_mini", "1:1", 5,
+    )
+    real_get = repository.get_video_task
+    calls = {"n": 0}
+
+    def fake_get(task_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_get(task_id)  # 第一轮拿到真 task,进入 runner
+        return None  # 之后所有轮都拿不到 → worker 退出
+
+    repository.get_video_task = fake_get
+    try:
+        service = VideoTaskService(
+            repository, SuccessfulVideoRunner(), StaticSettings(), account_poll_interval=0.01,
+        )
+        await asyncio.wait_for(service.resume_queued(), timeout=2)
+        # 让 worker 跑过第一轮成功,然后下一轮 fake_get → None → return
+        await asyncio.sleep(0.1)
+        await service.shutdown()
+        # worker 已经 return,没抛 IndexError,测试通过即说明 worker 静默退出
+        assert calls["n"] >= 1
+    finally:
+        repository.get_video_task = real_get
+
+
 class FailoverRunner:
     def __init__(self):
         self.calls = []

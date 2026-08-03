@@ -500,6 +500,14 @@ class VideoTaskService:
             business_date, next_reset = quota_window(datetime.now(UTC), settings["quota_reset_time"])
             self.repository.reset_daily_quotas(business_date)
             task = self.repository.get_video_task(task_id)
+            # v0.2.15:任务被 DELETE 端点删了 → get_video_task 返 None,
+            # worker 静默退出,不再刷 IndexError: list index out of range。
+            if task is None:
+                self.logger.info(
+                    "视频任务已被删除,worker 退出",
+                    extra={"event": "task_deleted_worker_exit", "task_id": task_id},
+                )
+                return
             # v0.2.9:按 task.model 找对应桶还有额度的账号。
             daily_quotas = self.settings_service.get_daily_quotas()
             account = task.account if task.account_id else self.repository.choose_available_account(
@@ -582,17 +590,22 @@ class VideoTaskService:
                         # (含 result_url / clean_video_url)再发,前端收到时就能直接用。
                         self._schedule_callback(task_id)
                         return
-                    except DoubaoRateLimited:
+                    except DoubaoRateLimited as exc:
+                        # v0.2.15:把豆包真正返回的 error_msg + SSE 响应原文写进
+                        # WARNING —— 之前只写「额度已用完」,真正 error_msg 被吞,
+                        # 「额度误报」(fingerprint / IP / 风控等)时完全没线索。
                         self.repository.mark_account_limited(
                             account.id, next_reset, daily_quotas,
                             business_date=business_date,
                         )
                         self.repository.assign_video_task(task_id, None)
                         self.repository.update_video_task(
-                            task_id, status="queued", error_message="账号今日额度已用完，正在切换账号"
+                            task_id, status="queued", error_message=f"账号今日额度已用完:{exc}"
                         )
+                        response_excerpt = (exc.response_text or "").replace("\r\n", " ")[:500]
                         self.logger.warning(
-                            "账号今日视频额度已用完",
+                            "账号今日视频额度已用完:%s | response=%s",
+                            exc, response_excerpt,
                             extra={"event": "video_quota_limited", "account_id": account.id},
                         )
                         continue

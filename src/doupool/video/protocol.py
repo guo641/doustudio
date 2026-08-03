@@ -14,7 +14,16 @@ MAX_I2V_IMAGES = 9
 
 
 class DoubaoRateLimited(RuntimeError):
-    pass
+    """豆包返回 STREAM_ERROR:rate limited 时抛。
+
+    v0.2.15:带 response_text 字段,把 SSE 响应原文透传出来,
+    `video/service._run_inner` 把它写到日志,方便下次「额度已用完」误报时
+    能看到豆包真正的 error_msg(可能是 fingerprint / IP / 风控 等)。
+    """
+
+    def __init__(self, message: str, response_text: str = "") -> None:
+        super().__init__(message)
+        self.response_text = response_text
 
 
 def _base_option(
@@ -261,7 +270,8 @@ def parse_sse_ack(text: str) -> dict[str, str]:
             error = json.loads(data or "{}")
             message = error.get("error_msg") or "豆包接口返回错误"
             if message == "rate limited":
-                raise DoubaoRateLimited(message)
+                # v0.2.15:把响应原文一起带出去,service 层写日志能看清真实 error_msg
+                raise DoubaoRateLimited(message, text[:2000])
             raise RuntimeError(message)
         if event == "SSE_ACK":
             payload = json.loads(data)

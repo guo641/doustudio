@@ -353,6 +353,28 @@ def test_is_task_deletable_false_for_missing(repository):
     assert repository.is_task_deletable("nonexistent") is False
 
 
+def test_get_update_assign_video_task_returns_none_when_task_deleted(repository, temp_profile):
+    """v0.2.15:DELETE 端点物理删除任务后,worker 还在 in-flight 时调用
+    get_video_task / update_video_task / assign_video_task,不应抛
+    VideoTaskDoesNotExist(peewee 包成 IndexError: list index out of range),
+    而是静默返回 None / skip,让 service._run_inner 自己退出。
+    """
+    account = Account.create(
+        id="account-1",
+        display_name="测试账号",
+        doubao_user_id="user-1",
+        profile_dir=temp_profile,
+    )
+    task = repository.create_video_task(
+        account.id, "P", "seedance_v2.0_mini", "1:1", 5,
+    )
+    repository.delete_video_task(task.id)
+    # 三种调用都不抛,都返回 None
+    assert repository.get_video_task(task.id) is None
+    assert repository.update_video_task(task.id, status="queued") is None
+    assert repository.assign_video_task(task.id, None) is None
+
+
 def test_complete_login_resets_quota_buckets_for_existing_account(repository, temp_profile):
     """v0.2.14:已存在账号重新登录成功后,把三桶 quota 清零 + 清 limited_until。
 

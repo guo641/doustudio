@@ -336,8 +336,16 @@ class AccountRepository:
             .order_by(VideoTask.group_index.asc(), VideoTask.created_at.asc())
         )
 
-    def assign_video_task(self, task_id: str, account_id: str | None) -> VideoTask:
-        task = VideoTask.get_by_id(task_id)
+    def assign_video_task(self, task_id: str, account_id: str | None) -> VideoTask | None:
+        # v0.2.15:DELETE 端点删了任务后,worker 还在 in-flight 时调用这里会
+        # 抛 VideoTaskDoesNotExist(peewee 包成 IndexError: list index out of range),
+        # 触发 _run_inner 顶层兜底的 ERROR「视频任务执行器出现未捕获异常」。
+        # 改成 silent skip:任务没了就不更新,worker 下一轮 get_video_task 会
+        # 自己退出。
+        try:
+            task = VideoTask.get_by_id(task_id)
+        except VideoTask.DoesNotExist:
+            return None
         task.account = account_id
         task.updated_at = utcnow()
         task.save()
@@ -345,8 +353,13 @@ class AccountRepository:
             Account.update(updated_at=utcnow()).where(Account.id == account_id).execute()
         return task
 
-    def get_video_task(self, task_id: str) -> VideoTask:
-        return VideoTask.get_by_id(task_id)
+    def get_video_task(self, task_id: str) -> VideoTask | None:
+        # v0.2.15:任务被 DELETE 端点删了 → 返回 None(原来是抛 DoesNotExist)。
+        # service._run_inner 收到 None 直接 return,worker 静默退出。
+        try:
+            return VideoTask.get_by_id(task_id)
+        except VideoTask.DoesNotExist:
+            return None
 
     def list_video_tasks(self, limit: int = 200) -> list[VideoTask]:
         return list(
@@ -356,8 +369,12 @@ class AccountRepository:
             .limit(limit)
         )
 
-    def update_video_task(self, task_id: str, **values) -> VideoTask:
-        task = VideoTask.get_by_id(task_id)
+    def update_video_task(self, task_id: str, **values) -> VideoTask | None:
+        # v0.2.15:同 assign_video_task —— 任务被删时 silent skip。
+        try:
+            task = VideoTask.get_by_id(task_id)
+        except VideoTask.DoesNotExist:
+            return None
         for key, value in values.items():
             setattr(task, key, value)
         task.updated_at = utcnow()
