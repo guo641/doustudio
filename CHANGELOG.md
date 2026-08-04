@@ -2,6 +2,62 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.19 - 2026-08-04
+
+### 修复
+
+- **「豆包真实计费」对齐 + 默认额度桶改 50**
+  v0.2.18 误以为豆包内部「按基础公式扣 0.2/s」,线上按用户反馈核账后,豆包真实计费是
+  `mini=1 点/秒 / fast=1.5 点/秒`(向上取整,与 v0.2.11 之前一致)。v0.2.18 的
+  0.2/s 反而成了「豆包扣 10 点,我方只扣 2 点」的账期不对账。`MODEL_COST_PER_SECOND`
+  回滚到 `mini=1.0/s / fast=1.5/s`,默认 `daily_quota_mini/v2/std` 从 5/5/5 改成
+  50/50/50(对齐豆包每账号每天 50 点的真实额度)。一个 5s mini 视频 = 5 点,
+  一个 10s fast 视频 = 15 点,账期对得上。
+
+- **「单账号并发 + 共享 BrowserContext」:Playwright runner 改成 async,首跑后复用 BrowserContext**
+  v0.2.17 引入「复用登录 profile」后,每次提交任务仍 `asyncio.to_thread(runner.run)`
+  走 sync Playwright + `await launch_persistent_context` —— 同一账号第二次跑
+  任务时,profile Lockfile / Chromium pid 仍会有竞争,日 worker 跑多个串行任务
+  时偶发 `BrowserContext._init` 错误。重构后:
+    1. `_run_inner` 改为 `await self.runner.run(...)`(async runner,不再 to_thread)
+    2. service 持 `per-profile BrowserContext` 缓存 + `per-profile asyncio.Lock`
+       —— 首次创建时拿锁,后续复用现成 context(免 Lockfile 冲突)
+    3. 全局 `asyncio.Semaphore(max_concurrency)` 仍在 `_run_inner` 入口把关
+  双账号场景:同账号不同 task 串行(避免同 profile 抢锁)、不同账号并行。
+
+- **「失败退还额度」:网络异常 / prompt 违规 / 无效输入 自动退已扣的额度**
+  v0.2.18 前,任务失败但豆包明确拒绝(违规词 / 网络超时 / 无效图片)时,runner 已
+  `update(status="generating")` 触发了 `increment_account_quota(by=cost)`,但
+  `except` 分支不退款 —— 用户被拒的任务仍在桶里扣了额度,变成「豆包拒了,我也
+  被扣了」。`service._run_inner` 用 `nonlocal quota_recorded / recorded_cost`
+  跟踪本 runner 已扣的额度;`classify_failure` 命中 `NETWORK / POLICY_VIOLATION
+  / INVALID_INPUT` 时调 `repository.decrement_account_quota(account, model, by=cost)`
+  把桶减回原状。
+  - **不退**:`GENERATION_FAILED / RATE_LIMITED / UNKNOWN` —— 前两类豆包大概率已
+    计费(用户在豆包官方账户能看到扣费),后者已走 `mark_account_limited` 路径
+  - **取消不参与退款**:用户进入 generating 后主动取消,**不退** —— 豆包已开始
+    生成,额度已扣,这是用户主动取消 ≠ 豆包拒绝,两条独立路径
+
+### 测试
+
+- `test_quota_cost_*` 更新为回滚后的费率期望值
+- `test_quota_cost_fits_daily_quota_bucket` 改为 daily_quota=50:10 个 5s mini = 50
+  点(用完整天)、10 个 10s mini = 100 点(超额)
+- `StaticSettings` 默认 daily_quota=50(对齐真实额度)
+- `test_video_browser.py`:新增 `test_load_browser_context_*` 4 个 + stealth args 测试
+- `test_video_service.py`:
+    - 新增 `HighConcurrencySettings(max_concurrency=3)` 测试双账号并行
+    - 新增 4 个 refundable failure 参数化测试(network / policy / invalid 退,
+      generation_failed 不退)
+    - 新增 `test_service_refunds_quota_on_each_retry_attempt`:违规改 prompt 重试
+      时每次失败都退(防止扣 3 次退 0 次)
+    - 新增 `test_service_refund_noop_when_quota_was_not_charged`:runner 抛异常前
+      没到 generating → 退款路径安全 noop
+- `test_video_repository.py`:
+    - 新增 5 个 `decrement_account_quota` 测试:扣 / clamp 0 / 非法 by / 非法 model /
+      increment + decrement 净 0
+- 全套 313 个 backend test 通过(2 个 test_login_browser 的 flaky 在 v0.2.18 同样失败,与本 release 无关)
+
 ## v0.2.18 - 2026-08-04
 
 ### 修复
