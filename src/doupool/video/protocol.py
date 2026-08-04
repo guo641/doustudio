@@ -4,6 +4,11 @@ import json
 import time
 from uuid import uuid4
 
+# v0.2.21:复用 prompt_reviser 已有的 policy 关键词(侵权/违规/换个主题/无法返回该内容
+# 等),chain 响应任意 message 文本命中即抛 DoubaoContentRejected,让 service 层
+# 立即标 failed + 退还额度,而不是等 5min timeout。
+from doupool.prompt_reviser import _POLICY_PATTERNS
+
 
 MODELS = {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}
 RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}
@@ -336,12 +341,26 @@ def parse_sse_ack(text: str) -> dict[str, str]:
 
 
 def parse_creation_result(response: dict) -> dict[str, str] | None:
+    """从 chain 响应里解析视频生成结果。
+
+    两条返回路径:
+    1. 成功 — `creation_block.creations[].video.status == 3` 且有 download_url → dict
+    2. v0.2.21:内容审核拒绝 — 任意 message 的 text 含 policy 关键词 → 抛
+       DoubaoContentRejected(reason, response_text=...)。
+
+    顺序:**先扫成功块**(若已成功直接 return),再扫拒绝关键词。避免已成功的任务
+    被同包里的 reject 文本误判。
+    """
     messages = response.get("downlink_body", {}).get("pull_singe_chain_downlink_body", {}).get("messages", [])
+    decoded_blocks: list[list[dict]] = []
     for message in messages:
         try:
-            blocks = json.loads(message.get("content") or "[]")
+            decoded_blocks.append(json.loads(message.get("content") or "[]"))
         except (TypeError, json.JSONDecodeError):
-            continue
+            decoded_blocks.append([])
+
+    # 1. 成功块优先
+    for blocks in decoded_blocks:
         for block in blocks:
             creations = block.get("content", {}).get("creation_block", {}).get("creations", [])
             for creation in creations:
@@ -353,7 +372,92 @@ def parse_creation_result(response: dict) -> dict[str, str] | None:
                         "fallback_result_url": video["download_url"],
                         "cover_url": video.get("cover", {}).get("image_thumb", {}).get("url", ""),
                     }
+
+    # 2. v0.2.21:policy 关键词兜底扫描 — 任意 block 含「侵权|违规|换个主题|无法
+    # 返回该内容|sensitive content」等关键词 → 抛 rejected,service 层立即 failed。
+    rejected_reason = _find_policy_rejection(decoded_blocks)
+    if rejected_reason is not None:
+        raise DoubaoContentRejected(rejected_reason, response_text=_truncate_response(response))
+
     return None
+
+
+class DoubaoContentRejected(RuntimeError):
+    """v0.2.21:豆包在 chain 响应里给了真人能看到的拒绝文案(常见如「生成内容中
+    疑似包含XXX侵权/换个主题再试试/无法返回该内容」等),而不是真正的成功块。
+
+    之前 `parse_creation_result` 看不见这条路径,polling 循环一直返回 None,直到
+    `runner.timeout` 触发才标 failed(timeout 阈值 5min,期间用户视角「卡住」)。
+
+    抛出后 service 层会:
+    - update_video_task(status="failed", error_message="豆包拒绝: ...")
+    - 退还本 runner 已扣的额度
+    - 触发 callback
+    - return —— 不重试(同 prompt 必拒)
+    """
+
+    def __init__(self, message: str, response_text: str = "") -> None:
+        super().__init__(message)
+        self.error_message = message
+        self.response_text = response_text
+
+
+def _find_policy_rejection(decoded_blocks: list[list[dict]]) -> str | None:
+    """扫描已解析的 blocks,返回第一个命中 `_POLICY_PATTERNS` 的原文片段。
+
+    扫描的字段(按经验):
+    - block.content.text_block.text        (普通文本块,豆包拒绝常在这里)
+    - block.content.creation_block.creations[].* (creation 失败状态有时附原因)
+    - block.content.error_block / disallow_reason / reason 等(防御性兜底)
+
+    返回首个命中的 `match.group(0)`(截断到 200 字),未命中返回 None。
+    """
+    def _scan_text(text: str) -> str | None:
+        if not text:
+            return None
+        for pat in _POLICY_PATTERNS:
+            m = pat.search(text)
+            if m:
+                return m.group(0)[:200]
+        return None
+
+    for blocks in decoded_blocks:
+        for block in blocks:
+            content = block.get("content") or {}
+            # text_block.text
+            text_block = content.get("text_block") or {}
+            hit = _scan_text(str(text_block.get("text") or ""))
+            if hit is not None:
+                return hit
+            # creation_block 失败状态附带的拒因(两种位置都见过:
+            # creation.error_msg / creation.video.error_msg,豆包版本可能不一样)
+            for creation in content.get("creation_block", {}).get("creations", []):
+                video = creation.get("video") or {}
+                hit = (
+                    _scan_text(str(creation.get("error_msg") or ""))
+                    or _scan_text(str(creation.get("disallow_reason") or ""))
+                    or _scan_text(str(creation.get("reason") or ""))
+                    or _scan_text(str(video.get("error_msg") or ""))
+                    or _scan_text(str(video.get("disallow_reason") or ""))
+                    or _scan_text(str(video.get("reason") or ""))
+                )
+                if hit is not None:
+                    return hit
+            # 顶层 error_block / reason 兜底
+            for key in ("error_block", "reason_block", "warning_block"):
+                sub = content.get(key) or {}
+                hit = _scan_text(str(sub.get("text") or sub.get("reason") or ""))
+                if hit is not None:
+                    return hit
+    return None
+
+
+def _truncate_response(response: dict, max_chars: int = 2000) -> str:
+    """把 chain response 截断到 max_chars,便于日志打印。失败也无副作用。"""
+    try:
+        return json.dumps(response, ensure_ascii=False)[:max_chars]
+    except (TypeError, ValueError):
+        return str(response)[:max_chars]
 
 
 def find_creation_directory(response: dict) -> str | None:

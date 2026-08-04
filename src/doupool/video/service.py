@@ -25,7 +25,7 @@ from doupool.watermark import (
 
 from .browser import TokenBundleUnavailable
 from .cost import quota_cost
-from .protocol import DURATIONS, MAX_I2V_IMAGES, MODELS, RATIOS, TASK_MODES, DoubaoRateLimited
+from .protocol import DURATIONS, MAX_I2V_IMAGES, MODELS, RATIOS, TASK_MODES, DoubaoContentRejected, DoubaoRateLimited
 
 
 # v0.2.16:日志 / DB 时间统一按北京时间,跟 OS 时区解耦
@@ -666,6 +666,35 @@ class VideoTaskService:
                     # token 是 profile 级问题,不是账号级 — 不 cap 桶、不改 limited_until,
                     # 让账号继续可调度,只是这条 task 标失败。下条 task 仍可能撞同样问题,
                     # 直到用户去点刷新 token。
+                    return
+                except DoubaoContentRejected as exc:
+                    # v0.2.21:豆包在 chain 响应里给了真人能看到的「侵权/违规/换个
+                    # 主题」等拒绝文案(protocol.parse_creation_result 兜底扫描到
+                    # 命中)。之前这条路径会让 polling 一直返回 None,直到
+                    # runner.timeout 5min 才抛「视频生成超时」,期间用户看任务
+                    # 永远「生成中」。现在立即标 failed + 退还额度 + 触发
+                    # callback。**不**触发 prompt 改写重试 —— 同 prompt 必拒,
+                    # 改写反而浪费额度再撞同样的 reject(用户的真实反馈:
+                    # 「加拒绝识别,不用调阈值」)。
+                    refund_quota_if_recorded()
+                    response_excerpt = (exc.response_text or "").replace("\r\n", " ")[:500]
+                    self.repository.update_video_task(
+                        task_id,
+                        status="failed",
+                        error_message=f"豆包拒绝:{exc.error_message}",
+                        completed_at=datetime.now(SHANGHAI).replace(tzinfo=None),
+                    )
+                    self.logger.warning(
+                        "event=video_content_rejected account_id=%s task_id=%s "
+                        "reason=%s | response=%s",
+                        account.id, task_id, exc.error_message, response_excerpt,
+                        extra={
+                            "event": "video_content_rejected",
+                            "account_id": account.id,
+                            "task_id": task_id,
+                        },
+                    )
+                    self._schedule_callback(task_id)
                     return
                 except DoubaoRateLimited as exc:
                     # v0.2.16:豆包把所有拦截都报 "rate limited",但

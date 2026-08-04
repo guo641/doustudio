@@ -4,7 +4,7 @@ import pytest
 
 from doupool.db.models import Account
 from doupool.video.browser import TokenBundleUnavailable
-from doupool.video.protocol import DoubaoRateLimited
+from doupool.video.protocol import DoubaoContentRejected, DoubaoRateLimited
 from doupool.video.service import VideoTaskService
 
 
@@ -865,3 +865,78 @@ async def test_service_refund_noop_when_quota_was_not_charged(repository, temp_p
     acc = Account.get_by_id("acc-noref")
     # 桶没扣(没到 generating),decrement noop 后也是 0
     assert acc.video_quota_used_mini == 0
+
+
+# ---------- v0.2.21:内容审核拒绝识别 + 立即失败 + 退还额度 ----------
+
+
+class ContentRejectedRunner:
+    """v0.2.21:模拟豆包 chain 响应里的内容审核拒绝 — runner.run 抛
+    DoubaoContentRejected,service 应该:
+    - task 立即标 failed + 清晰错误信息("豆包拒绝:无法返回该内容")
+    - 退还本 runner 已扣的额度(quota_cost = 5 点 for mini 5s)
+    - 触发 callback(_schedule_callback)
+    - 不走 prompt 改写重试(同 prompt 必拒)
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        self.calls += 1
+        # runner 内部从「开始生成」到 chain 响应里看到拒绝文案,
+        # 跟真实跑一样会先 update("generating") 触发扣款,然后再抛 DoubaoContentRejected
+        update(status="generating", conversation_id="conv-rej")
+        raise DoubaoContentRejected(
+            "无法返回该内容",
+            response_text='{"downlink_body":{"messages":[{"text":"无法返回该内容"}]}}',
+        )
+
+
+@pytest.mark.asyncio
+async def test_service_marks_failed_and_refunds_on_content_rejected(repository, temp_profile):
+    """v0.2.21:豆包 chain 拒绝 → 立即 failed + 退还 5 点 mini 额度 + 不重试。"""
+    Account.create(
+        id="acc-rej", display_name="rej", doubao_user_id="u-rej",
+        profile_dir=temp_profile,
+    )
+    runner = ContentRejectedRunner()
+    service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
+
+    task = service.start("违规测试", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    # 1. task 必须 failed + error_message 含「豆包拒绝」+ 原文
+    assert saved.status == "failed"
+    assert "豆包拒绝" in (saved.error_message or "")
+    assert "无法返回该内容" in (saved.error_message or "")
+    # 2. 桶被「扣→退」,最终是 0(不是 5)
+    acc = Account.get_by_id("acc-rej")
+    assert acc.video_quota_used_mini == 0
+    assert acc.video_limited_until is None
+    assert acc.status == "active"
+    # 3. 拒绝只调一次 runner(没改写 prompt 重试)
+    assert runner.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_content_rejected_skips_prompt_retry(repository, temp_profile):
+    """v0.2.21:同 prompt 必拒,绝不触发 prompt 改写重试路径(prompt_retry_count=0)。"""
+    Account.create(
+        id="acc-rej2", display_name="rej2", doubao_user_id="u-rej2",
+        profile_dir=temp_profile,
+    )
+    runner = ContentRejectedRunner()
+    service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
+
+    task = service.start("违规再测", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    # prompt_retry_count 必须保持 0(没走 revise_prompt)
+    assert saved.prompt_retry_count == 0
+    # prompt 也没被改写
+    assert saved.prompt == "违规再测"
+    # runner 只跑一次(没重试)
+    assert runner.calls == 1

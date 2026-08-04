@@ -2,6 +2,47 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.21 - 2026-08-04
+
+### 修复
+
+- **「豆包内容审核拒绝」任务不再卡 5 分钟 timeout**
+  线上反馈:用户在浏览器已看到豆包「提示词侵权违规 / 换个主题再试试 /
+  无法返回该内容 / sensitive content」等拒绝文案,但 DouStudio 任务一直
+  「生成中」5 分钟,直到 `RuntimeError: 视频生成超时` 才标 failed,期间 quota
+  也已经被扣走(直到 v0.2.19 失败退还路径才会回滚)。根因是
+  [`src/doupool/video/protocol.py:parse_creation_result`](src/doupool/video/protocol.py)
+  只识别 `block_type=2074` 的成功块,内容审核拒绝走 `text_block.text` 或
+  `creation_block.creations[].video.error_msg` 的拒因字段,polling 循环每
+  5s 调一次都返回 None,直到 `self.timeout` 5 分钟才触发。
+  - 新增异常 `DoubaoContentRejected(message, response_text)`,复用
+    `prompt_reviser._POLICY_PATTERNS`(侵权|违规|换个主题|无法返回该内容|
+    sensitive content|content violates ...),在 `parse_creation_result` 兜底
+    阶段扫所有 message 的 text_block / creation_block.error_msg /
+    disallow_reason / video.error_msg 等位置。
+  - `video/service._run_inner` 新增 `except DoubaoContentRejected` 分支:
+    立即 `update_video_task(status="failed", error_message="豆包拒绝: ...")`
+    + 退还本 runner 已扣的 quota(v0.2.19 的 `refund_quota_if_recorded()`)
+    + 触发 callback + return。**不**做 prompt 改写重试 —— 同 prompt 必拒,
+    改写也是浪费额度且会再撞同样的 reject。
+  - 顺序保护:成功块优先 return,只有整个 messages 都扫完没成功块时才跑
+    policy 关键词兜底,避免已成功任务被同包 reject 文本误判。
+  - response_text 截断 2000 字符随 WARNING 日志输出(`event=video_content_rejected`),
+    排查「额度误退」时能直接看到豆包原文,跟 v0.2.15
+    `DoubaoRateLimited.response_text` 一个套路。
+
+- **账号 quota 在任务终态后 4 秒内实时刷新**
+  任务 succeeded/failed/cancelled 后账号面板的 `今日额度` 数字不再等用户
+  切走再切回 / F5 整页刷新才更新。后端 DB quota 写入早就是对的
+  (`service.update` 闭包里 `increment_account_quota` 同步落库),只是前端
+  `accounts` ref 只在挂载 / 登录完成时拉一次。
+  - `App.vue:refreshTasks()` 拉到 fresh 任务列表后,与旧的 `tasks.value`
+    对比,差集 = 状态变更的任务。任一新终态(`succeeded` / `failed` /
+    `cancelled`)任务出现 → 触发一次 `refreshAccounts()`。
+  - 4s `refreshTasks` 节奏不动,quota 数字 4s 内同步。
+
+## v0.2.20 - 2026-08-04
+
 ## v0.2.20 - 2026-08-04
 
 ### 修复

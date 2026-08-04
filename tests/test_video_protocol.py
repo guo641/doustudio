@@ -4,6 +4,7 @@ import pytest
 
 from doupool.video.protocol import (
     EXTRA_CLIENT_META_KEYS,
+    DoubaoContentRejected,
     DoubaoRateLimited,
     build_completion_payload,
     find_creation_directory,
@@ -294,3 +295,118 @@ def test_i2v_payload_rejects_more_than_nine_images():
     ]
     with pytest.raises(ValueError, match="9"):
         build_completion_payload("x", "seedance_v2.0_mini", "1:1", 5, "fp", mode="i2v", images=images)
+
+
+# ---------- v0.2.21:内容审核拒绝识别 ----------
+
+
+def _wrap(content_blocks: list[dict]) -> dict:
+    """组装一个完整的 chain response 包装,内含一个 message + blocks。
+
+    v0.2.21:用 ensure_ascii=False 把中文按原字面量写出 —— 与线上豆包响应一致
+    (线上 SSE 是 UTF-8 字节流,不在 JSON 层做 unicode-escape 转义),response_text
+    里才能直接 substring 匹配中文。否则会被字面 escape 形式阻断 substring in
+    检查(被 pytest repr 显示出来,看起来像乱码)。
+    """
+    return {
+        "downlink_body": {
+            "pull_singe_chain_downlink_body": {
+                "messages": [{"content": json.dumps(content_blocks, ensure_ascii=False)}]
+            }
+        }
+    }
+
+
+def test_parse_creation_result_raises_on_text_block_rejection():
+    """v0.2.21:豆包把「无法返回该内容」塞 text_block.text 时,parse_creation_result
+    必须抛 DoubaoContentRejected —— 之前默默返 None,polling 卡到 5min timeout。"""
+    response = _wrap([{
+        "block_type": 10000,
+        "content": {"text_block": {"text": "无法返回该内容,你可以换个主题再试试"}},
+    }])
+
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_creation_result(response)
+    assert "无法返回该内容" in excinfo.value.error_message
+    # response_text 是 truncated JSON(ensure_ascii=False → 中文以原字面量写出)
+    assert excinfo.value.response_text
+    assert "无法返回该内容" in excinfo.value.response_text
+    assert "换个主题" in excinfo.value.response_text
+
+
+def test_parse_creation_result_raises_on_copyright_violation_text():
+    """侵权关键词(用户真实 case:「生成内容中疑似包含XXX侵权」)也要识别。"""
+    response = _wrap([{
+        "block_type": 10000,
+        "content": {"text_block": {"text": "生成内容中疑似包含某品牌商标侵权,请重新描述"}},
+    }])
+
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_creation_result(response)
+    assert "侵权" in excinfo.value.error_message
+
+
+def test_parse_creation_result_raises_on_creation_block_error_msg():
+    """creation_block 失败状态附带的 error_msg / disallow_reason 也要识别。"""
+    response = _wrap([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [{
+            "id": "task-x",
+            "video": {"status": 6, "error_msg": "换个主题再试试"},
+        }]}},
+    }])
+
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_creation_result(response)
+    assert excinfo.value.error_message == "换个主题再试试"
+
+
+def test_parse_creation_result_prefers_success_over_rejection_text():
+    """同时含成功块 + 同包内的 reject 文本 → 必须先返回成功 dict(避免误判)。"""
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {"content": json.dumps([
+                {"block_type": 10000, "content": {"text_block": {"text": "换个主题再试试"}}},
+                {"block_type": 2074, "content": {"creation_block": {"creations": [{
+                    "id": "task-real",
+                    "video": {
+                        "status": 3,
+                        "vid": "video-real",
+                        "download_url": "https://example.test/real.mp4",
+                    },
+                }]}}},
+            ])},
+        ]}}
+    }
+
+    # 顺序敏感:成功块先出现,parse_creation_result 必须直接 return 成功 dict
+    assert parse_creation_result(response) == {
+        "remote_task_id": "task-real",
+        "vid": "video-real",
+        "fallback_result_url": "https://example.test/real.mp4",
+        "cover_url": "",
+    }
+
+
+def test_parse_creation_result_returns_none_for_legitimate_unchanged_chain():
+    """完全没成功块 + 没 policy 关键词 → 返 None(让 polling 继续等)。"""
+    response = _wrap([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [{
+            "id": "task-x",
+            "video": {"status": 1},  # 还在生成
+        }]}},
+    }])
+
+    assert parse_creation_result(response) is None
+
+
+def test_parse_creation_result_raises_on_sensitive_content_english():
+    """英文 reject 文案也要识别(sensitive content / content violates ...)。"""
+    response = _wrap([{
+        "block_type": 10000,
+        "content": {"text_block": {"text": "Sorry, this request contains sensitive content and cannot be fulfilled."}},
+    }])
+
+    with pytest.raises(DoubaoContentRejected):
+        parse_creation_result(response)

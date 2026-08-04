@@ -77,6 +77,8 @@ const imageFiles = ref<File[]>([]);
 const imagePreviews = ref<string[]>([]);
 const MAX_I2V_IMAGES = 9;
 const MAX_I2V_BYTES = 15 * 1024 * 1024;
+// v0.2.21:refreshTasks() 拿来判断「本轮新出现的终态任务」,触发实时刷 accounts。
+const TERMINAL_STATUSES = ['succeeded', 'failed', 'cancelled'] as const;
 let taskTimer: ReturnType<typeof setInterval> | undefined;
 
 /**
@@ -147,6 +149,20 @@ async function refreshTasks() {
     // 只有最新的 fetch 才写回,避免 stale 响应盖掉新数据
     if (mySeq !== tasksFetchSeq) return;
     tasks.value = fresh;
+    // v0.2.21:检测本轮刷新里「刚出现的终态任务」(succeeded/failed/cancelled),
+    // 立即拉一次 accounts —— 任务 succeeded 时 worker 已经 increment_account_quota
+    // 写库,但前端 accounts ref 只在 onMounted / 登录完成 / 增删 toggle 时刷新,
+    // 用户得切走再切回或者整页 F5 才能看到「今日额度」变化。4s 轮询内补一次,
+    // quota 数字就在 UI 上跟上了。
+    const hadTerminal = new Set(
+      tasks.value
+        .filter((t) => (TERMINAL_STATUSES as readonly string[]).includes(t.status))
+        .map((t) => `${t.id}:${t.status}`),
+    );
+    const newTerminal = fresh.filter(
+      (t) => (TERMINAL_STATUSES as readonly string[]).includes(t.status) && !hadTerminal.has(`${t.id}:${t.status}`),
+    );
+    if (newTerminal.length) void refreshAccounts();
   } catch (e) {
     if (mySeq !== tasksFetchSeq) return;
     showToast('failed', e instanceof Error ? e.message : '任务加载失败');

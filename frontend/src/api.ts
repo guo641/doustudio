@@ -3,6 +3,10 @@
 const token: string = (window as unknown as { __DOUPOOL_TOKEN__?: string }).__DOUPOOL_TOKEN__ || '';
 const headers = { 'X-DouPool-Token': token, 'Content-Type': 'application/json' };
 
+// v0.2.21:listVideoTasks 返回类型 —— 用 inline structural 避免和 App.vue
+// 同名 VideoTask 类型冲突(tsc 视为不相关类型)。
+// 完整 VideoTask 类型在 App.vue 定义,本层只关心 status + id 用于差集比较。
+
 async function json(response: Response, message: string) {
   if (!response.ok) {
     let detail = message;
@@ -64,7 +68,25 @@ export function loginEvents(id: string, onEvent: (event: any) => void) {
   });
   return source;
 }
-export async function listVideoTasks() {
+export async function listVideoTasks(): Promise<Array<{
+  id: string;
+  account_name?: string;
+  prompt: string;
+  model: string;
+  ratio: string;
+  duration: number;
+  mode?: string;
+  image_count?: number;
+  status: string;
+  result_url?: string;
+  backup_result_url?: string;
+  fallback_result_url?: string;
+  cover_url?: string;
+  error?: string;
+  quota_used?: number;
+  quota_total?: number;
+  created_at: string;
+}>> {
   return json(await fetch('/api/video-tasks', { headers }), '任务加载失败');
 }
 export async function createVideoTask(body: {
