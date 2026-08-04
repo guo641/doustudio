@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import mimetypes
@@ -12,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.async_api import BrowserContext, Page, async_playwright
 
 from .protocol import (
     EXTRA_CLIENT_META_KEYS,
@@ -478,14 +479,18 @@ async ({name, mime, base64Data}) => {
 """
 
 
-def read_browser_fingerprint(page, context) -> str:
+async def read_browser_fingerprint(page, context) -> str:
     """旧版 fp(只取 s_v_web_id cookie)— v0.2.17 之前 main path,现在保留
-    是为了 login 模块和外部脚本不破。视频提交已切到 load_browser_context。"""
-    page.wait_for_function(
+    是为了 login 模块和外部脚本不破。视频提交已切到 load_browser_context。
+
+    v0.2.19:async Playwright 重构后统一 async — login 模块的 sync 调用点
+    也已迁移到 login/browser.py,本函数对外是 async。
+    """
+    await page.wait_for_function(
         "JSON.parse(localStorage.getItem('__tea_cache_tokens_497858') || '{}').user_unique_id",
         timeout=15_000,
     )
-    cookies = context.cookies(["https://www.doubao.com"])
+    cookies = await context.cookies(["https://www.doubao.com"])
     fingerprint = next(
         (cookie["value"] for cookie in cookies if cookie["name"] == "s_v_web_id"),
         "",
@@ -495,23 +500,25 @@ def read_browser_fingerprint(page, context) -> str:
     return fingerprint
 
 
-def load_browser_context(page, context, *, pc_version: str | None = None) -> TokenBundle:
+async def load_browser_context(page, context, *, pc_version: str | None = None) -> TokenBundle:
     """v0.2.17:从已登录 page + context 抽完整 TokenBundle。
 
     跟 read_browser_fingerprint 行为差:除了 fp cookie 还读 localStorage 的
     web_id / tea_uuid / device_id,组成 TokenBundle 给 payload.client_meta 透传。
     pc_version 优先用 settings 传进来的(从 SettingsService.get("pc_version")
     读),fallback 到模块级 PC_VERSION 常量。
+
+    v0.2.19:async Playwright,所有 page.evaluate / context.cookies 前加 await。
     """
     effective_pc_version = pc_version or PC_VERSION
-    page.wait_for_function(
+    await page.wait_for_function(
         "JSON.parse(localStorage.getItem('__tea_cache_tokens_497858') || '{}').user_unique_id",
         timeout=15_000,
     )
-    cookies = context.cookies(["https://www.doubao.com"])
+    cookies = await context.cookies(["https://www.doubao.com"])
     cookie_map = {cookie["name"]: cookie["value"] for cookie in cookies if cookie.get("name")}
 
-    storage = page.evaluate(
+    storage = await page.evaluate(
         "() => {"
         "  const read = (k) => { try { return JSON.parse(localStorage.getItem(k) || '{}') } catch { return {} } };"
         "  const tea = read('__tea_cache_tokens_497858');"
@@ -579,11 +586,94 @@ def load_image_base64(path: Path) -> tuple[str, str, str]:
 
 
 class PlaywrightVideoRunner:
+    """v0.2.19:async Playwright + per-profile_dir BrowserContext 共享。
+
+    同一账号(profile_dir)的多个 task 复用同一个 BrowserContext,
+    每个 task 自己 new_page → page.close()。BrowserContext 生命周期跟
+    runner 实例走,close() 时统一关。task 之间不再 per-account asyncio.Lock
+    串行化(同账号 5 个 mini 10s 视频可以并发跑,共享 50 点 quota)。
+
+    pc_version 在第一次 context 启动时读,缓存到 _tokens。后续 task 复用
+    缓存的 TokenBundle(避免每次重新抽 leveldb / 触 WebMSSDK)。
+    """
+
     def __init__(self, timeout: float = 420, poll_interval: float = 10):
         self.timeout = timeout
         self.poll_interval = poll_interval
+        self._pw = None  # async_playwright() instance
+        self._pw_lock: asyncio.Lock | None = None  # lazy
+        self._contexts: dict[str, BrowserContext] = {}
+        self._tokens: dict[str, TokenBundle] = {}
+        self._init_locks: dict[str, asyncio.Lock] = {}
 
-    def recheck_result(
+    def _lock_for(self, profile_dir: Path) -> asyncio.Lock:
+        """v0.2.19:per-profile 异步锁 —— lazy 创建,保证同一 profile
+        的第一个 context 创建是串行的(避免并发 launch_persistent_context
+        同 Lockfile 互撞)。后续 task 直接拿到已存在的 context。
+        """
+        key = str(profile_dir)
+        if key not in self._init_locks:
+            self._init_locks[key] = asyncio.Lock()
+        return self._init_locks[key]
+
+    async def _ensure_playwright(self):
+        if self._pw is None:
+            self._pw = await async_playwright().start()
+        return self._pw
+
+    async def _get_shared_context(self, profile_dir: Path, pc_version: str | None):
+        """拿到共享的 BrowserContext + 缓存的 TokenBundle。
+
+        第一次:launch_persistent_context + load_browser_context + 缓存
+        后续:直接返回缓存
+        """
+        key = str(profile_dir)
+        async with self._lock_for(profile_dir):
+            if key not in self._contexts:
+                pw = await self._ensure_playwright()
+                context = await pw.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    **_build_launch_kwargs(),
+                )
+                # 必须先打开 doubao.com 拿到 aegis 风控指纹,否则
+                # COMPLETION_SCRIPT 会被字节拒为 1011(用户未登录)。
+                page = context.pages[0] if context.pages else await context.new_page()
+                await page.goto(
+                    "https://www.doubao.com/chat/",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+                await page.wait_for_timeout(2_000)
+                # 抽完整 TokenBundle 缓存起来
+                bundle = await load_browser_context(page, context, pc_version=pc_version)
+                # 把 init page 关掉,让后续 task 自己 new_page。
+                # context 里的 cookies / localStorage 都还在。
+                await page.close()
+                self._contexts[key] = context
+                self._tokens[key] = bundle
+            return self._contexts[key], self._tokens[key]
+
+    async def close(self) -> None:
+        """v0.2.19:关闭所有共享 BrowserContext + Playwright 实例。
+        service.shutdown() 调用一次即可。
+        """
+        for context in self._contexts.values():
+            try:
+                await context.close()
+            except Exception:
+                pass
+        self._contexts.clear()
+        self._tokens.clear()
+        self._init_locks.clear()
+        if self._pw is not None:
+            try:
+                await self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
+        self._pw_lock = None
+
+    async def recheck_result(
         self,
         profile_dir: Path,
         conversation_id: str,
@@ -599,53 +689,51 @@ class PlaywrightVideoRunner:
         或 "卡在 generating 很久不动了",想再查一次远端而不消耗豆包额度
         (不调 COMPLETION_SCRIPT,只查 chain)。
 
+        v0.2.19:async Playwright,共用 shared context。
+
         返回 None = 还在生成中 / 远端还没出 result;
         返回 dict = parse_creation_result 出的 result 字段(result_url /
         backup_result_url / fallback_result_url / vid / cover_url 等),
         调用方负责写回 VideoTask。
         """
-        with sync_playwright() as playwright:
-            context = playwright.chromium.launch_persistent_context(
-                str(profile_dir),
-                **_build_launch_kwargs(),
+        context, _bundle = await self._get_shared_context(profile_dir, pc_version=None)
+        page = context.pages[0] if context.pages else await context.new_page()
+        try:
+            # 必须先打开 doubao.com 拿到 aegis 风控指纹,否则 CHAIN_SCRIPT
+            # 会被字节拒为 1011(用户未登录)——和首次提交一样的硬约束。
+            await page.goto(
+                "https://www.doubao.com/chat/",
+                wait_until="domcontentloaded",
+                timeout=30_000,
             )
-            try:
-                page = context.pages[0] if context.pages else context.new_page()
-                # 必须先打开 doubao.com 拿到 aegis 风控指纹,否则 CHAIN_SCRIPT
-                # 会被字节拒为 1011(用户未登录)——和首次提交一样的硬约束。
-                page.goto(
-                    "https://www.doubao.com/chat/",
-                    wait_until="domcontentloaded",
-                    timeout=30_000,
+            await page.wait_for_timeout(2_000)
+            # 切到指定 conversation(只读,不发新请求)
+            await page.evaluate(
+                "id => history.replaceState({}, '', '/chat/' + id)",
+                conversation_id,
+            )
+            update(status="rechecking")
+            deadline = time.monotonic() + deadline_seconds
+            while time.monotonic() < deadline:
+                if cancel_event.is_set():
+                    raise RuntimeError("任务已取消")
+                chain = await page.evaluate(
+                    CHAIN_SCRIPT, {"conversationId": conversation_id}
                 )
-                page.wait_for_timeout(2_000)
-                # 切到指定 conversation(只读,不发新请求)
-                page.evaluate(
-                    "id => history.replaceState({}, '', '/chat/' + id)",
-                    conversation_id,
-                )
-                update(status="rechecking")
-                deadline = time.monotonic() + deadline_seconds
-                while time.monotonic() < deadline:
-                    if cancel_event.is_set():
-                        raise RuntimeError("任务已取消")
-                    chain = page.evaluate(
-                        CHAIN_SCRIPT, {"conversationId": conversation_id}
+                if chain["status"] != 200:
+                    raise RuntimeError(
+                        f"豆包结果接口返回 HTTP {chain['status']}"
                     )
-                    if chain["status"] != 200:
-                        raise RuntimeError(
-                            f"豆包结果接口返回 HTTP {chain['status']}"
-                        )
-                    result = parse_creation_result(chain["data"])
-                    if result:
-                        update(status="resolving", **result)
-                        return self._resolve_original_download(page, result, cancel_event)
-                    page.wait_for_timeout(self.poll_interval * 1000)
-                return None
-            finally:
-                context.close()
+                result = parse_creation_result(chain["data"])
+                if result:
+                    update(status="resolving", **result)
+                    return await self._resolve_original_download(page, result, cancel_event)
+                await page.wait_for_timeout(self.poll_interval * 1000)
+            return None
+        finally:
+            await page.close()
 
-    def run(
+    async def run(
         self,
         profile_dir: Path,
         prompt: str,
@@ -659,79 +747,73 @@ class PlaywrightVideoRunner:
         image_paths: list[str] | None = None,
         pc_version: str | None = None,
     ) -> dict[str, str]:
-        with sync_playwright() as playwright:
-            context = playwright.chromium.launch_persistent_context(
-                str(profile_dir),
-                **_build_launch_kwargs(),
-            )
-            try:
-                page = context.pages[0] if context.pages else context.new_page()
-                page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30_000)
-                page.wait_for_timeout(2_000)
-                # v0.2.17:抽完整 TokenBundle,透传给 payload.client_meta
-                token_bundle = load_browser_context(page, context, pc_version=pc_version)
-                fingerprint = token_bundle.device_id or token_bundle.web_id
+        context, token_bundle = await self._get_shared_context(
+            profile_dir, pc_version=pc_version
+        )
+        page = context.pages[0] if context.pages else await context.new_page()
+        try:
+            fingerprint = token_bundle.device_id or token_bundle.web_id
 
-                uploaded_images: list[dict] = []
-                if mode == "i2v":
-                    paths = [Path(item) for item in (image_paths or [])]
-                    if not paths:
-                        raise RuntimeError("图生视频缺少本地图片")
-                    if len(paths) > 9:
-                        raise RuntimeError("图生视频最多支持 9 张图片")
-                    update(status="starting")
-                    for index, image_path in enumerate(paths, start=1):
-                        if cancel_event.is_set():
-                            raise RuntimeError("任务已取消")
-                        if not image_path.is_file():
-                            raise RuntimeError(f"图片不存在：{image_path}")
-                        name, mime, b64 = load_image_base64(image_path)
-                        update(status="starting", error_message=f"正在上传图片 {index}/{len(paths)}")
-                        uploaded = page.evaluate(
-                            UPLOAD_IMAGE_SCRIPT,
-                            {"name": name, "mime": mime, "base64Data": b64},
-                        )
-                        uploaded_images.append(uploaded)
-
-                payload = build_completion_payload(
-                    prompt,
-                    model,
-                    ratio,
-                    duration,
-                    fingerprint,
-                    mode=mode,
-                    images=uploaded_images or None,
-                    # v0.2.17:WebMSSDK / TeaSDK 真实指纹(从登录 profile 抽)透传给
-                    # payload.client_meta — 走 EXTRA_CLIENT_META_KEYS 白名单。
-                    **token_bundle.to_client_meta(),
-                )
-                local_id = payload["client_meta"]["local_conversation_id"]
-                page.evaluate("id => history.replaceState({}, '', '/chat/' + id)", local_id)
-                response = page.evaluate(COMPLETION_SCRIPT, {"payload": payload})
-                if response["status"] != 200:
-                    raise RuntimeError(f"豆包提交接口返回 HTTP {response['status']}")
-                ack = parse_sse_ack(response["text"])
-                update(status="generating", **ack)
-
-                deadline = time.monotonic() + self.timeout
-                while time.monotonic() < deadline:
+            uploaded_images: list[dict] = []
+            if mode == "i2v":
+                paths = [Path(item) for item in (image_paths or [])]
+                if not paths:
+                    raise RuntimeError("图生视频缺少本地图片")
+                if len(paths) > 9:
+                    raise RuntimeError("图生视频最多支持 9 张图片")
+                update(status="starting")
+                for index, image_path in enumerate(paths, start=1):
                     if cancel_event.is_set():
                         raise RuntimeError("任务已取消")
-                    chain = page.evaluate(CHAIN_SCRIPT, {"conversationId": ack["conversation_id"]})
-                    if chain["status"] != 200:
-                        raise RuntimeError(f"豆包结果接口返回 HTTP {chain['status']}")
-                    result = parse_creation_result(chain["data"])
-                    if result:
-                        update(status="resolving", **result)
-                        return self._resolve_original_download(page, result, cancel_event)
-                    page.wait_for_timeout(self.poll_interval * 1000)
-                raise RuntimeError("视频生成超时")
-            finally:
-                context.close()
+                    if not image_path.is_file():
+                        raise RuntimeError(f"图片不存在：{image_path}")
+                    name, mime, b64 = load_image_base64(image_path)
+                    update(status="starting", error_message=f"正在上传图片 {index}/{len(paths)}")
+                    uploaded = await page.evaluate(
+                        UPLOAD_IMAGE_SCRIPT,
+                        {"name": name, "mime": mime, "base64Data": b64},
+                    )
+                    uploaded_images.append(uploaded)
 
-    def _resolve_original_download(self, page, result: dict[str, str], cancel_event: threading.Event) -> dict[str, str]:
+            payload = build_completion_payload(
+                prompt,
+                model,
+                ratio,
+                duration,
+                fingerprint,
+                mode=mode,
+                images=uploaded_images or None,
+                # v0.2.17:WebMSSDK / TeaSDK 真实指纹(从登录 profile 抽)透传给
+                # payload.client_meta — 走 EXTRA_CLIENT_META_KEYS 白名单。
+                **token_bundle.to_client_meta(),
+            )
+            local_id = payload["client_meta"]["local_conversation_id"]
+            await page.evaluate("id => history.replaceState({}, '', '/chat/' + id)", local_id)
+            response = await page.evaluate(COMPLETION_SCRIPT, {"payload": payload})
+            if response["status"] != 200:
+                raise RuntimeError(f"豆包提交接口返回 HTTP {response['status']}")
+            ack = parse_sse_ack(response["text"])
+            update(status="generating", **ack)
+
+            deadline = time.monotonic() + self.timeout
+            while time.monotonic() < deadline:
+                if cancel_event.is_set():
+                    raise RuntimeError("任务已取消")
+                chain = await page.evaluate(CHAIN_SCRIPT, {"conversationId": ack["conversation_id"]})
+                if chain["status"] != 200:
+                    raise RuntimeError(f"豆包结果接口返回 HTTP {chain['status']}")
+                result = parse_creation_result(chain["data"])
+                if result:
+                    update(status="resolving", **result)
+                    return await self._resolve_original_download(page, result, cancel_event)
+                await page.wait_for_timeout(self.poll_interval * 1000)
+            raise RuntimeError("视频生成超时")
+        finally:
+            await page.close()
+
+    async def _resolve_original_download(self, page, result: dict[str, str], cancel_event: threading.Event) -> dict[str, str]:
         fallback = {**result, "result_url": result["fallback_result_url"]}
-        homepage = page.evaluate(
+        homepage = await page.evaluate(
             AISPACE_SCRIPT,
             {"endpoint": "/samantha/aispace/homepage", "body": {}},
         )
@@ -744,7 +826,7 @@ class PlaywrightVideoRunner:
         deadline = time.monotonic() + 120
         node_id = None
         while time.monotonic() < deadline and not cancel_event.is_set():
-            nodes = page.evaluate(
+            nodes = await page.evaluate(
                 AISPACE_SCRIPT,
                 {
                     "endpoint": "/samantha/aispace/node_info",
@@ -760,11 +842,11 @@ class PlaywrightVideoRunner:
                 node_id = find_video_node(nodes["data"], result["vid"])
             if node_id:
                 break
-            page.wait_for_timeout(5_000)
+            await page.wait_for_timeout(5_000)
         if not node_id:
             return fallback
 
-        download = page.evaluate(
+        download = await page.evaluate(
             AISPACE_SCRIPT,
             {
                 "endpoint": "/samantha/aispace/get_download_info",

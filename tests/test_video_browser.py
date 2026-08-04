@@ -26,11 +26,11 @@ class FakePage:
             "device_id": "dev_from_storage",
         }
 
-    def wait_for_function(self, expression, timeout):
+    async def wait_for_function(self, expression, timeout):
         self.expression = expression
         self.timeout = timeout
 
-    def evaluate(self, _expression):
+    async def evaluate(self, _expression):
         return self._evaluate_result
 
 
@@ -42,15 +42,19 @@ class FakeContext:
             cookies = [{"name": "s_v_web_id", "value": "verify_current_fp"}]
         self._cookies = cookies
 
-    def cookies(self, urls):
+    async def cookies(self, urls):
         assert urls == ["https://www.doubao.com"]
         return self._cookies
 
 
-def test_read_browser_fingerprint_uses_current_tea_key_and_fingerprint_cookie():
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_read_browser_fingerprint_uses_current_tea_key_and_fingerprint_cookie():
     page = FakePage()
 
-    fingerprint = read_browser_fingerprint(page, FakeContext())
+    fingerprint = await read_browser_fingerprint(page, FakeContext())
 
     assert "__tea_cache_tokens_497858" in page.expression
     assert "__tea_cache_tokens_2018" not in page.expression
@@ -97,14 +101,15 @@ def test_token_bundle_to_client_meta_always_has_pc_version():
     assert bundle.to_client_meta()["pc_version"] == "3.27.4"
 
 
-def test_load_browser_context_reads_tea_and_device_storage():
+@pytest.mark.asyncio
+async def test_load_browser_context_reads_tea_and_device_storage():
     """v0.2.17:load_browser_context 从 page.evaluate 抽 localStorage 的 web_id /
     tea_uuid / device_id,凑齐 TokenBundle 透传给 payload.client_meta。"""
     cookies = [
         {"name": "s_v_web_id", "value": "device_cookie_fp"},
         {"name": "msToken", "value": "ms_abc"},
     ]
-    bundle = load_browser_context(FakePage(), FakeContext(cookies=cookies))
+    bundle = await load_browser_context(FakePage(), FakeContext(cookies=cookies))
     assert bundle.web_id == "wb_from_storage"
     assert bundle.tea_uuid == "tu_from_storage"
     assert bundle.device_id == "dev_from_storage"
@@ -112,7 +117,8 @@ def test_load_browser_context_reads_tea_and_device_storage():
     assert bundle.pc_version == "3.27.4"
 
 
-def test_load_browser_context_falls_back_to_cookies_when_storage_empty():
+@pytest.mark.asyncio
+async def test_load_browser_context_falls_back_to_cookies_when_storage_empty():
     """v0.2.17:localStorage 全空 → web_id / device_id / tea_uuid 走 cookie 兜底。"""
     page = FakePage(evaluate_result={"web_id": "", "tea_uuid": "", "device_id": ""})
     cookies = [
@@ -120,26 +126,28 @@ def test_load_browser_context_falls_back_to_cookies_when_storage_empty():
         {"name": "samantha_web_web_id", "value": "wb_cookie"},
         {"name": "user_unique_id", "value": "tu_cookie"},
     ]
-    bundle = load_browser_context(page, FakeContext(cookies=cookies))
+    bundle = await load_browser_context(page, FakeContext(cookies=cookies))
     assert bundle.web_id == "wb_cookie"
     assert bundle.tea_uuid == "tu_cookie"
     assert bundle.device_id == "fp_cookie"
 
 
-def test_load_browser_context_raises_when_no_fingerprint_cookie():
+@pytest.mark.asyncio
+async def test_load_browser_context_raises_when_no_fingerprint_cookie():
     """v0.2.17:连 fp cookie + localStorage device_id 都拿不到 → 提示重新登录。"""
     page = FakePage(evaluate_result={"web_id": "", "tea_uuid": "", "device_id": ""})
     with __import__("pytest").raises(RuntimeError, match="重新登录"):
-        load_browser_context(page, FakeContext(cookies=[]))
+        await load_browser_context(page, FakeContext(cookies=[]))
 
 
-def test_load_browser_context_raises_token_bundle_unavailable_when_no_web_id():
+@pytest.mark.asyncio
+async def test_load_browser_context_raises_token_bundle_unavailable_when_no_web_id():
     """v0.2.17:web_id 完全抽不到(冷启动 profile 没让 WebMSSDK 跑过)→
     抛 TokenBundleUnavailable,UI 引导用户去 doubao.com/chat/ 主页访问 5 秒。"""
     page = FakePage(evaluate_result={"web_id": "", "tea_uuid": "", "device_id": ""})
     cookies = [{"name": "s_v_web_id", "value": "fp_only"}]  # 只剩 fp,没 web_id
     with __import__("pytest").raises(TokenBundleUnavailable, match="web_id"):
-        load_browser_context(page, FakeContext(cookies=cookies))
+        await load_browser_context(page, FakeContext(cookies=cookies))
 
 
 def test_extract_webmssdk_tokens_reads_cookies_sqlite(tmp_path):

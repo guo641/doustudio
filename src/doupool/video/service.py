@@ -7,7 +7,6 @@ import json
 import logging
 import re
 import threading
-from collections import defaultdict
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -89,7 +88,10 @@ class VideoTaskService:
         # v0.2.9:callback 任务池 —— 每个 task 最多一个 callback 在跑,
         # 重试 retry-result 不重复发回执(只在最终 terminal 状态发一次)。
         self._callback_tasks: dict[str, asyncio.Task[None]] = {}
-        self._account_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # v0.2.19:删除 _account_locks —— 同账号多 task 现在共享 BrowserContext
+        # (PlaywrightVideoRunner 自己维护 per-profile 异步锁做首次 context 创建),
+        # 同账号 5 个 mini 10s 视频可以并发跑,共享 50 点 quota。剩下的并发闸门是
+        # _global_semaphore(max_concurrency,默认 1)。
         self._global_semaphore: asyncio.Semaphore | None = None
         self._semaphore_limit = 0
 
@@ -406,8 +408,9 @@ class VideoTaskService:
             self.repository.update_video_task(task_id, **values)
 
         try:
-            result = await asyncio.to_thread(
-                self.runner.recheck_result,
+            # v0.2.19:recheck_result 现在是 async(共享 BrowserContext),直接 await,
+            # 不再走 asyncio.to_thread。
+            result = await self.runner.recheck_result(
                 profile_dir,
                 conversation_id,
                 update,
@@ -535,169 +538,172 @@ class VideoTaskService:
                 await asyncio.sleep(self.account_poll_interval)
                 continue
             self.repository.assign_video_task(task_id, account.id)
+            # v0.2.19:删除 _account_locks —— 同账号多 task 现在共享 BrowserContext,
+            # 锁反而阻塞并发(50 点账号一次只能跑 1 个 task 是 bug)。剩下
+            # _global_semaphore 限制全局并发数(max_concurrency,默认 1)。
             async with self._global_semaphore:
-                async with self._account_locks[account.id]:
-                    if cancellation.is_set():
-                        return
-                    self.repository.update_video_task(task_id, status="starting", error_message=None)
-                    quota_recorded = False
+                if cancellation.is_set():
+                    return
+                self.repository.update_video_task(task_id, status="starting", error_message=None)
+                quota_recorded = False
 
-                    def update(**values) -> None:
-                        nonlocal quota_recorded
-                        if values.get("status") == "generating" and not quota_recorded:
-                            # v0.2.11:按 model + duration 算 cost,扣对应桶。
-                            # 非法 duration 走兜底 max(1, duration)。
-                            cost = quota_cost(task.model, int(task.duration))
-                            self.repository.increment_account_quota(
-                                account.id, model=task.model, by=cost
-                            )
-                            quota_recorded = True
-                        self.repository.update_video_task(task_id, **values)
+                def update(**values) -> None:
+                    nonlocal quota_recorded
+                    if values.get("status") == "generating" and not quota_recorded:
+                        # v0.2.11:按 model + duration 算 cost,扣对应桶。
+                        # 非法 duration 走兜底 max(1, duration)。
+                        cost = quota_cost(task.model, int(task.duration))
+                        self.repository.increment_account_quota(
+                            account.id, model=task.model, by=cost
+                        )
+                        quota_recorded = True
+                    self.repository.update_video_task(task_id, **values)
 
-                    try:
-                        image_paths = []
-                        if task.image_paths:
-                            try:
-                                image_paths = json.loads(task.image_paths)
-                            except json.JSONDecodeError:
-                                image_paths = []
-                        result = await asyncio.to_thread(
-                            self.runner.run,
-                            account.profile_dir,
-                            task.prompt,
-                            task.model,
-                            task.ratio,
-                            task.duration,
-                            update,
-                            cancellation,
-                            mode=getattr(task, "mode", None) or "t2v",
-                            image_paths=image_paths or None,
-                            # v0.2.17:settings 里的 pc_version(默认 "3.27.4")
-                            # 透传给 runner.run → load_browser_context,塞进
-                            # payload.client_meta.pc_version。
-                            pc_version=settings.get("pc_version"),
-                        )
-                        self.repository.update_video_task(task_id, status="succeeded", **result)
-                        self.logger.info(
-                            "视频任务生成成功", extra={"event": "video_succeeded", "account_id": account.id}
-                        )
-                        # 生成成功后异步调去水印,失败也不影响主流程。
-                        # 这里再包一层 try,保证即使 _run_watermark 内部出现
-                        # 意料之外的异常(比如 zhuceka 改了实现抛非 ZhucekaError),
-                        # 也不会让"已 succeeded"的任务被错标为 failed。
+                try:
+                    image_paths = []
+                    if task.image_paths:
                         try:
-                            await self._run_watermark(task_id, result, settings)
-                        except Exception as watermark_exc:
-                            self.repository.update_video_task(
-                                task_id, clean_error=f"去水印过程异常:{watermark_exc}"
-                            )
-                            self.logger.exception(
-                                "去水印过程出现未捕获异常,任务保留 succeeded 状态",
-                                extra={"event": "watermark_unexpected_error", "task_id": task_id},
-                            )
-                        # v0.2.9:succeeded 后异步发 callback —— 拿到最新 task 行
-                        # (含 result_url / clean_video_url)再发,前端收到时就能直接用。
-                        self._schedule_callback(task_id)
-                        return
-                    except TokenBundleUnavailable as exc:
-                        # v0.2.17:profile 里抽不到 web_id(冷启动 profile 没让 WebMSSDK
-                        # 跑过 / msToken 已过期)。不是 quota 问题,不要 cap 桶。
-                        # 写清楚「请去浏览器访问主页 + 点刷新 token」,让用户自救。
-                        # 直接 return:token 是 profile 级问题,重提同一 profile 必失败,
-                        # 不要被外层 while not cancellation.is_set() 死循环重试。
+                            image_paths = json.loads(task.image_paths)
+                        except json.JSONDecodeError:
+                            image_paths = []
+                    # v0.2.19:runner.run 现在是 async(共享 BrowserContext),
+                    # 直接 await,不再走 asyncio.to_thread。
+                    result = await self.runner.run(
+                        account.profile_dir,
+                        task.prompt,
+                        task.model,
+                        task.ratio,
+                        task.duration,
+                        update,
+                        cancellation,
+                        mode=getattr(task, "mode", None) or "t2v",
+                        image_paths=image_paths or None,
+                        # v0.2.17:settings 里的 pc_version(默认 "3.27.4")
+                        # 透传给 runner.run → load_browser_context,塞进
+                        # payload.client_meta.pc_version。
+                        pc_version=settings.get("pc_version"),
+                    )
+                    self.repository.update_video_task(task_id, status="succeeded", **result)
+                    self.logger.info(
+                        "视频任务生成成功", extra={"event": "video_succeeded", "account_id": account.id}
+                    )
+                    # 生成成功后异步调去水印,失败也不影响主流程。
+                    # 这里再包一层 try,保证即使 _run_watermark 内部出现
+                    # 意料之外的异常(比如 zhuceka 改了实现抛非 ZhucekaError),
+                    # 也不会让"已 succeeded"的任务被错标为 failed。
+                    try:
+                        await self._run_watermark(task_id, result, settings)
+                    except Exception as watermark_exc:
                         self.repository.update_video_task(
-                            task.id,
-                            status="failed",
-                            error_message=(
-                                "profile 中缺少 web_id,请在浏览器里访问 "
-                                "https://www.doubao.com/chat/ 主页 5-10 秒后"
-                                "点「刷新 token」(token 过期 / 冷启动 profile 都需要)"
-                            ),
+                            task_id, clean_error=f"去水印过程异常:{watermark_exc}"
                         )
-                        self.logger.warning(
-                            "event=video_token_bundle_unavailable account_id=%s task_id=%s error=%s",
-                            account.id,
-                            task.id,
-                            exc,
+                        self.logger.exception(
+                            "去水印过程出现未捕获异常,任务保留 succeeded 状态",
+                            extra={"event": "watermark_unexpected_error", "task_id": task_id},
                         )
-                        # token 是 profile 级问题,不是账号级 — 不 cap 桶、不改 limited_until,
-                        # 让账号继续可调度,只是这条 task 标失败。下条 task 仍可能撞同样问题,
-                        # 直到用户去点刷新 token。
-                        return
-                    except DoubaoRateLimited as exc:
-                        # v0.2.16:豆包把所有拦截都报 "rate limited",但
-                        # extra.decision.from == "shark_admin" 是风控拦截,
-                        # 不是 quota 限流 — 风控经常很快就放,不该 cap 桶封号。
-                        response_excerpt = (exc.response_text or "").replace("\r\n", " ")[:500]
-                        if exc.is_risk_control:
-                            # 风控:不动桶,只标 task failed,让用户知道是被风控。
-                            # self.repository.assign_video_task(task_id, None) 让
-                            # 任务回到 queued,下次调度可能会选别的账号重试。
-                            self.repository.update_video_task(
-                                task_id, status="failed",
-                                error_message="账号被风控拦截（shark_admin verify），稍后重试或换号",
-                                completed_at=datetime.now(SHANGHAI).replace(tzinfo=None),
-                            )
-                            self.repository.assign_video_task(task_id, None)
-                            self.logger.warning(
-                                "账号被风控拦截,任务标 failed 不阻塞账号: %s | response=%s",
-                                exc, response_excerpt,
-                                extra={"event": "video_risk_control", "account_id": account.id},
-                            )
-                            return  # 任务失败,不再 continue 重试这一条
-                        # 真 quota 限流:cap 桶 + 封号 limited_until + 任务回 queued 等明天
-                        # v0.2.15:把豆包真正返回的 error_msg + SSE 响应原文写进
-                        # WARNING —— 之前只写「额度已用完」,真正 error_msg 被吞,
-                        # 「额度误报」(fingerprint / IP / 风控等)时完全没线索。
-                        self.repository.mark_account_limited(
-                            account.id, next_reset, daily_quotas,
-                            business_date=business_date,
+                    # v0.2.9:succeeded 后异步发 callback —— 拿到最新 task 行
+                    # (含 result_url / clean_video_url)再发,前端收到时就能直接用。
+                    self._schedule_callback(task_id)
+                    return
+                except TokenBundleUnavailable as exc:
+                    # v0.2.17:profile 里抽不到 web_id(冷启动 profile 没让 WebMSSDK
+                    # 跑过 / msToken 已过期)。不是 quota 问题,不要 cap 桶。
+                    # 写清楚「请去浏览器访问主页 + 点刷新 token」,让用户自救。
+                    # 直接 return:token 是 profile 级问题,重提同一 profile 必失败,
+                    # 不要被外层 while not cancellation.is_set() 死循环重试。
+                    self.repository.update_video_task(
+                        task.id,
+                        status="failed",
+                        error_message=(
+                            "profile 中缺少 web_id,请在浏览器里访问 "
+                            "https://www.doubao.com/chat/ 主页 5-10 秒后"
+                            "点「刷新 token」(token 过期 / 冷启动 profile 都需要)"
+                        ),
+                    )
+                    self.logger.warning(
+                        "event=video_token_bundle_unavailable account_id=%s task_id=%s error=%s",
+                        account.id,
+                        task.id,
+                        exc,
+                    )
+                    # token 是 profile 级问题,不是账号级 — 不 cap 桶、不改 limited_until,
+                    # 让账号继续可调度,只是这条 task 标失败。下条 task 仍可能撞同样问题,
+                    # 直到用户去点刷新 token。
+                    return
+                except DoubaoRateLimited as exc:
+                    # v0.2.16:豆包把所有拦截都报 "rate limited",但
+                    # extra.decision.from == "shark_admin" 是风控拦截,
+                    # 不是 quota 限流 — 风控经常很快就放,不该 cap 桶封号。
+                    response_excerpt = (exc.response_text or "").replace("\r\n", " ")[:500]
+                    if exc.is_risk_control:
+                        # 风控:不动桶,只标 task failed,让用户知道是被风控。
+                        # self.repository.assign_video_task(task_id, None) 让
+                        # 任务回到 queued,下次调度可能会选别的账号重试。
+                        self.repository.update_video_task(
+                            task_id, status="failed",
+                            error_message="账号被风控拦截（shark_admin verify），稍后重试或换号",
+                            completed_at=datetime.now(SHANGHAI).replace(tzinfo=None),
                         )
                         self.repository.assign_video_task(task_id, None)
-                        self.repository.update_video_task(
-                            task_id, status="queued", error_message=f"账号今日额度已用完:{exc}"
-                        )
                         self.logger.warning(
-                            "账号今日视频额度已用完:%s | response=%s",
+                            "账号被风控拦截,任务标 failed 不阻塞账号: %s | response=%s",
                             exc, response_excerpt,
-                            extra={"event": "video_quota_limited", "account_id": account.id},
+                            extra={"event": "video_risk_control", "account_id": account.id},
                         )
-                        continue
-                    except Exception as exc:
-                        if cancellation.is_set():
-                            self.repository.assign_video_task(task_id, None)
-                            self.repository.update_video_task(
-                                task_id, status="queued", error_message="应用已停止，等待下次继续"
-                            )
-                            return
-                        # 分类失败 → 决定是否改写 prompt 后重试
-                        failure = classify_failure(str(exc))
-                        attempt = getattr(task, "prompt_retry_count", 0) or 0
-                        max_attempts = int(settings.get("max_prompt_retries", 2))
-                        if failure.revise_prompt and attempt < max_attempts:
-                            new_prompt = revise_prompt(task.prompt, failure, attempt=attempt + 1)
-                            if new_prompt and new_prompt != task.prompt:
-                                self.repository.update_video_task(
-                                    task_id,
-                                    prompt=new_prompt,
-                                    prompt_retry_count=attempt + 1,
-                                    status="queued",
-                                    error_message=f"改写 prompt 第 {attempt + 1} 次重试:{failure.kind}",
-                                    account_id=None,
-                                )
-                                self.logger.warning(
-                                    "prompt 改写重试 %d/%d: %s",
-                                    attempt + 1, max_attempts, failure.detail,
-                                    extra={"event": "prompt_revised", "task_id": task_id},
-                                )
-                                continue
-                        self.repository.update_video_task(task_id, status="failed", error_message=str(exc))
-                        self.logger.exception(
-                            "视频任务失败", extra={"event": "video_failed", "account_id": account.id}
+                        return  # 任务失败,不再 continue 重试这一条
+                    # 真 quota 限流:cap 桶 + 封号 limited_until + 任务回 queued 等明天
+                    # v0.2.15:把豆包真正返回的 error_msg + SSE 响应原文写进
+                    # WARNING —— 之前只写「额度已用完」,真正 error_msg 被吞,
+                    # 「额度误报」(fingerprint / IP / 风控等)时完全没线索。
+                    self.repository.mark_account_limited(
+                        account.id, next_reset, daily_quotas,
+                        business_date=business_date,
+                    )
+                    self.repository.assign_video_task(task_id, None)
+                    self.repository.update_video_task(
+                        task_id, status="queued", error_message=f"账号今日额度已用完:{exc}"
+                    )
+                    self.logger.warning(
+                        "账号今日视频额度已用完:%s | response=%s",
+                        exc, response_excerpt,
+                        extra={"event": "video_quota_limited", "account_id": account.id},
+                    )
+                    continue
+                except Exception as exc:
+                    if cancellation.is_set():
+                        self.repository.assign_video_task(task_id, None)
+                        self.repository.update_video_task(
+                            task_id, status="queued", error_message="应用已停止，等待下次继续"
                         )
-                        # v0.2.9:failed 也触发 callback —— 让 callback_url 知道最终落点。
-                        self._schedule_callback(task_id)
                         return
+                    # 分类失败 → 决定是否改写 prompt 后重试
+                    failure = classify_failure(str(exc))
+                    attempt = getattr(task, "prompt_retry_count", 0) or 0
+                    max_attempts = int(settings.get("max_prompt_retries", 2))
+                    if failure.revise_prompt and attempt < max_attempts:
+                        new_prompt = revise_prompt(task.prompt, failure, attempt=attempt + 1)
+                        if new_prompt and new_prompt != task.prompt:
+                            self.repository.update_video_task(
+                                task_id,
+                                prompt=new_prompt,
+                                prompt_retry_count=attempt + 1,
+                                status="queued",
+                                error_message=f"改写 prompt 第 {attempt + 1} 次重试:{failure.kind}",
+                                account_id=None,
+                            )
+                            self.logger.warning(
+                                "prompt 改写重试 %d/%d: %s",
+                                attempt + 1, max_attempts, failure.detail,
+                                extra={"event": "prompt_revised", "task_id": task_id},
+                            )
+                            continue
+                    self.repository.update_video_task(task_id, status="failed", error_message=str(exc))
+                    self.logger.exception(
+                        "视频任务失败", extra={"event": "video_failed", "account_id": account.id}
+                    )
+                    # v0.2.9:failed 也触发 callback —— 让 callback_url 知道最终落点。
+                    self._schedule_callback(task_id)
+                    return
 
     async def _run_watermark(self, task_id: str, result: dict, settings: dict) -> None:
         """
@@ -768,3 +774,12 @@ class VideoTaskService:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+        # v0.2.19:关掉 Playwright 共享 BrowserContext(避免进程退出时 Chromium 残留)。
+        if hasattr(self.runner, "close"):
+            try:
+                await self.runner.close()
+            except Exception as exc:
+                self.logger.warning(
+                    "runner.close() 异常: %s", exc,
+                    extra={"event": "runner_close_error"},
+                )

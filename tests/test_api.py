@@ -115,17 +115,18 @@ def test_settings_round_trip_backup_and_validation(repository, database_manager,
     headers = {"X-DouPool-Token": "secret"}
 
     initial = client.get("/api/settings", headers=headers).json()
-    assert initial["daily_quota"] == 5
+    # v0.2.19:默认桶从 5 改成 50(豆包每天每账号 50 点)
+    assert initial["daily_quota"] == 50
     # v0.2.9:三个新桶都在 defaults 里
-    assert initial["daily_quota_mini"] == 5
-    assert initial["daily_quota_v2"] == 5
-    assert initial["daily_quota_std"] == 5
+    assert initial["daily_quota_mini"] == 50
+    assert initial["daily_quota_v2"] == 50
+    assert initial["daily_quota_std"] == 50
     # 三个桶独立更新
     updated = client.put("/api/settings", headers=headers, json={"daily_quota_mini": 7, "daily_quota_std": 2})
     assert updated.status_code == 200
     assert updated.json()["daily_quota_mini"] == 7
     assert updated.json()["daily_quota_std"] == 2
-    assert updated.json()["daily_quota_v2"] == 5  # 未动
+    assert updated.json()["daily_quota_v2"] == 50  # 未动
     assert client.put("/api/settings", headers=headers, json={"max_concurrency": 0}).status_code == 422
     assert client.put("/api/settings", headers=headers, json={"daily_quota_mini": 200}).status_code == 422
     backup = client.post("/api/settings/backup", headers=headers)

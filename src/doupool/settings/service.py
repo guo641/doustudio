@@ -14,10 +14,12 @@ class SettingsService:
         "max_concurrency": 1,
         # v0.2.9:按 seedance 模型拆 daily_quota。旧 daily_quota 保留做 legacy
         # fallback(老 DB 导出 / 还没升级设置的实例,get_daily_quotas() 会兜底)。
-        "daily_quota": 5,
-        "daily_quota_mini": 5,
-        "daily_quota_v2": 5,
-        "daily_quota_std": 5,
+        # v0.2.19:默认值从 5 改成 50 — 豆包每天每账号 50 点,mini 1 点/秒 / fast 1.5 点/秒。
+        # 老 DB 已经存了 5 的话 get_daily_quotas 仍会读老值,需要用户手动改一次。
+        "daily_quota": 50,
+        "daily_quota_mini": 50,
+        "daily_quota_v2": 50,
+        "daily_quota_std": 50,
         "quota_reset_time": "00:00",
         "scheduler_strategy": "least_used",
         "default_model": "seedance_v2.0_mini",

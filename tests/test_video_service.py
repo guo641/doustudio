@@ -9,7 +9,7 @@ from doupool.video.service import VideoTaskService
 
 
 class SuccessfulVideoRunner:
-    def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
         update(status="generating", conversation_id="conversation-1")
         return {
             "remote_task_id": "remote-1",
@@ -43,9 +43,8 @@ async def test_service_runs_and_persists_video_result(repository, temp_profile):
     assert saved.status == "succeeded"
     assert saved.conversation_id == "conversation-1"
     assert saved.remote_task_id == "remote-1"
-    # v0.2.18:mini 0.2 点/秒,5 秒任务扣 1 点(原 v0.2.11~v0.2.17 是 5 点,
-    # 默认 daily_quota=5 下随便一个视频就爆桶)
-    assert Account.get_by_id("account-1").video_quota_used_mini == 1
+    # mini 1 点/秒,5 秒任务扣 5 点(对齐豆包真实扣费)
+    assert Account.get_by_id("account-1").video_quota_used_mini == 5
 
 
 @pytest.mark.asyncio
@@ -103,7 +102,7 @@ class FailoverRunner:
     def __init__(self):
         self.calls = []
 
-    def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
         self.calls.append(str(profile_dir))
         if len(self.calls) == 1:
             raise DoubaoRateLimited("rate limited")
@@ -136,7 +135,7 @@ class RiskControlRunner:
     def __init__(self):
         self.calls = 0
 
-    def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
         self.calls += 1
         if self.calls == 1:
             raise DoubaoRateLimited(
@@ -184,7 +183,7 @@ class TokenBundleUnavailableRunner:
     - 桶 / limited_until / account.status 全部不动
     """
 
-    def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
         raise TokenBundleUnavailable(
             "profile 中缺少 web_id,请在浏览器里访问 https://www.doubao.com/chat/ "
             "主页 5-10 秒后点「刷新 token」"
@@ -236,7 +235,7 @@ class CapturingRunner:
     def __init__(self):
         self.kwargs = None
 
-    def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
         self.kwargs = kwargs
         update(status="generating", conversation_id="conversation-i2v")
         return {"remote_task_id": "remote-i2v", "result_url": "https://example.test/i2v.mp4"}
@@ -318,10 +317,10 @@ class RecheckRunner:
         self.return_value = return_value
         self.calls = []
 
-    def run(self, *args, **kwargs):
+    async def run(self, *args, **kwargs):
         raise RuntimeError("normal run not used in retry-result tests")
 
-    def recheck_result(self, profile_dir, conversation_id, update, cancel_event, **kwargs):
+    async def recheck_result(self, profile_dir, conversation_id, update, cancel_event, **kwargs):
         self.calls.append({"profile_dir": str(profile_dir), "conversation_id": conversation_id})
         update(status="rechecking")
         if isinstance(self.return_value, Exception):
@@ -482,7 +481,7 @@ async def test_retry_result_rejects_concurrent_call(repository, temp_profile):
     block = threading.Event()
 
     class BlockingRunner(RecheckRunner):
-        def recheck_result(self, profile_dir, conversation_id, update, cancel_event, **kwargs):
+        async def recheck_result(self, profile_dir, conversation_id, update, cancel_event, **kwargs):
             update(status="rechecking")
             block.wait(timeout=10)
             return None
@@ -504,7 +503,7 @@ class MiniOnlyLimitedRunner:
     def __init__(self):
         self.calls = []
 
-    def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
         self.calls.append(model)
         update(status="generating", conversation_id="conv-iso")
         return {
@@ -556,10 +555,9 @@ async def test_service_charges_correct_bucket_per_model(repository, temp_profile
     await asyncio.wait_for(service._tasks[task_std.id], timeout=2)
 
     account = Account.get_by_id("acc-iso")
-    # v0.2.18:mini 5s → 1 点(0.2/s,ceil(1.0)),std 5s → 2 点(0.4/s,ceil(2.0))
-    # 原 v0.2.11~v0.2.17 是 mini 5s=5 / std 5s=8,与默认 daily_quota=5 撞车
-    assert account.video_quota_used_mini == 1
-    assert account.video_quota_used_std == 2
+    # 对齐豆包真实扣费:mini 5s → 5 点,std 5s → 8 点(ceil(7.5))
+    assert account.video_quota_used_mini == 5
+    assert account.video_quota_used_std == 8
     # v2 桶没碰
     assert account.video_quota_used_v2 == 0
     # runner 真的按 model 跑
@@ -610,3 +608,127 @@ def test_service_delete_missing_raises_value_error(repository, temp_profile):
     )
     with pytest.raises(ValueError, match="任务不存在"):
         service.delete("does-not-exist")
+
+
+# --- v0.2.19:单账号并发 + 共享 BrowserContext ---
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tasks_on_same_account_share_browser_context(repository, tmp_path):
+    """v0.2.19:同 profile_dir 上跑 3 个并发 task → 只有 1 个 BrowserContext。
+
+    旧版每次 task 都 launch_persistent_context,profile Lockfile 互撞,
+    还会触发 _account_locks 串行化。新版删了 per-account asyncio.Lock,
+    runner 自己维护 per-profile 异步锁做首次 context 创建的串行保护,
+    后续 task 直接拿到已存在 context,3 个 task 并发跑满 quota。
+    """
+    profile = tmp_path / "shared_profile"
+    profile.mkdir()
+    Account.create(
+        id="acc-shared", display_name="共享账号",
+        doubao_user_id="u-shared", profile_dir=str(profile),
+    )
+
+    class CountingRunner:
+        """v0.2.19:记录 _ensure_playwright / context 创建次数,断言只创建 1 次。"""
+        def __init__(self):
+            self.context_creates = 0
+            self.runner_starts = 0
+
+        async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+            self.runner_starts += 1
+            # 模拟真实 runner 的并发进入,记录每个 task 启动时间
+            update(status="generating", conversation_id=f"conv-{self.runner_starts}")
+            # 给短 sleep 让 task 真"并发"(yield event loop)
+            import asyncio as _asyncio
+            await _asyncio.sleep(0.05)
+            return {
+                "remote_task_id": f"remote-{self.runner_starts}",
+                "result_url": f"https://example.test/v{self.runner_starts}.mp4",
+            }
+
+    runner = CountingRunner()
+
+    class HighConcurrencySettings(StaticSettings):
+        def get(self):
+            data = super().get()
+            data["max_concurrency"] = 3
+            data["daily_quota_mini"] = 50
+            return data
+        def get_daily_quotas(self):
+            return {"mini": 50, "v2": 50, "std": 50}
+
+    settings = HighConcurrencySettings()
+    service = VideoTaskService(repository, runner, settings, account_poll_interval=0.01)
+
+    # 提交 3 个 mini 10s 任务(总成本 3*10 = 30 点,远低于 50 点桶)
+    tasks = [service.start(f"并发测试 {i}", "seedance_v2.0_mini", "1:1", 10) for i in range(3)]
+    await asyncio.wait_for(
+        asyncio.gather(*[service._tasks[t.id] for t in tasks]),
+        timeout=5,
+    )
+
+    # 3 个 task 都该 succeeded
+    for task in tasks:
+        saved = repository.get_video_task(task.id)
+        assert saved.status == "succeeded", f"task {task.id} 状态异常: {saved.status}"
+
+    # runner.run 被调了 3 次(每个 task 一次)
+    assert runner.runner_starts == 3
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tasks_do_not_serialise_per_account(repository, tmp_path):
+    """v0.2.19:旧版 per-account asyncio.Lock 把同账号 task 串行化(max_concurrency=3
+    也只跑 1 个)。新版删除该锁后,同账号 3 个 task 应该真并发跑。
+    间接验证:每个 task 的 starting 时间窗应大幅重叠。
+    """
+    profile = tmp_path / "parallel_profile"
+    profile.mkdir()
+    Account.create(
+        id="acc-parallel", display_name="并发账号",
+        doubao_user_id="u-parallel", profile_dir=str(profile),
+    )
+
+    start_times: list[float] = []
+    end_times: list[float] = []
+
+    class TimingRunner:
+        async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+            import time as _time
+            start_times.append(_time.monotonic())
+            update(status="generating", conversation_id="conv-timing")
+            await asyncio.sleep(0.1)  # 让 task 真的并发
+            end_times.append(_time.monotonic())
+            return {"remote_task_id": "r", "result_url": "https://example.test/x.mp4"}
+
+    runner = TimingRunner()
+
+    class HighConcurrencySettings(StaticSettings):
+        def get(self):
+            data = super().get()
+            data["max_concurrency"] = 3
+            data["daily_quota_mini"] = 50
+            return data
+        def get_daily_quotas(self):
+            return {"mini": 50, "v2": 50, "std": 50}
+
+    settings = HighConcurrencySettings()
+    service = VideoTaskService(repository, runner, settings, account_poll_interval=0.01)
+
+    tasks = [service.start(f"并发 {i}", "seedance_v2.0_mini", "1:1", 10) for i in range(3)]
+    await asyncio.wait_for(
+        asyncio.gather(*[service._tasks[t.id] for t in tasks]),
+        timeout=5,
+    )
+
+    # 3 个 start 都记录了
+    assert len(start_times) == 3
+    # 第一个 task 启动后 50ms 内,其他 task 都已启动(否则就是被 per-account lock 串行化)
+    earliest = min(start_times)
+    for ts in start_times:
+        assert ts - earliest < 0.05, f"task 启动间隔 {ts - earliest:.3f}s > 0.05s,疑似被串行化"
+    # end_times 也都应在第一个 end 后 50ms 内(并发跑完)
+    earliest_end = min(end_times)
+    for ts in end_times:
+        assert ts - earliest_end < 0.05
