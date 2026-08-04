@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import secrets
 import shutil
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+from playwright.sync_api import sync_playwright
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -15,6 +20,7 @@ from doupool.db.models import Account, LoginAttempt
 from doupool.login.service import LoginAlreadyRunning
 from doupool.logging.setup import set_log_level
 from doupool.updater import check_for_update
+from doupool.video.browser import TokenBundleUnavailable, extract_webmssdk_tokens
 from doupool.video.service import NoAvailableAccount
 
 
@@ -443,6 +449,138 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def _token_bundle_dict(bundle, available: bool, hint: str = "") -> dict:
+        """v0.2.17:把 TokenBundle 序列化成 API 响应。available=False(抽不到 web_id)
+        时 msToken / web_id / device_id 等值仍返回(用于 UI 调试看是哪个字段缺失),
+        统一在 hint 里说明原因。
+        """
+        return {
+            "available": available,
+            "hint": hint,
+            "ms_token_preview": (bundle.ms_token[:12] + "...") if bundle.ms_token else "",
+            "web_id": bundle.web_id,
+            "web_id_signature": bundle.web_id_signature,
+            "device_id": bundle.device_id,
+            "tea_uuid": bundle.tea_uuid,
+            "pc_version": bundle.pc_version,
+            "fetched_at": bundle.fetched_at,
+            "age_seconds": bundle.age_seconds(),
+        }
+
+    @app.get("/api/accounts/{account_id}/webmssdk-tokens")
+    def get_webmssdk_tokens(
+        account_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.17:从账号 profile 抽当前 WebMSSDK / TeaSDK token bundle。
+
+        不启动浏览器,只读 Default/Cookies SQLite + Local Storage leveldb。
+        字段缺失(典型:刚 login 没让主页跑过 WebMSSDK)→ 200 但 available=False
+        + hint 引导用户去浏览器访问主页后再调一次。
+        """
+        authorize(x_doupool_token, authorization)
+        account = Account.get_or_none(Account.id == account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        profile_dir = Path(account.profile_dir)
+        try:
+            bundle = extract_webmssdk_tokens(profile_dir)
+        except TokenBundleUnavailable as exc:
+            # 返回 200 + available=False,UI 区分"账号不存在"vs"token 抽不到"
+            return {
+                "available": False,
+                "hint": str(exc),
+                "ms_token_preview": "",
+                "web_id": "",
+                "web_id_signature": "",
+                "device_id": "",
+                "tea_uuid": "",
+                "pc_version": "",
+                "fetched_at": 0.0,
+                "age_seconds": None,
+            }
+        return _token_bundle_dict(bundle, available=True)
+
+    @app.post("/api/accounts/{account_id}/refresh-tokens", status_code=202)
+    async def refresh_webmssdk_tokens(
+        account_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.17:启动 headless Playwright 访问 doubao.com/chat/ 让 WebMSSDK
+        重新跑一次(产生新 msToken),然后再 extract_webmssdk_tokens 读新 bundle。
+
+        msToken 过期时用户点 UI 「刷新 token」按钮触发。同步跑 Playwright 会
+        阻塞 FastAPI 事件循环 ~5-10 秒,所以走 asyncio.to_thread 抛到 threadpool。
+        """
+        authorize(x_doupool_token, authorization)
+        account = Account.get_or_none(Account.id == account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        profile_dir = Path(account.profile_dir)
+
+        def _refresh():
+            # headless=False 是必须的:WebMSSDK 会拒绝 headless 拉新 token。
+            # 但 refresh 端点不需要可视化 — 浏览器窗口弹个 1s 就关,不打扰用户。
+            t0 = time.monotonic()
+            with sync_playwright() as pw:
+                ctx = pw.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    headless=False,
+                    args=[
+                        "--window-position=-2400,-2400",
+                        "--window-size=900,650",
+                    ],
+                )
+                try:
+                    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                    page.goto(
+                        "https://www.doubao.com/chat/",
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                    # WebMSSDK 跑 msToken 缓存通常 3-6 秒,留 8 秒 buffer
+                    page.wait_for_timeout(8_000)
+                finally:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+            bundle = extract_webmssdk_tokens(profile_dir)
+            return bundle, time.monotonic() - t0
+
+        try:
+            bundle, elapsed = await asyncio.to_thread(_refresh)
+        except TokenBundleUnavailable as exc:
+            # 主页访问了但 leveldb 还是没 web_id —— 罕见,可能是 disk flush
+            # 延迟。返回 200 + available=False 让前端显示 hint。
+            logging.getLogger("doupool.api").warning(
+                "刷新 token 后仍抽不到 web_id: account=%s err=%s", account_id, exc
+            )
+            return {
+                "available": False,
+                "hint": str(exc),
+                "ms_token_preview": "",
+                "web_id": "",
+                "web_id_signature": "",
+                "device_id": "",
+                "tea_uuid": "",
+                "pc_version": "",
+                "fetched_at": 0.0,
+                "age_seconds": None,
+            }
+        except Exception as exc:
+            # Playwright 启动失败 / Chromium 没装 / profile lock 占用
+            logging.getLogger("doupool.api").exception(
+                "刷新 token 失败: account=%s", account_id
+            )
+            raise HTTPException(status_code=503, detail=f"刷新 token 失败:{exc}") from exc
+        return {
+            **_token_bundle_dict(bundle, available=True),
+            "hint": f"刷新成功,耗时 {elapsed:.1f}s",
+        }
 
     assets = frontend_dir / "assets"
     if assets.exists():

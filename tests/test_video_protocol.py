@@ -3,6 +3,7 @@ import json
 import pytest
 
 from doupool.video.protocol import (
+    EXTRA_CLIENT_META_KEYS,
     DoubaoRateLimited,
     build_completion_payload,
     find_creation_directory,
@@ -37,7 +38,92 @@ def test_build_new_conversation_video_payload():
     }
 
 
-def test_parse_sse_ack_extracts_new_conversation():
+def test_build_completion_payload_uses_uuid4_for_default_ids():
+    """v0.2.17:local_message_id / local_conversation_id / unique_key 默认
+    用 uuid4(v1 时间戳+MAC 可聚关联全账号,纯数字 16 位更易按时间窗聚类)。
+    不传这几个 kwargs,生成出来必须是合法的 UUIDv4 字面量。
+    """
+    import re
+    import uuid as _uuid
+
+    payload = build_completion_payload(
+        prompt="测试",
+        model="seedance_v2.0_mini",
+        ratio="1:1",
+        duration=5,
+        fingerprint="fp",
+    )
+
+    # 抓所有「应该 UUIDv4」的 id 字段
+    ids_to_check = [
+        payload["client_meta"]["local_conversation_id"],
+        payload["option"]["unique_key"],
+        payload["messages"][-1]["local_message_id"],
+    ]
+    if payload["messages"][0]["content_block"][0]["block_type"] == 10052:
+        # i2v 才会出现 attachment_message,这里 t2v 默认没 attachment
+        pass
+
+    uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+    for sid in ids_to_check:
+        assert uuid_re.match(sid), f"不是 UUIDv4 格式: {sid!r}"
+        # 二次断言:uuid.UUID 解析 + version=4 抛错则失败
+        _uuid.UUID(sid, version=4)
+
+
+def test_build_completion_payload_forwards_extra_client_meta():
+    """v0.2.17:**extra_client_meta kwargs(白名单 EXTRA_CLIENT_META_KEYS)
+    合并到 payload.client_meta。runner 层把 TokenBundle.to_dict() 透传进来。
+    """
+    payload = build_completion_payload(
+        prompt="测试",
+        model="seedance_v2.0_mini",
+        ratio="1:1",
+        duration=5,
+        fingerprint="fp",
+        web_id="wb_xyz",
+        tea_uuid="tu_xyz",
+        device_id="dev_xyz",
+        pc_version="3.27.4",
+        web_id_signature="sig_xyz",
+        # 非白名单:应该被忽略
+        sessionid="leaked_secret_should_be_dropped",
+        random_attacker_field="evil",
+    )
+
+    client_meta = payload["client_meta"]
+    assert client_meta["web_id"] == "wb_xyz"
+    assert client_meta["tea_uuid"] == "tu_xyz"
+    assert client_meta["device_id"] == "dev_xyz"
+    assert client_meta["pc_version"] == "3.27.4"
+    assert client_meta["web_id_signature"] == "sig_xyz"
+    # 白名单外的字段必须没漏进 payload
+    assert "sessionid" not in client_meta
+    assert "random_attacker_field" not in client_meta
+
+
+def test_build_completion_payload_drops_empty_extra_client_meta():
+    """v0.2.17:None / 空串的 extra_client_meta 不应该写进 payload。"""
+    payload = build_completion_payload(
+        prompt="测试",
+        model="seedance_v2.0_mini",
+        ratio="1:1",
+        duration=5,
+        fingerprint="fp",
+        web_id="",       # 空串 → 丢弃
+        tea_uuid=None,   # None → 丢弃
+    )
+    assert "web_id" not in payload["client_meta"]
+    assert "tea_uuid" not in payload["client_meta"]
+
+
+def test_extra_client_meta_keys_is_frozenset_or_tuple():
+    """v0.2.17:EXTRA_CLIENT_META_KEYS 必须是不可变集合,运行时不能被改动。"""
+    assert isinstance(EXTRA_CLIENT_META_KEYS, (tuple, frozenset))
+    assert {"web_id", "tea_uuid", "device_id", "pc_version", "web_id_signature"} <= set(EXTRA_CLIENT_META_KEYS)
+
+
+
     text = (
         'event: SSE_HEARTBEAT\ndata: {}\n\n'
         'event: SSE_ACK\ndata: {"query_list":[{"question_id":"q1"}],'

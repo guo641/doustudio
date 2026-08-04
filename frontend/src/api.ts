@@ -127,6 +127,35 @@ export async function backupDatabase() {
   return json(await fetch('/api/settings/backup', { method: 'POST', headers }), '数据库备份失败');
 }
 
+// v0.2.17:WebMSSDK / TeaSDK token 状态 + 手动刷新。
+// 返回的 bundle 字段详情见 api/app.py:_token_bundle_dict。
+export type WebMSSDKTokensResponse = {
+  available: boolean;
+  hint: string;
+  ms_token_preview: string;
+  web_id: string;
+  web_id_signature: string;
+  device_id: string;
+  tea_uuid: string;
+  pc_version: string;
+  fetched_at: number;
+  age_seconds: number | null;
+};
+
+export async function getWebMSSDKTokens(accountId: string): Promise<WebMSSDKTokensResponse> {
+  return json(
+    await fetch(`/api/accounts/${accountId}/webmssdk-tokens`, { headers }),
+    'token 状态加载失败',
+  );
+}
+
+export async function refreshWebMSSDKTokens(accountId: string): Promise<WebMSSDKTokensResponse> {
+  return json(
+    await fetch(`/api/accounts/${accountId}/refresh-tokens`, { method: 'POST', headers }),
+    '刷新 token 失败',
+  );
+}
+
 export function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();

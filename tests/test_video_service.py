@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from doupool.db.models import Account
+from doupool.video.browser import TokenBundleUnavailable
 from doupool.video.protocol import DoubaoRateLimited
 from doupool.video.service import VideoTaskService
 
@@ -170,6 +171,49 @@ async def test_service_does_not_cap_buckets_on_shark_admin_risk_control(reposito
     assert "风控" in (saved.error_message or "")
     # 桶没动
     acc = Account.get_by_id("acc-risk")
+    assert acc.video_quota_used_mini == 0
+    assert acc.video_limited_until is None
+    assert acc.status == "active"
+
+
+class TokenBundleUnavailableRunner:
+    """v0.2.17:模拟 profile 抽不到 web_id 的情况(冷启动 / token 过期)。
+    runner.run 直接抛 TokenBundleUnavailable,service 应该:
+    - task 标 failed + 清晰错误信息
+    - 桶 / limited_until / account.status 全部不动
+    """
+
+    def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        raise TokenBundleUnavailable(
+            "profile 中缺少 web_id,请在浏览器里访问 https://www.doubao.com/chat/ "
+            "主页 5-10 秒后点「刷新 token」"
+        )
+
+
+@pytest.mark.asyncio
+async def test_service_does_not_cap_buckets_on_token_bundle_unavailable(repository, temp_profile):
+    """v0.2.17:profile 没 web_id → task failed,不动 quota,账号继续可调度。
+
+    风控 quota 区分:这是配置问题(profile 冷启动 / token 过期),不是风控也不是
+    quota。cap 桶只会让用户以为账号额度用完。任务失败后用户去点「刷新 token」
+    再重试。
+    """
+    Account.create(
+        id="acc-tok", display_name="token 账号", doubao_user_id="u-tok",
+        profile_dir=temp_profile,
+    )
+    runner = TokenBundleUnavailableRunner()
+    service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
+
+    task = service.start("token 测试", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    assert saved.status == "failed"
+    assert "web_id" in (saved.error_message or "")
+    assert "刷新 token" in (saved.error_message or "")
+    # 桶没动,账号继续 active
+    acc = Account.get_by_id("acc-tok")
     assert acc.video_quota_used_mini == 0
     assert acc.video_limited_until is None
     assert acc.status == "active"

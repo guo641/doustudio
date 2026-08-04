@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import base64
+import json
 import mimetypes
+import random
+import re
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
 from .protocol import (
+    EXTRA_CLIENT_META_KEYS,
     build_completion_payload,
     find_creation_directory,
     find_video_node,
@@ -20,6 +26,201 @@ from .protocol import (
 
 
 PC_VERSION = "3.27.4"
+# v0.2.17:模块级常量保留向后兼容;真实读取走 settings_service.get("pc_version")。
+# 这里只是个 fallback,settings 没读到 / 写坏时用。
+
+# v0.2.17:Chrome 启动参数压下「自动化」指纹。--disable-blink-features=AutomationControlled
+# 把 navigator.webdriver 反探测盖掉,site-per-process 关掉是字节前端用到的隔离行为。
+_STEALTH_LAUNCH_ARGS = (
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+)
+
+# 浏览器 locale / 时区跟真人中文用户对齐,避免 fbp(fingerprint by proxy)命中海外标签。
+_BROWSER_LOCALE = "zh-CN"
+_BROWSER_TIMEZONE = "Asia/Shanghai"
+
+
+class TokenBundleUnavailable(RuntimeError):
+    """v0.2.17:从登录 profile 抽不到完整 WebMSSDK token bundle。
+
+    通常因为:刚 login 完没让真人用户访问 doubao.com/chat/ 主页,leveldb 里
+    还没有 msToken / web_id 缓存。CHANGELOG 要求用户「登录后先在浏览器里
+    手动访问 doubao.com/chat/ 主页 5-10 秒」,再点 UI 「刷新 token」按钮。
+    """
+
+
+@dataclass(slots=True)
+class TokenBundle:
+    """v0.2.17:登录 profile 里抽出的 WebMSSDK / TeaSDK 真实指纹。
+
+    字段都来自登录后持久化的 Chromium profile(Cookies SQLite + Local Storage leveldb),
+    **不要逆向生成**(用户决策)。视频提交时把 `to_client_meta()` 当 kwargs 透传给
+    `build_completion_payload`,payload.client_meta 收到后豆包会用它签 a_bogus。
+    """
+
+    ms_token: str = ""
+    web_id: str = ""
+    web_id_signature: str = ""
+    device_id: str = ""
+    tea_uuid: str = ""
+    pc_version: str = PC_VERSION
+    fetched_at: float = field(default_factory=time.time)
+
+    def to_client_meta(self) -> dict[str, str]:
+        """返回白名单(EXTRA_CLIENT_META_KEYS)过滤后的 dict,空值丢弃。
+
+        pc_version 用 dataclass 默认(永不空),即使 TokenBundle 没显式给也会
+        出现在 dict 里 — 字节风控看到空 pc_version 直接风控。
+        """
+        return {
+            k: v
+            for k, v in {
+                "web_id": self.web_id,
+                "tea_uuid": self.tea_uuid,
+                "device_id": self.device_id,
+                "pc_version": self.pc_version,
+                "web_id_signature": self.web_id_signature,
+            }.items()
+            if v
+        }
+
+    def age_seconds(self) -> float:
+        return max(0.0, time.time() - self.fetched_at)
+
+
+def _read_chromium_cookies(profile_dir: Path) -> dict[str, str]:
+    """v0.2.17:读 Chromium Cookies SQLite(Default/Cookies),key 是 cookie name。
+
+    返回 {cookie_name: value},失败抛 TokenBundleUnavailable。Chromium 在 Windows
+    下用 SQLite 存 cookie,内部 hosts 表里 doubao.com 一行一行都展开。lock 文件
+    临时库 profile 锁住读不到 → 复制到 tmp 再读。
+    """
+    candidates = [
+        profile_dir / "Default" / "Cookies",
+        profile_dir / "Default" / "Network" / "Cookies",
+    ]
+    db_path = next((p for p in candidates if p.exists()), None)
+    if db_path is None:
+        return {}
+
+    tmp = db_path.with_suffix(".doupool.read.tmp")
+    try:
+        try:
+            tmp.write_bytes(db_path.read_bytes())
+            conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+        except sqlite3.OperationalError:
+            # ro 失败 → 普通只读连接
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("PRAGMA query_only = ON")
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name, value, host_key FROM cookies "
+                "WHERE host_key LIKE '%doubao.com%'"
+            )
+            cookies: dict[str, str] = {}
+            for name, value, host in cur.fetchall():
+                if name and value:
+                    cookies[name] = value
+            return cookies
+        finally:
+            conn.close()
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _read_chromium_local_storage(profile_dir: Path) -> dict[str, str]:
+    """v0.2.17:读 Local Storage leveldb,挑出 web_id / device_id / tea_uuid。
+
+    leveldb 是二进制格式(每条记录 varint 头 + key + value),直接读 .log 文件
+    用正则扫 `__tea_cache_tokens_497858` / `samantha_web_web_id` 出现的 JSON。
+    实测这两个 key 在 Chromium 重启后会被压到 .log 文件(冷启动),足够用。
+    """
+    log_path = profile_dir / "Default" / "Local Storage" / "leveldb" / "000003.log"
+    if not log_path.exists():
+        return {}
+    try:
+        raw = log_path.read_bytes()
+    except OSError:
+        return {}
+    text = raw.decode("latin-1", errors="replace")
+
+    out: dict[str, str] = {}
+    # __tea_cache_tokens_497858 是一个 JSON 串:{user_unique_id, web_id, ...}
+    tea_match = re.search(rb'__tea_cache_tokens_497858(.+?)</script>', raw, re.DOTALL)
+    if tea_match:
+        try:
+            obj = json.loads(tea_match.group(1).decode("utf-8", errors="replace"))
+            if isinstance(obj, dict):
+                if obj.get("web_id"):
+                    out["web_id"] = str(obj["web_id"])
+                if obj.get("user_unique_id"):
+                    out["tea_uuid"] = str(obj["user_unique_id"])
+        except (ValueError, TypeError):
+            pass
+    # samantha_web_web_id 是另一个 JSON:{web_id, ...}
+    sam_match = re.search(rb'samantha_web_web_id(.+?)</script>', raw, re.DOTALL)
+    if sam_match:
+        try:
+            obj = json.loads(sam_match.group(1).decode("utf-8", errors="replace"))
+            if isinstance(obj, dict) and obj.get("web_id"):
+                out["device_id"] = str(obj["web_id"])
+        except (ValueError, TypeError):
+            pass
+    # 备用:直接 regex 抓 web_id 的 string
+    if "web_id" not in out:
+        m = re.search(r'"web_id"\s*:\s*"([A-Za-z0-9_\-]{8,80})"', text)
+        if m:
+            out["web_id"] = m.group(1)
+    if "tea_uuid" not in out:
+        m = re.search(r'"user_unique_id"\s*:\s*"([A-Za-z0-9_\-]{8,80})"', text)
+        if m:
+            out["tea_uuid"] = m.group(1)
+    return out
+
+
+def extract_webmssdk_tokens(profile_dir: Path) -> TokenBundle:
+    """v0.2.17:从登录后持久化的 Chromium profile 抽 WebMSSDK / TeaSDK 真实指纹。
+
+    读 Default/Cookies(挑 doubao.com 域名的)+ Local Storage/leveldb/000003.log
+    拼出 TokenBundle。任意一个关键字段缺失 → 抛 TokenBundleUnavailable,
+    UI 引导用户「在浏览器里访问 doubao.com/chat/ 主页 5 秒后点刷新 token」。
+    """
+    profile_dir = Path(profile_dir)
+    cookies = _read_chromium_cookies(profile_dir)
+    storage = _read_chromium_local_storage(profile_dir)
+
+    ms_token = cookies.get("msToken", "") or cookies.get("ms_token", "")
+    web_id_signature = cookies.get("_signature", "") or cookies.get("samantha_web_id_signature", "")
+    web_id = storage.get("web_id", "") or cookies.get("samantha_web_web_id", "")
+    device_id = storage.get("device_id", "") or cookies.get("s_v_web_id", "")
+    tea_uuid = storage.get("tea_uuid", "") or cookies.get("user_unique_id", "")
+
+    # web_id 是字节风控核心,缺失 = 抽不出来
+    missing = []
+    if not web_id:
+        missing.append("web_id")
+    if not device_id:
+        missing.append("device_id")
+    if missing and not ms_token:
+        # msToken 缺失常见(用户刚 login 没让主页跑过 WebMSSDK),只有 web_id 缺失才是硬错
+        raise TokenBundleUnavailable(
+            f"profile 中缺少 web_id/device_id,字段: {missing}; "
+            "请在浏览器里访问 https://www.doubao.com/chat/ 主页 5-10 秒后点「刷新 token」"
+        )
+
+    return TokenBundle(
+        ms_token=ms_token,
+        web_id=web_id,
+        web_id_signature=web_id_signature,
+        device_id=device_id,
+        tea_uuid=tea_uuid,
+        pc_version=PC_VERSION,
+    )
 
 COMMON_QUERY_JS = r"""
 () => {
@@ -278,6 +479,8 @@ async ({name, mime, base64Data}) => {
 
 
 def read_browser_fingerprint(page, context) -> str:
+    """旧版 fp(只取 s_v_web_id cookie)— v0.2.17 之前 main path,现在保留
+    是为了 login 模块和外部脚本不破。视频提交已切到 load_browser_context。"""
     page.wait_for_function(
         "JSON.parse(localStorage.getItem('__tea_cache_tokens_497858') || '{}').user_unique_id",
         timeout=15_000,
@@ -290,6 +493,83 @@ def read_browser_fingerprint(page, context) -> str:
     if not fingerprint:
         raise RuntimeError("豆包浏览器指纹不可用，请重新登录")
     return fingerprint
+
+
+def load_browser_context(page, context, *, pc_version: str | None = None) -> TokenBundle:
+    """v0.2.17:从已登录 page + context 抽完整 TokenBundle。
+
+    跟 read_browser_fingerprint 行为差:除了 fp cookie 还读 localStorage 的
+    web_id / tea_uuid / device_id,组成 TokenBundle 给 payload.client_meta 透传。
+    pc_version 优先用 settings 传进来的(从 SettingsService.get("pc_version")
+    读),fallback 到模块级 PC_VERSION 常量。
+    """
+    effective_pc_version = pc_version or PC_VERSION
+    page.wait_for_function(
+        "JSON.parse(localStorage.getItem('__tea_cache_tokens_497858') || '{}').user_unique_id",
+        timeout=15_000,
+    )
+    cookies = context.cookies(["https://www.doubao.com"])
+    cookie_map = {cookie["name"]: cookie["value"] for cookie in cookies if cookie.get("name")}
+
+    storage = page.evaluate(
+        "() => {"
+        "  const read = (k) => { try { return JSON.parse(localStorage.getItem(k) || '{}') } catch { return {} } };"
+        "  const tea = read('__tea_cache_tokens_497858');"
+        "  const device = read('samantha_web_web_id');"
+        "  return {"
+        "    web_id: tea.web_id || '',"
+        "    tea_uuid: tea.user_unique_id || '',"
+        "    device_id: device.web_id || '',"
+        "  };"
+        "}"
+    )
+    if not isinstance(storage, dict):
+        storage = {}
+
+    web_id = storage.get("web_id") or cookie_map.get("samantha_web_web_id") or ""
+    tea_uuid = storage.get("tea_uuid") or cookie_map.get("user_unique_id") or ""
+    device_id = storage.get("device_id") or cookie_map.get("s_v_web_id") or ""
+    fingerprint = cookie_map.get("s_v_web_id") or device_id
+
+    if not fingerprint:
+        raise RuntimeError("豆包浏览器指纹不可用，请重新登录")
+    if not web_id:
+        # 抽不到 web_id → 风控无解,UI 显示「去浏览器手动访问主页后点刷新 token」
+        raise TokenBundleUnavailable(
+            "profile 中缺少 web_id,请在浏览器里访问 https://www.doubao.com/chat/ "
+            "主页 5-10 秒后点「刷新 token」"
+        )
+
+    return TokenBundle(
+        ms_token=cookie_map.get("msToken", "") or cookie_map.get("ms_token", ""),
+        web_id=web_id,
+        web_id_signature=cookie_map.get("_signature", "") or cookie_map.get("samantha_web_id_signature", ""),
+        device_id=device_id,
+        tea_uuid=tea_uuid,
+        pc_version=effective_pc_version,
+    )
+
+
+def _build_launch_kwargs() -> dict:
+    """v0.2.17:launch_persistent_context 的「拟人化」参数。"""
+    return {
+        "headless": False,
+        "viewport": {
+            "width": 940 + random.randint(-3, 3),
+            "height": 650 + random.randint(-3, 3),
+        },
+        "args": [
+            "--window-size=1000,720",
+            "--window-position=-2000,-2000",
+            *_STEALTH_LAUNCH_ARGS,
+        ],
+        "locale": _BROWSER_LOCALE,
+        "timezone_id": _BROWSER_TIMEZONE,
+        "extra_http_headers": {
+            "Referer": "https://www.doubao.com/chat/",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        },
+    }
 
 
 def load_image_base64(path: Path) -> tuple[str, str, str]:
@@ -327,9 +607,7 @@ class PlaywrightVideoRunner:
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
                 str(profile_dir),
-                headless=False,
-                viewport={"width": 940, "height": 650},
-                args=["--window-size=1000,720", "--window-position=-2000,-2000"],
+                **_build_launch_kwargs(),
             )
             try:
                 page = context.pages[0] if context.pages else context.new_page()
@@ -379,19 +657,20 @@ class PlaywrightVideoRunner:
         *,
         mode: str = "t2v",
         image_paths: list[str] | None = None,
+        pc_version: str | None = None,
     ) -> dict[str, str]:
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
                 str(profile_dir),
-                headless=False,
-                viewport={"width": 940, "height": 650},
-                args=["--window-size=1000,720", "--window-position=-2000,-2000"],
+                **_build_launch_kwargs(),
             )
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 page.goto("https://www.doubao.com/chat/", wait_until="domcontentloaded", timeout=30_000)
                 page.wait_for_timeout(2_000)
-                fingerprint = read_browser_fingerprint(page, context)
+                # v0.2.17:抽完整 TokenBundle,透传给 payload.client_meta
+                token_bundle = load_browser_context(page, context, pc_version=pc_version)
+                fingerprint = token_bundle.device_id or token_bundle.web_id
 
                 uploaded_images: list[dict] = []
                 if mode == "i2v":
@@ -422,6 +701,9 @@ class PlaywrightVideoRunner:
                     fingerprint,
                     mode=mode,
                     images=uploaded_images or None,
+                    # v0.2.17:WebMSSDK / TeaSDK 真实指纹(从登录 profile 抽)透传给
+                    # payload.client_meta — 走 EXTRA_CLIENT_META_KEYS 白名单。
+                    **token_bundle.to_client_meta(),
                 )
                 local_id = payload["client_meta"]["local_conversation_id"]
                 page.evaluate("id => history.replaceState({}, '', '/chat/' + id)", local_id)

@@ -424,3 +424,304 @@ def test_delete_video_task_returns_503_when_service_down(repository, tmp_path):
 
     assert response.status_code == 503
     assert repository.get_video_task(task.id).status == "queued"
+
+
+# ---------- v0.2.17:WebMSSDK / TeaSDK token 状态 + 刷新端点 ----------
+# 登录 profile 用同一 Chromium 实例才能让 WebMSSDK 写过 leveldb,GET 端点
+# 只读 profile 不开浏览器,POST 端点才会拉起 headless=False Playwright。
+# 测试里把 extract_webmssdk_tokens 和 sync_playwright 都 monkeypatch 掉,
+# 避免真起浏览器 / 真读 SQLite。
+
+def test_get_webmssdk_tokens_returns_available_bundle(repository, tmp_path, temp_profile, monkeypatch):
+    """v0.2.17:profile 里能抽到完整 bundle → 200 + available=True + 字段填齐。"""
+    from doupool.db.models import Account
+    from doupool.video.browser import TokenBundle
+
+    account = Account.create(
+        id="account-token", display_name="token 账号", doubao_user_id="token-user",
+        profile_dir=temp_profile,
+    )
+
+    def fake_extract(profile_dir):
+        return TokenBundle(
+            ms_token="ms_abcdef1234567890",
+            web_id="wb_x",
+            web_id_signature="sig_x",
+            device_id="dev_x",
+            tea_uuid="tu_x",
+            pc_version="3.27.4",
+        )
+
+    monkeypatch.setattr("doupool.api.app.extract_webmssdk_tokens", fake_extract)
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.get(f"/api/accounts/{account.id}/webmssdk-tokens", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is True
+    assert payload["hint"] == ""
+    assert payload["ms_token_preview"] == "ms_abcdef123..."
+    assert payload["web_id"] == "wb_x"
+    assert payload["web_id_signature"] == "sig_x"
+    assert payload["device_id"] == "dev_x"
+    assert payload["tea_uuid"] == "tu_x"
+    assert payload["pc_version"] == "3.27.4"
+    assert payload["fetched_at"] > 0
+    assert payload["age_seconds"] is not None
+
+
+def test_get_webmssdk_tokens_returns_unavailable_when_bundle_missing(repository, tmp_path, temp_profile, monkeypatch):
+    """v0.2.17:抽不到完整 bundle(冷启动 profile)→ 200 + available=False + hint 引导用户去主页。"""
+    from doupool.db.models import Account
+    from doupool.video.browser import TokenBundleUnavailable
+
+    account = Account.create(
+        id="account-cold", display_name="冷启动", doubao_user_id="cold-user",
+        profile_dir=temp_profile,
+    )
+
+    def fake_extract(profile_dir):
+        raise TokenBundleUnavailable(
+            "profile 中缺少 web_id/device_id,字段: ['web_id']; "
+            "请在浏览器里访问 https://www.doubao.com/chat/ 主页 5-10 秒后点「刷新 token」"
+        )
+
+    monkeypatch.setattr("doupool.api.app.extract_webmssdk_tokens", fake_extract)
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.get(f"/api/accounts/{account.id}/webmssdk-tokens", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is False
+    assert "web_id" in payload["hint"]
+    # 字段全空,UI 区分"账号不存在"vs"token 抽不到"
+    assert payload["ms_token_preview"] == ""
+    assert payload["web_id"] == ""
+    assert payload["device_id"] == ""
+    assert payload["fetched_at"] == 0.0
+    assert payload["age_seconds"] is None
+
+
+def test_get_webmssdk_tokens_404_when_account_missing(repository, tmp_path, monkeypatch):
+    """v0.2.17:账号不存在 → 404(不能返回 available=False 误导用户)。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.get(
+        "/api/accounts/does-not-exist/webmssdk-tokens",
+        headers={"X-DouPool-Token": "secret"},
+    )
+
+    assert response.status_code == 404
+    assert "account not found" in response.json()["detail"]
+
+
+def test_get_webmssdk_tokens_requires_auth(repository, tmp_path):
+    """v0.2.17:无 token → 401,跟其他端点一致。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.get("/api/accounts/anything/webmssdk-tokens")
+
+    assert response.status_code == 401
+
+
+def test_refresh_tokens_returns_new_bundle(repository, tmp_path, temp_profile, monkeypatch):
+    """v0.2.17:成功路径 → 202 + available=True + 包含刷后 bundle 的字段 + 耗时 hint。"""
+    from doupool.db.models import Account
+    from doupool.video.browser import TokenBundle
+
+    account = Account.create(
+        id="account-refresh", display_name="可刷新", doubao_user_id="refresh-user",
+        profile_dir=temp_profile,
+    )
+
+    launched = {"persistent": False}
+
+    class FakeBrowser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        @property
+        def chromium(self):
+            return self
+
+        def launch_persistent_context(self, profile_dir, **kwargs):
+            launched["persistent"] = True
+            assert kwargs["headless"] is False
+            assert "--window-position=-2400,-2400" in kwargs["args"]
+
+            class _Ctx:
+                def __init__(self):
+                    self.pages = []
+
+                def new_page(self):
+                    class _Page:
+                        def goto(self, url, **kw):
+                            pass
+
+                        def wait_for_timeout(self, ms):
+                            pass
+
+                    p = _Page()
+                    self.pages.append(p)
+                    return p
+
+                def close(self):
+                    pass
+
+            return _Ctx()
+
+    def fake_extract(profile_dir):
+        return TokenBundle(
+            ms_token="ms_refreshed_zzz",
+            web_id="wb_new",
+            web_id_signature="sig_new",
+            device_id="dev_new",
+            tea_uuid="tu_new",
+            pc_version="3.27.4",
+        )
+
+    monkeypatch.setattr("doupool.api.app.sync_playwright", lambda: FakeBrowser())
+    monkeypatch.setattr("doupool.api.app.extract_webmssdk_tokens", fake_extract)
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(f"/api/accounts/{account.id}/refresh-tokens", headers=headers)
+
+    assert response.status_code == 202
+    assert launched["persistent"] is True
+    payload = response.json()
+    assert payload["available"] is True
+    assert "刷新成功" in payload["hint"]
+    assert payload["web_id"] == "wb_new"
+    assert payload["web_id_signature"] == "sig_new"
+    assert payload["device_id"] == "dev_new"
+    assert payload["tea_uuid"] == "tu_new"
+    assert payload["ms_token_preview"] == "ms_refreshed..."
+
+
+def test_refresh_tokens_returns_unavailable_when_bundle_still_missing(
+    repository, tmp_path, temp_profile, monkeypatch,
+):
+    """v0.2.17:Playwright 跑过但 leveldb 还是没 web_id → 200 + available=False + hint。"""
+    from doupool.db.models import Account
+    from doupool.video.browser import TokenBundleUnavailable
+
+    account = Account.create(
+        id="account-still", display_name="空 profile", doubao_user_id="still-user",
+        profile_dir=temp_profile,
+    )
+
+    class FakeBrowser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        @property
+        def chromium(self):
+            return self
+
+        def launch_persistent_context(self, profile_dir, **kwargs):
+            class _Ctx:
+                def __init__(self):
+                    self.pages = []
+
+                def new_page(self):
+                    class _Page:
+                        def goto(self, url, **kw):
+                            pass
+
+                        def wait_for_timeout(self, ms):
+                            pass
+
+                    p = _Page()
+                    self.pages.append(p)
+                    return p
+
+                def close(self):
+                    pass
+
+            return _Ctx()
+
+    def fake_extract(profile_dir):
+        raise TokenBundleUnavailable("profile 中缺少 web_id")
+
+    monkeypatch.setattr("doupool.api.app.sync_playwright", lambda: FakeBrowser())
+    monkeypatch.setattr("doupool.api.app.extract_webmssdk_tokens", fake_extract)
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(f"/api/accounts/{account.id}/refresh-tokens", headers=headers)
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["available"] is False
+    assert "web_id" in payload["hint"]
+    assert payload["web_id"] == ""
+
+
+def test_refresh_tokens_503_when_playwright_raises(
+    repository, tmp_path, temp_profile, monkeypatch,
+):
+    """v0.2.17:Playwright 启动失败 / profile lock / Chromium 没装 → 503,不静默 200。"""
+    from doupool.db.models import Account
+
+    account = Account.create(
+        id="account-broken", display_name="坏 profile", doubao_user_id="broken-user",
+        profile_dir=temp_profile,
+    )
+
+    def fake_playwright():
+        raise RuntimeError("Chromium 没装")
+
+    monkeypatch.setattr("doupool.api.app.sync_playwright", fake_playwright)
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(f"/api/accounts/{account.id}/refresh-tokens", headers=headers)
+
+    assert response.status_code == 503
+    assert "Chromium 没装" in response.json()["detail"]
+
+
+def test_refresh_tokens_404_when_account_missing(repository, tmp_path):
+    """v0.2.17:刷不存在的账号 → 404,不会触发 Playwright。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.post(
+        "/api/accounts/does-not-exist/refresh-tokens",
+        headers={"X-DouPool-Token": "secret"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_refresh_tokens_requires_auth(repository, tmp_path):
+    """v0.2.17:无 token → 401,跟其他端点一致。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.post("/api/accounts/anything/refresh-tokens")
+
+    assert response.status_code == 401

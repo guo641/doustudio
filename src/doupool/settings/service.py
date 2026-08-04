@@ -32,6 +32,10 @@ class SettingsService:
         "watermark_key": "",
         # 失败自动改 prompt 重试
         "max_prompt_retries": 2,
+        # v0.2.17:浏览器 PC 端版本号,被 video/browser.py 读取塞到
+        # payload.client_meta.pc_version。不暴露前端(17-b 时一起加 UI),
+        # 升级时只需改这里 + 重启服务。
+        "pc_version": "3.27.4",
     }
 
     # seedance 模型 → quota 桶名。供 repository / video_service 单一真值源使用。

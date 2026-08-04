@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-import secrets
 import time
-from uuid import uuid1, uuid4
+from uuid import uuid4
 
 
 MODELS = {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}
@@ -11,6 +10,17 @@ RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}
 DURATIONS = {5, 10}
 TASK_MODES = {"t2v", "i2v"}
 MAX_I2V_IMAGES = 9
+
+# v0.2.17:payload.client_meta 透传键(从登录 profile 抽出的 WebMSSDK / TeaSDK
+# 真实指纹,直接复用而不是逆向生成 msToken / a_bogus)。
+# service / runner 层把 TokenBundle.to_dict() 当 **extra_client_meta 透传进来。
+EXTRA_CLIENT_META_KEYS = (
+    "web_id",
+    "tea_uuid",
+    "device_id",
+    "pc_version",
+    "web_id_signature",
+)
 
 
 class DoubaoRateLimited(RuntimeError):
@@ -107,7 +117,7 @@ def _text_message(
 ) -> dict:
     message_text = f"生成视频：{prompt}，{ratio}"
     return {
-        "local_message_id": local_message_id or str(uuid1()),
+        "local_message_id": local_message_id or str(uuid4()),
         "content_block": [{
             "block_type": 10000,
             "content": {
@@ -160,7 +170,7 @@ def _attachment_message(
             "src": "",
         })
     return {
-        "local_message_id": local_message_id or str(uuid1()),
+        "local_message_id": local_message_id or str(uuid4()),
         "content_block": [{
             "block_type": 10052,
             "content": {
@@ -193,7 +203,14 @@ def build_completion_payload(
     collect_id: str | None = None,
     attachment_message_id: str | None = None,
     attachment_block_id: str | None = None,
+    **extra_client_meta: str,
 ) -> dict:
+    """组装豆包视频生成请求的 payload。
+
+    v0.2.17:**extra_client_meta 透传 WebMSSDK / TeaSDK 真实指纹字段,runner 层
+    把 TokenBundle.to_dict() 当 kwargs 传入(只接受 EXTRA_CLIENT_META_KEYS
+    白名单内的键,避免乱塞字段污染 payload)。
+    """
     prompt = prompt.strip()
     if not prompt:
         raise ValueError("prompt is required")
@@ -219,9 +236,9 @@ def build_completion_payload(
         raise ValueError("images are only supported for i2v")
 
     now_ms = now_ms or int(time.time() * 1000)
-    local_conversation_id = local_conversation_id or (
-        f"local_{secrets.randbelow(9_000_000_000_000_000) + 1_000_000_000_000_000}"
-    )
+    # v0.2.17:local_conversation_id 用 UUIDv4 — 之前是 16 位纯数字,风控可按
+    # 数字模式聚关联账号 + 时间窗。UUIDv4 无任何语义信息,跟真人浏览器一致。
+    local_conversation_id = local_conversation_id or str(uuid4())
     unique_key = unique_key or str(uuid4())
     collect_id = collect_id or (str(uuid4()) if images else "")
 
@@ -259,6 +276,13 @@ def build_completion_payload(
             "bot_id": "7338286299411103781",
             "last_section_id": "",
             "last_message_index": None,
+            # v0.2.17:WebMSSDK / TeaSDK 真实指纹(从登录 profile 抽)。
+            # 只接受 EXTRA_CLIENT_META_KEYS 白名单内的键,过滤掉杂七杂八 kwargs。
+            **{
+                k: v
+                for k, v in extra_client_meta.items()
+                if k in EXTRA_CLIENT_META_KEYS and v
+            },
         },
         "messages": messages,
         "option": _base_option(

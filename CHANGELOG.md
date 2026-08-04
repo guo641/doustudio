@@ -2,6 +2,45 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.17 - 2026-08-04
+
+### 修复
+
+- **「shark_admin 风控」绕过 — 复用登录 profile 的真实 WebMSSDK / TeaSDK token**:v0.2.16 把风控从 quota 桶隔离掉,账号不再被误 cap,但**每条 task 仍第一请求就被 shark_admin 拦截**(`error_code=710022004, decision.from=shark_admin, subtype=semantic_reasoning`),线上命中率 0%。根因是视频提交的 Playwright 跑的 JS fetch 没带真实 msToken / 完整 doubao.com cookies / 真 `Referer` / `sec-ch-ua*` / 真实 `pc_version`,风控 front-end 一眼识破。逆向 WebMSSDK 算法 ROI 太低且易被环境检测识破,改走**复用登录 profile 已签好的 token**路线:
+  - 新增 `TokenBundle`(`video/browser.py`):从登录后持久化的 Chromium profile 抽 `msToken` / `web_id` / `web_id_signature` / `device_id` / `tea_uuid` / `pc_version`,凑齐后透传给 `payload.client_meta`。
+  - **`extract_webmssdk_tokens(profile_dir)`**:读 `Default/Cookies` SQLite(挑 doubao.com 域名)+ `Local Storage/leveldb/000003.log` 拼出 bundle。关键字段缺失(wid_id / device_id)→ 抛 `TokenBundleUnavailable`,UI 引导用户「登录后在浏览器里手动访问 doubao.com/chat/ 主页 5-10 秒」后再点刷新。
+  - **`load_browser_context` 改名 + 加 kwargs**:返回 `TokenBundle` 而非单独 fp 字符串;接受 `pc_version=settings.get("pc_version")` 透传,真实浏览器 pc_version 走 Settings 单一来源(`pc_version` 设置项,browser.py 的模块常量降为兜底)。
+  - **`build_completion_payload` 加 `**kwargs`**:透传 `EXTRA_CLIENT_META_KEYS = ("web_id", "tea_uuid", "device_id", "pc_version", "web_id_signature")` 白名单字段到 `client_meta`,空值自动丢弃。
+  - **视频提交复用登录 profile**:登录 + 视频提交共用同一 Playwright 持久 Chromium 上下文,关掉可视化(登录仍可视化)。Cookie / WebMSSDK 缓存全在,无需重抽。
+  - **per-account `asyncio.Lock`**:`video/service._scheduler_loop` 入口按 `account.id` 加锁,接受 Playwright `Lockfile` 互斥(同账号串行,不同账号并行;实际双账号场景 = 串行,quota 已限流)。
+  - **手动「🔄 刷新 token」按钮**:msToken 过期不静默重抽,前端账号面板每行加按钮 → 调 `POST /api/accounts/{id}/refresh-tokens`,headless=False Playwright 访问 doubao.com/chat/ 主页 8s 让 WebMSSDK 跑过,再 `extract_webmssdk_tokens` 重读新 bundle(走 `asyncio.to_thread` 避免阻塞 FastAPI 事件循环)。
+
+- **UUID 形态修复 — UUIDv4 替代 UUIDv1 / 纯数字**:`local_message_id` / `local_conversation_id` 之前分别用 `uuid1()`(时间戳 + MAC 可聚关联全账号) / 16 位纯数字 `secrets.randbelow`,风控后台通过同 cluster 反查就能把 DouStudio 的账号一锅端。改成 `uuid.uuid4()` 随机对手难关联。
+
+- **风控「profile 缺 token」早退:`_run_inner` 捕获 `TokenBundleUnavailable` 后 `return`(不 retry)**:同 profile 反复重试抽不到同样的字段,只会浪费 GPU 配额且 task 永远 `failed`。token 抽不到是 profile 级别问题,沿用 v0.2.16 隔离路径,只标 `failed` 不动 quota 桶,UI 红字 hint 引导用户去刷。
+
+### 新增
+
+- `GET /api/accounts/{id}/webmssdk-tokens` — 读 profile 不开浏览器,返回 `{available, hint, ms_token_preview, web_id, web_id_signature, device_id, tea_uuid, pc_version, fetched_at, age_seconds}`。`available=false` 时 hint 引导用户去主页。
+- `POST /api/accounts/{id}/refresh-tokens` (status 202) — 启动 headless=False Playwright 跑主页 8s 后重抽,返回新 bundle 或 503 on Playwright fail。
+- `Settings` 新增 `pc_version="3.27.4"` 字段(供 `browser.py` 读取,release 暂不暴露前端 UI)。
+- 前端账号面板:Token 列展示「正常 / 缺失」badge + age("12 分钟前" / "从未") + 操作按钮,失败时 hint 行红字说明。
+
+### 测试
+
+- `test_token_bundle_to_client_meta_drops_empty_fields` / `test_token_bundle_to_client_meta_always_has_pc_version` — `TokenBundle` 白名单 + 空值过滤 + pc_version 兜底
+- `test_load_browser_context_reads_tea_and_device_storage` / `test_load_browser_context_falls_back_to_cookies_when_storage_empty` / `test_load_browser_context_raises_when_no_fingerprint_cookie` / `test_load_browser_context_raises_token_bundle_unavailable_when_no_web_id` — profile 抽取三种路径 + 错路径
+- `test_extract_webmssdk_tokens_reads_cookies_sqlite` / `test_extract_webmssdk_tokens_raises_when_profile_dir_missing` — 从 SQLite 抽 msToken / sig,空 profile 抛 `TokenBundleUnavailable`
+- `test_build_launch_kwargs_includes_stealth_args_and_locale` — `_build_launch_kwargs` 含 `--disable-blink-features=AutomationControlled` / `timezone_id="Asia/Shanghai"` / `locale="zh-CN"` / `Referer / Accept-Language` / viewport 抖动 ±3
+- `test_get_webmssdk_tokens_returns_available_bundle` / `..._returns_unavailable_when_bundle_missing` / `..._404_when_account_missing` / `..._requires_auth` — `GET` 端点四种路径
+- `test_refresh_tokens_returns_new_bundle` / `..._returns_unavailable_when_bundle_still_missing` / `..._503_when_playwright_raises` / `..._404_when_account_missing` / `..._requires_auth` — `POST` 端点五种路径
+
+### 重要提示
+
+- **登录后必须先在浏览器里手动访问 `https://www.doubao.com/chat/` 主页 5-10 秒**——让 WebMSSDK 跑过、leveldb 写完 msToken / web_id 缓存,后续 DouStudio 提交任务才能拿到真 token。冷启动 profile 直接提交会全走红字 hint 「profile 中缺少 web_id」。
+- msToken 过期后,UI 账号面板点「🔄 刷新 token」即可(headless=False 起一个离屏窗口跑主页 8s,不影响正常使用)。
+- 双账号场景下,Playwright Lockfile 互斥会让任务**串行**(同账号);quota 系统已限制 `max_concurrency`,实际影响有限。
+
 ## v0.2.16 - 2026-08-04
 
 ### 修复

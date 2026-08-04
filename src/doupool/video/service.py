@@ -24,6 +24,7 @@ from doupool.watermark import (
     resolve_clean_url as zhuceka_resolve,
 )
 
+from .browser import TokenBundleUnavailable
 from .cost import quota_cost
 from .protocol import DURATIONS, MAX_I2V_IMAGES, MODELS, RATIOS, TASK_MODES, DoubaoRateLimited
 
@@ -571,6 +572,10 @@ class VideoTaskService:
                             cancellation,
                             mode=getattr(task, "mode", None) or "t2v",
                             image_paths=image_paths or None,
+                            # v0.2.17:settings 里的 pc_version(默认 "3.27.4")
+                            # 透传给 runner.run → load_browser_context,塞进
+                            # payload.client_meta.pc_version。
+                            pc_version=settings.get("pc_version"),
                         )
                         self.repository.update_video_task(task_id, status="succeeded", **result)
                         self.logger.info(
@@ -593,6 +598,31 @@ class VideoTaskService:
                         # v0.2.9:succeeded 后异步发 callback —— 拿到最新 task 行
                         # (含 result_url / clean_video_url)再发,前端收到时就能直接用。
                         self._schedule_callback(task_id)
+                        return
+                    except TokenBundleUnavailable as exc:
+                        # v0.2.17:profile 里抽不到 web_id(冷启动 profile 没让 WebMSSDK
+                        # 跑过 / msToken 已过期)。不是 quota 问题,不要 cap 桶。
+                        # 写清楚「请去浏览器访问主页 + 点刷新 token」,让用户自救。
+                        # 直接 return:token 是 profile 级问题,重提同一 profile 必失败,
+                        # 不要被外层 while not cancellation.is_set() 死循环重试。
+                        self.repository.update_video_task(
+                            task.id,
+                            status="failed",
+                            error_message=(
+                                "profile 中缺少 web_id,请在浏览器里访问 "
+                                "https://www.doubao.com/chat/ 主页 5-10 秒后"
+                                "点「刷新 token」(token 过期 / 冷启动 profile 都需要)"
+                            ),
+                        )
+                        self.logger.warning(
+                            "event=video_token_bundle_unavailable account_id=%s task_id=%s error=%s",
+                            account.id,
+                            task.id,
+                            exc,
+                        )
+                        # token 是 profile 级问题,不是账号级 — 不 cap 桶、不改 limited_until,
+                        # 让账号继续可调度,只是这条 task 标失败。下条 task 仍可能撞同样问题,
+                        # 直到用户去点刷新 token。
                         return
                     except DoubaoRateLimited as exc:
                         # v0.2.16:豆包把所有拦截都报 "rate limited",但

@@ -1,6 +1,12 @@
 <script setup lang="ts">
+import { onMounted, ref, watch } from 'vue';
 import { UsersRound, Plus, RefreshCw, Trash2 } from '@lucide/vue';
 import { DpBadge, DpButton, DpEmpty, DpPanel, DpSwitch, DpTable } from '@/ui';
+import {
+  getWebMSSDKTokens,
+  refreshWebMSSDKTokens,
+  type WebMSSDKTokensResponse,
+} from '@/api';
 
 type Account = {
   id: string;
@@ -26,13 +32,18 @@ const BUCKETS: { key: Bucket; label: string }[] = [
   { key: 'std', label: 'fast' },
 ];
 
-defineProps<{ accounts: Account[]; loading?: boolean; busy?: boolean }>();
+const props = defineProps<{ accounts: Account[]; loading?: boolean; busy?: boolean }>();
 const emit = defineEmits<{
   add: [];
   toggle: [value: { id: string; enabled: boolean }];
   delete: [id: string];
   relogin: [id: string];
 }>();
+
+// v0.2.17:token 状态。Record<accountId, bundle>,无 token 时 hint 引导用户去刷。
+const tokenStatus = ref<Record<string, WebMSSDKTokensResponse | null>>({});
+const refreshing = ref<Record<string, boolean>>({});
+const refreshError = ref<Record<string, string>>({});
 
 function remove(account: Account) {
   if (confirm(`确定删除账号“${account.display_name}”及其本地会话吗？`)) {
@@ -77,6 +88,64 @@ function formatRecovery(value?: string) {
   if (!value) return '—';
   return new Date(value).toLocaleString('zh-CN');
 }
+
+// v0.2.17:把 msToken age 格式化成"12 分钟前"等人类可读。
+function formatTokenAge(bundle: WebMSSDKTokensResponse | null | undefined): string {
+  if (!bundle || bundle.age_seconds == null) return '从未';
+  const sec = bundle.age_seconds;
+  if (sec < 60) return `${Math.round(sec)} 秒前`;
+  if (sec < 3600) return `${Math.round(sec / 60)} 分钟前`;
+  if (sec < 86400) return `${Math.round(sec / 3600)} 小时前`;
+  return `${Math.round(sec / 86400)} 天前`;
+}
+
+async function loadTokenStatus(accounts: Account[]) {
+  // 并行拉所有账号的 token 状态。任一失败只影响那一行的 hint,不让整页崩。
+  await Promise.all(
+    accounts.map(async (acc) => {
+      try {
+        tokenStatus.value[acc.id] = await getWebMSSDKTokens(acc.id);
+      } catch (err) {
+        tokenStatus.value[acc.id] = {
+          available: false,
+          hint: String(err),
+          ms_token_preview: '',
+          web_id: '',
+          web_id_signature: '',
+          device_id: '',
+          tea_uuid: '',
+          pc_version: '',
+          fetched_at: 0,
+          age_seconds: null,
+        };
+      }
+    }),
+  );
+}
+
+async function refreshOne(account: Account) {
+  refreshing.value[account.id] = true;
+  refreshError.value[account.id] = '';
+  try {
+    tokenStatus.value[account.id] = await refreshWebMSSDKTokens(account.id);
+  } catch (err) {
+    refreshError.value[account.id] = String(err);
+  } finally {
+    refreshing.value[account.id] = false;
+  }
+}
+
+onMounted(() => {
+  if (props.accounts?.length) loadTokenStatus(props.accounts);
+});
+
+// 父级换账号列表(添加 / 删除 / 刷新)时,重新拉 token 状态。
+watch(
+  () => props.accounts.map((a) => a.id).join(','),
+  () => {
+    if (props.accounts?.length) loadTokenStatus(props.accounts);
+  },
+);
 </script>
 
 <template>
@@ -91,24 +160,25 @@ function formatRecovery(value?: string) {
     <DpTable min-width="980px">
       <thead>
         <tr>
-          <th style="width: 24%">账号</th>
-          <th style="width: 12%">状态</th>
-          <th style="width: 26%">今日额度(mini / fast)</th>
-          <th style="width: 16%">限额恢复</th>
-          <th style="width: 10%">参与调度</th>
-          <th style="width: 12%">操作</th>
+          <th style="width: 22%">账号</th>
+          <th style="width: 11%">状态</th>
+          <th style="width: 22%">今日额度(mini / fast)</th>
+          <th style="width: 14%">限额恢复</th>
+          <th style="width: 13%">Token</th>
+          <th style="width: 9%">参与调度</th>
+          <th style="width: 9%">操作</th>
         </tr>
       </thead>
       <tbody>
         <tr v-if="loading">
-          <td colspan="6">
+          <td colspan="7">
             <DpEmpty title="正在加载…">
               <template #icon><UsersRound :size="18" /></template>
             </DpEmpty>
           </td>
         </tr>
         <tr v-else-if="!accounts.length">
-          <td colspan="6">
+          <td colspan="7">
             <DpEmpty title="还没有账号" description="添加账号后即可进入自动调度，扫码登录信息仅保存在本机。">
               <template #icon><UsersRound :size="18" /></template>
             </DpEmpty>
@@ -161,6 +231,28 @@ function formatRecovery(value?: string) {
           </td>
           <td class="muted">{{ formatRecovery(account.video_limited_until) }}</td>
           <td>
+            <div class="token-cell">
+              <div class="token-status">
+                <DpBadge
+                  :tone="tokenStatus[account.id]?.available ? 'active' : 'expired'"
+                  dot
+                >
+                  {{ tokenStatus[account.id]?.available ? '正常' : '缺失' }}
+                </DpBadge>
+                <small class="token-age muted">{{ formatTokenAge(tokenStatus[account.id]) }}</small>
+              </div>
+              <small
+                v-if="tokenStatus[account.id] && !tokenStatus[account.id]!.available"
+                class="token-hint"
+              >
+                {{ tokenStatus[account.id]!.hint }}
+              </small>
+              <small v-if="refreshError[account.id]" class="token-hint error">
+                {{ refreshError[account.id] }}
+              </small>
+            </div>
+          </td>
+          <td>
             <DpSwitch
               :on="account.enabled"
               :aria-label="`${account.enabled ? '停用' : '启用'} ${account.display_name}`"
@@ -170,12 +262,13 @@ function formatRecovery(value?: string) {
           <td>
             <div class="row-actions">
               <DpButton
-                v-if="account.status !== 'active'"
                 size="sm"
-                @click="$emit('relogin', account.id)"
+                :disabled="!!refreshing[account.id]"
+                :aria-label="`刷新 ${account.display_name} 的 token`"
+                @click="refreshOne(account)"
               >
-                <RefreshCw :size="12" />
-                重新登录
+                <RefreshCw :size="12" :class="{ spinning: refreshing[account.id] }" />
+                {{ refreshing[account.id] ? '刷新中…' : '🔄 刷新 token' }}
               </DpButton>
               <DpButton
                 size="sm"
@@ -307,5 +400,42 @@ function formatRecovery(value?: string) {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.token-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 130px;
+}
+
+.token-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.token-age {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.token-hint {
+  color: var(--danger-text);
+  font-size: 10.5px;
+  line-height: 1.35;
+  word-break: break-all;
+}
+
+.token-hint.error {
+  color: var(--danger-text);
+}
+
+.spinning {
+  animation: token-spin 0.9s linear infinite;
+}
+
+@keyframes token-spin {
+  to { transform: rotate(360deg); }
 }
 </style>

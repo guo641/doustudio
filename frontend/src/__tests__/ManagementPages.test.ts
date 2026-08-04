@@ -7,6 +7,16 @@ const api = vi.hoisted(() => ({
   getSettings: vi.fn().mockResolvedValue({ max_concurrency:1, daily_quota:5, quota_reset_time:'00:00', scheduler_strategy:'least_used', default_model:'seedance_v2.0_mini', default_duration:5, default_ratio:'1:1', download_dir:'/tmp/downloads', log_level:'INFO', log_retention_days:30, data_dir:'/tmp/data' }),
   saveSettings: vi.fn().mockImplementation(async value=>value),
   backupDatabase: vi.fn().mockResolvedValue({ path:'/tmp/backup.sqlite3' }),
+  // v0.2.17:AccountTable 在 onMounted/watch 时调这两个,默认给 "available=true" 兜底
+  // —— 老测试不关心 token 字段,但 mock 缺失会让组件初始 render 失败。
+  getWebMSSDKTokens: vi.fn().mockResolvedValue({
+    available: true, hint: '', ms_token_preview: '', web_id: 'wb', web_id_signature: '',
+    device_id: 'dev', tea_uuid: 'tu', pc_version: '3.27.4', fetched_at: 0, age_seconds: 0,
+  }),
+  refreshWebMSSDKTokens: vi.fn().mockResolvedValue({
+    available: true, hint: 'mock', ms_token_preview: '', web_id: 'wb', web_id_signature: '',
+    device_id: 'dev', tea_uuid: 'tu', pc_version: '3.27.4', fetched_at: 0, age_seconds: 0,
+  }),
 }));
 vi.mock('../api', () => api);
 
