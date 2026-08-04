@@ -43,8 +43,9 @@ async def test_service_runs_and_persists_video_result(repository, temp_profile):
     assert saved.status == "succeeded"
     assert saved.conversation_id == "conversation-1"
     assert saved.remote_task_id == "remote-1"
-    # v0.2.11:mini 1 点/秒,5 秒任务扣 5 点(老版本是 +1)
-    assert Account.get_by_id("account-1").video_quota_used_mini == 5
+    # v0.2.18:mini 0.2 点/秒,5 秒任务扣 1 点(原 v0.2.11~v0.2.17 是 5 点,
+    # 默认 daily_quota=5 下随便一个视频就爆桶)
+    assert Account.get_by_id("account-1").video_quota_used_mini == 1
 
 
 @pytest.mark.asyncio
@@ -555,9 +556,10 @@ async def test_service_charges_correct_bucket_per_model(repository, temp_profile
     await asyncio.wait_for(service._tasks[task_std.id], timeout=2)
 
     account = Account.get_by_id("acc-iso")
-    # v0.2.11:mini 5s → 5 点,std 5s → 8 点(ceil(7.5))
-    assert account.video_quota_used_mini == 5
-    assert account.video_quota_used_std == 8
+    # v0.2.18:mini 5s → 1 点(0.2/s,ceil(1.0)),std 5s → 2 点(0.4/s,ceil(2.0))
+    # 原 v0.2.11~v0.2.17 是 mini 5s=5 / std 5s=8,与默认 daily_quota=5 撞车
+    assert account.video_quota_used_mini == 1
+    assert account.video_quota_used_std == 2
     # v2 桶没碰
     assert account.video_quota_used_v2 == 0
     # runner 真的按 model 跑

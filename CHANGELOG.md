@@ -2,6 +2,37 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.18 - 2026-08-04
+
+### 修复
+
+- **「额度公式爆炸」修复:v0.2.17 默认 daily_quota=5 下一个 10s mini 视频扣 10 点爆桶**
+  v0.2.11~v0.2.17 期间费率沿用 `mini=1.0/s / fast=1.5/s`(向上取整),但**默认 `daily_quota_mini/std=5`**,用户线上实测:
+  - mini 5s 视频 → 扣 5 点(刚好用完全天)
+  - mini 10s 视频 → 扣 10 点,显示「10/5 已用完」
+  - fast 5s 视频 → 扣 8 点(超额 3,直接限流)
+  `MODEL_COST_PER_SECOND` 调到 `mini=0.2/s / fast=0.4/s`,新额度:
+  - mini 5s = ceil(1.0) = **1 点**
+  - mini 10s = ceil(2.0) = **2 点**
+  - fast 5s = ceil(2.0) = **2 点**
+  - fast 10s = ceil(4.0) = **4 点**
+  默认 5 点/天的桶下,5 个 10s mini 视频用完当天,用户不再看到「1 个视频就额度爆」的假象。
+
+- **「下载按钮点了没反应」修复:v0.2.17 后 WebView2 跨域下载新增 window.open 兜底**
+  v0.2.17 `DownloadButton.vue` 的跨域下载链是 `fetch(cors)` → CORS 失败 → `fetch(no-cors)` → opaque blob → `<a download>` → 触发 WebView2 下载管理器。线上复现:**fetch 走完、`<a>.click()` 调用了,但 WebView2 对 opaque response 出来的 blob 处理不一致**(body 可能空 / type 空 / 下载管理器不接),用户点了下载按钮「无反应」。线上用户 workaround 是「复制链接」贴到系统浏览器,系统浏览器对 cross-origin URL 下载行为一致能下。
+  三层 fallback:
+    1. `fetch(URL, mode='cors')` → blob + `<a download>` → 应用内下载(服务端开 CORS 才走得到)
+    2. `fetch(URL, mode='no-cors')` → opaque blob + `<a download>` → 多数情况能下,空 blob 走下一层
+    3. `window.open(URL, '_blank', 'noopener,noreferrer')` → 系统默认浏览器兜底,**用户至少能看到浏览器弹窗有反应**(pywebview + WebView2 把 window.open 代理到 OS 默认浏览器)
+  `triggerBlobDownload(blob)` 检测 `blob.size === 0` 直接返回 false,让外层走 `window.open`,不再让「点了没反应」这种黑盒发生。
+
+### 测试
+
+- `test_quota_cost_mini_per_second` / `test_quota_cost_fast_per_second_ceils` / `test_quota_cost_v2_legacy_alias` 全部更新为新费率期望值
+- 新增 `test_quota_cost_fits_daily_quota_bucket`:回归保护 — 默认 daily_quota_mini=5 下,2 个 10s mini = 4 点(< 5,留 1 点余量),5 个 10s mini = 10 点(> 5,触顶)
+- `test_service_runs_and_persists_video_result` / `test_service_charges_correct_bucket_per_model`:5s mini 期望 `video_quota_used_mini` 从 5 改 1、std 桶从 8 改 2
+- 全套 237 个 backend test 通过、frontend `ManagementPages.test.ts` 4 个测试通过
+
 ## v0.2.17 - 2026-08-04
 
 ### 修复
