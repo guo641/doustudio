@@ -2,6 +2,32 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.16 - 2026-08-04
+
+### 修复
+
+- **「shark_admin 风控被误判为 quota 限流」根因修复**:`error_msg: "rate limited"` 是豆包一个**通用 wrapper**,背后既可能是真 quota 限额,也可能是字节风控(`from=shark_admin, type=verify, subtype=semantic_reasoning, code=10000, error_code=710022004`)。v0.2.14 / v0.2.15 无条件当成 quota 限流 → cap 桶 + 设 `video_limited_until` → 账号**永久 cap 死**,UI 报"额度已用完"但实际桶只跑过一次任务甚至零次。
+  - `DoubaoRateLimited` 增加 `is_risk_control` 字段(v0.2.16):`parse_sse_ack` 解析 `extra.decision` JSON,识别 `from == "shark_admin"` → 风控,否则 → 真 quota。
+  - `video/service._run_inner` 区分两条路径:
+    - **风控**:只把这条 task 标 `failed`(`error_message="账号被风控拦截(shark_admin verify),稍后重试或换号"`),**完全不动 quota 桶、不设 `video_limited_until`**。账号继续可用,下一条任务可正常调度。
+    - **真 quota**:保持旧的 cap 桶 + 设 limited_until 行为不变。
+  - 日志:`event=video_risk_control` WARNING 带 `response_text` 前 500 字符(豆包真实风控 detail),便于事后复盘 IP / fingerprint / prompt 命中哪条策略。
+
+- **「软件时间跟本地差 8 小时」修复**:之前 DB / 日志时间戳全部走 `datetime.now(UTC)`(naive),日志 formatter 用 OS 本地时区格式化。两者口径不一致,且都跟 OS 时区耦合 —— 用户机器如果不在 `Asia/Shanghai`(或装的是 UTC ISO image),DB 显示的时间就比本地晚 8h,quota reset / 登录 `finished_at` / `last_verified_at` 都错位。
+  - **统一按北京时间(`Asia/Shanghai`)**,跟 OS 时区解耦:
+    - `doupool.db.models.utcnow()`:函数名保留(向后兼容),实际返回 `datetime.now(SHANGHAI).replace(tzinfo=None)`。所有 DB DateTime 字段(`quota_window`、`complete_login`、`update_video_task.completed_at`、`last_verified_at`、`finished_at` 等)都通过它写。
+    - `doupool.logging.setup.RedactingFormatter.formatTime`:override 标准库实现,强制 `datetime.fromtimestamp(record.created, tz=Asia/Shanghai)`,OS 时区是啥都按上海时间格式化。
+    - `doupool.login.browser._iso_now` + `doupool.settings.service` 备份文件名:也走 `Asia/Shanghai`。
+  - 新增 `tzdata>=2024.2` 到依赖:Windows 干净 Python 没有系统 IANA tz 数据库,没有这个包 `ZoneInfo("Asia/Shanghai")` 直接抛 `ZoneInfoNotFoundError`,第一个视频任务就崩。
+
+### 测试
+
+- 新增 `test_parse_sse_ack_detects_shark_admin_risk_control`:`extra.decision.from == "shark_admin"` → `DoubaoRateLimited.is_risk_control is True`
+- 新增 `test_parse_sse_ack_rates_limit_without_shark_admin_stays_quota`:普通 429 仍是 quota 路径(`is_risk_control is False`)
+- 新增 `test_service_does_not_cap_buckets_on_shark_admin_risk_control`:`_run_inner` 撞风控 → task `failed`、桶仍是 0、`limited_until` 仍是 None,账号下次仍可调度
+- 新增 `test_utcnow_returns_beijing_time`:`utcnow()` 跟 `datetime.now(UTC)` 差恒为 28800s(±5s)
+- 新增 `test_formatter_uses_shanghai_timezone_regardless_of_os`:`LogRecord.created` 是某 UTC 时刻 → 格式化出来是 `+8h` 上海时间
+
 ## v0.2.15 - 2026-08-04
 
 ### 修复

@@ -265,3 +265,32 @@ def test_v10_migration_is_idempotent(tmp_path):
         assert [r[0] for r in rows] == [10]
     finally:
         manager.close()
+
+
+def test_utcnow_returns_beijing_time():
+    """v0.2.16:utcnow() 名字保留兼容,但实际返回 Asia/Shanghai 时间。
+
+    历史原因:这函数原本叫 utcnow 是真 UTC,但业务上一直当 "now" 用 —
+    quota 桶 reset、登录 finished_at、账号 last_verified_at 这些对用户来说
+    都该是"本地时间"。统一到 Asia/Shanghai 之后,DB DateTime 字段就是用户
+    视角的北京时间,跟 quota_window 算 business_date 的口径一致。
+
+    测试:不管 OS 时区配成啥,utcnow() 跟 UTC 时间的差应该等于 Asia/Shanghai
+    跟 UTC 的差(= 8h)。
+    """
+    from datetime import UTC, datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from doupool.db.models import utcnow
+
+    now_bj = utcnow()
+    now_utc = datetime.now(UTC).replace(tzinfo=None)
+    # 误差容忍 5 秒(测试跑得快,但 wall clock 不可控)
+    delta = abs((now_bj - now_utc).total_seconds())
+    # 期望差 ~ 8h(= 28800s,Asia/Shanghai 是 UTC+8)
+    assert 28_795 <= delta <= 28_805, f"utcnow() 跟 UTC 差 {delta}s,期望 ~28800s"
+
+    # 直接构造上海时间,验证 utcnow() 返回值的 tz-aware 表示确实是 Shanghai
+    shanghai = ZoneInfo("Asia/Shanghai")
+    now_bj_aware = now_bj.replace(tzinfo=shanghai).astimezone(UTC).replace(tzinfo=None)
+    assert abs((now_bj_aware - now_utc).total_seconds()) < 5

@@ -4,6 +4,9 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class SettingsService:
@@ -87,7 +90,7 @@ class SettingsService:
     def backup(self) -> Path:
         backup_dir = self.data_dir / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
-        target = backup_dir / f"doupool-{datetime.now():%Y%m%d-%H%M%S-%f}.sqlite3"
+        target = backup_dir / f"doupool-{datetime.now(_SHANGHAI):%Y%m%d-%H%M%S-%f}.sqlite3"
         with sqlite3.connect(self.database_path) as source, sqlite3.connect(target) as destination:
             source.backup(destination)
         return target

@@ -128,6 +128,53 @@ async def test_service_cools_limited_account_and_fails_over(repository, tmp_path
     assert Account.get_by_id("account-1").video_limited_until is not None
 
 
+class RiskControlRunner:
+    """v0.2.16:模拟豆包风控拦截 — 第一次抛 is_risk_control=True,第二次随便来。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            raise DoubaoRateLimited(
+                "rate limited",
+                response_text='event: STREAM_ERROR\ndata: {"error_code":710022004,"error_msg":"rate limited","extra":{"decision":"{\\"from\\":\\"shark_admin\\",\\"type\\":\\"verify\\"}"}}\n\n',
+                is_risk_control=True,
+            )
+        # 第二次假设直接成功
+        update(status="generating", conversation_id="conversation-2")
+        return {"remote_task_id": "remote-2", "result_url": "https://example.test/2.mp4"}
+
+
+@pytest.mark.asyncio
+async def test_service_does_not_cap_buckets_on_shark_admin_risk_control(repository, temp_profile):
+    """v0.2.16:豆包 shark_admin 风控拦截(DoubaoRateLimited.is_risk_control=True)
+    不该 cap 桶,也不该封号 — 风控经常很快就放,cap 桶只让用户误以为是 quota 限流。
+
+    期望:任务标 failed + 错误信息"风控",账号 status / quota 桶 / limited_until 全部不动,
+    后续还能选这个账号跑别的任务。
+    """
+    Account.create(
+        id="acc-risk", display_name="风控账号", doubao_user_id="u-risk",
+        profile_dir=temp_profile,
+    )
+    runner = RiskControlRunner()
+    service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
+
+    task = service.start("风控测试", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    assert saved.status == "failed"
+    assert "风控" in (saved.error_message or "")
+    # 桶没动
+    acc = Account.get_by_id("acc-risk")
+    assert acc.video_quota_used_mini == 0
+    assert acc.video_limited_until is None
+    assert acc.status == "active"
+
+
 @pytest.mark.asyncio
 async def test_service_resumes_persisted_queued_tasks(repository, temp_profile):
     Account.create(id="resume-account", display_name="恢复账号", doubao_user_id="resume-user", profile_dir=temp_profile)

@@ -28,6 +28,10 @@ from .cost import quota_cost
 from .protocol import DURATIONS, MAX_I2V_IMAGES, MODELS, RATIOS, TASK_MODES, DoubaoRateLimited
 
 
+# v0.2.16:日志 / DB 时间统一按北京时间,跟 OS 时区解耦
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
 class NoAvailableAccount(RuntimeError):
     pass
 
@@ -497,7 +501,7 @@ class VideoTaskService:
             if self._global_semaphore is None or self._semaphore_limit != concurrency:
                 self._global_semaphore = asyncio.Semaphore(concurrency)
                 self._semaphore_limit = concurrency
-            business_date, next_reset = quota_window(datetime.now(UTC), settings["quota_reset_time"])
+            business_date, next_reset = quota_window(datetime.now(SHANGHAI), settings["quota_reset_time"])
             self.repository.reset_daily_quotas(business_date)
             task = self.repository.get_video_task(task_id)
             # v0.2.15:任务被 DELETE 端点删了 → get_video_task 返 None,
@@ -591,6 +595,27 @@ class VideoTaskService:
                         self._schedule_callback(task_id)
                         return
                     except DoubaoRateLimited as exc:
+                        # v0.2.16:豆包把所有拦截都报 "rate limited",但
+                        # extra.decision.from == "shark_admin" 是风控拦截,
+                        # 不是 quota 限流 — 风控经常很快就放,不该 cap 桶封号。
+                        response_excerpt = (exc.response_text or "").replace("\r\n", " ")[:500]
+                        if exc.is_risk_control:
+                            # 风控:不动桶,只标 task failed,让用户知道是被风控。
+                            # self.repository.assign_video_task(task_id, None) 让
+                            # 任务回到 queued,下次调度可能会选别的账号重试。
+                            self.repository.update_video_task(
+                                task_id, status="failed",
+                                error_message="账号被风控拦截（shark_admin verify），稍后重试或换号",
+                                completed_at=datetime.now(SHANGHAI).replace(tzinfo=None),
+                            )
+                            self.repository.assign_video_task(task_id, None)
+                            self.logger.warning(
+                                "账号被风控拦截,任务标 failed 不阻塞账号: %s | response=%s",
+                                exc, response_excerpt,
+                                extra={"event": "video_risk_control", "account_id": account.id},
+                            )
+                            return  # 任务失败,不再 continue 重试这一条
+                        # 真 quota 限流:cap 桶 + 封号 limited_until + 任务回 queued 等明天
                         # v0.2.15:把豆包真正返回的 error_msg + SSE 响应原文写进
                         # WARNING —— 之前只写「额度已用完」,真正 error_msg 被吞,
                         # 「额度误报」(fingerprint / IP / 风控等)时完全没线索。
@@ -602,7 +627,6 @@ class VideoTaskService:
                         self.repository.update_video_task(
                             task_id, status="queued", error_message=f"账号今日额度已用完:{exc}"
                         )
-                        response_excerpt = (exc.response_text or "").replace("\r\n", " ")[:500]
                         self.logger.warning(
                             "账号今日视频额度已用完:%s | response=%s",
                             exc, response_excerpt,

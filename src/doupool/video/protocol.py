@@ -19,11 +19,34 @@ class DoubaoRateLimited(RuntimeError):
     v0.2.15:带 response_text 字段,把 SSE 响应原文透传出来,
     `video/service._run_inner` 把它写到日志,方便下次「额度已用完」误报时
     能看到豆包真正的 error_msg(可能是 fingerprint / IP / 风控 等)。
+
+    v0.2.16:is_risk_control 旗标 — `extra.decision.from == "shark_admin"` 时
+    表示这是字节风控拦截,不是真 quota 限流。service 层区分两种处理:
+    - 真 quota: cap 三桶 + 封号 limited_until
+    - 风控: 不动桶,只标 task failed,提示"账号被风控,稍后重试或换号"
     """
 
-    def __init__(self, message: str, response_text: str = "") -> None:
+    def __init__(self, message: str, response_text: str = "", is_risk_control: bool = False) -> None:
         super().__init__(message)
         self.response_text = response_text
+        self.is_risk_control = is_risk_control
+
+
+def _detect_risk_control(payload: dict) -> bool:
+    """v0.2.16:识别豆包 STREAM_ERROR 的风控来源。
+
+    字节内部风控服务 shark_admin 会把 decision 塞在 extra.decision(字符串形式的 JSON),
+    `from == "shark_admin"` + `type == "verify"` 就是风控拦截。
+    真 quota 限流没这个 decision 字段,或者 `from` 不是 shark_admin。
+    """
+    decision_raw = payload.get("extra", {}).get("decision") if isinstance(payload, dict) else None
+    if not decision_raw:
+        return False
+    try:
+        decision = json.loads(decision_raw)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return decision.get("from") == "shark_admin"
 
 
 def _base_option(
@@ -270,8 +293,11 @@ def parse_sse_ack(text: str) -> dict[str, str]:
             error = json.loads(data or "{}")
             message = error.get("error_msg") or "豆包接口返回错误"
             if message == "rate limited":
-                # v0.2.15:把响应原文一起带出去,service 层写日志能看清真实 error_msg
-                raise DoubaoRateLimited(message, text[:2000])
+                # v0.2.16:区分真 quota 限流 vs 风控拦截。豆包把所有拦截都报
+                # "rate limited",但 extra.decision.from == "shark_admin" 时
+                # 是字节风控(verify),不该 cap 桶(rate limit 经常很快就放)。
+                is_risk = _detect_risk_control(error)
+                raise DoubaoRateLimited(message, text[:2000], is_risk_control=is_risk)
             raise RuntimeError(message)
         if event == "SSE_ACK":
             payload = json.loads(data)

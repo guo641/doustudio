@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from peewee import (
     AutoField,
@@ -18,9 +19,20 @@ from playhouse.db_url import DatabaseProxy
 
 database_proxy = DatabaseProxy()
 
+# v0.2.16:所有时间戳统一按"北京时间"存 — DB 里写啥用户就该看到啥,
+# 跟 OS 时区解耦(用户机器时区如果配 UTC,这里也会得到 +8 的 Beijing 时间)。
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
 
 def utcnow() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
+    """v0.2.16:墙钟时间用 Asia/Shanghai 返回,名字保留 utcnow 兼容老调用点。
+
+    历史原因:这个函数原本叫 utcnow 是真 UTC,但业务上一直当 "now" 用 —— quota
+    桶 reset、登录 finished_at、账号 last_verified_at 这些对用户来说都该是
+    "本地时间"。统一到 Asia/Shanghai 之后,DB 里的 DateTime 字段就是用户视角的
+    北京时间,quota_window 内部本来也用 Asia/Shanghai 算 business_date,口径一致。
+    """
+    return datetime.now(SHANGHAI).replace(tzinfo=None)
 
 
 class BaseModel(Model):

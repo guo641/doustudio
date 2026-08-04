@@ -56,6 +56,37 @@ def test_parse_sse_ack_raises_typed_rate_limit():
         parse_sse_ack(text)
 
 
+def test_parse_sse_ack_detects_shark_admin_risk_control():
+    """v0.2.16:豆包 STREAM_ERROR extra.decision.from == "shark_admin" 时
+    抛出 is_risk_control=True 的 DoubaoRateLimited — service 层据此区分
+    风控拦截 vs 真 quota 限流,不能 cap 桶封号。
+    """
+    text = (
+        'event: STREAM_ERROR\n'
+        'data: {"error_code":710022004,"error_msg":"rate limited","extra":{'
+        '"decision":"{\\"code\\":\\"10000\\",\\"from\\":\\"shark_admin\\",'
+        '\\"type\\":\\"verify\\",\\"region\\":\\"cn\\",'
+        '\\"subtype\\":\\"semantic_reasoning\\",\\"detail\\":\\"abc\\"}"'
+        '}}\n\n'
+    )
+    with pytest.raises(DoubaoRateLimited) as excinfo:
+        parse_sse_ack(text)
+    assert excinfo.value.is_risk_control is True
+    assert "rate limited" in str(excinfo.value)
+
+
+def test_parse_sse_ack_rates_limit_without_shark_admin_stays_quota():
+    """v0.2.16:没 extra.decision / from 不是 shark_admin → 还是真 quota 限流
+    (is_risk_control=False),保持旧的 cap 桶行为。"""
+    text = (
+        'event: STREAM_ERROR\n'
+        'data: {"error_code":429,"error_msg":"rate limited"}\n\n'
+    )
+    with pytest.raises(DoubaoRateLimited) as excinfo:
+        parse_sse_ack(text)
+    assert excinfo.value.is_risk_control is False
+
+
 def test_parse_sse_ack_attaches_response_text_to_rate_limit():
     """v0.2.15:DoubaoRateLimited 带 response_text,video/service 写日志时
     能看到豆包真正的 SSE 响应原文,排查「额度误报」(指纹 / IP / 风控)时

@@ -4,8 +4,9 @@ import json
 import logging
 import re
 import threading
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
@@ -13,6 +14,7 @@ from .detector import DoubaoIdentity
 from .service import VerifiedLogin
 
 _LOG = logging.getLogger("doupool.login")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 # v0.2.7:沿 yaonieyo/doubao-account-pool 双轨判定,完全抛弃
@@ -228,7 +230,8 @@ def _sessionid_cookie_value(context) -> str | None:
 
 
 def _iso_now() -> str:
-    return datetime.now(UTC).isoformat()
+    # v0.2.16:cookies.json debug 字段的时间戳也用北京时间,跟 DB 一致
+    return datetime.now(_SHANGHAI).isoformat()
 
 
 def _save_doubao_cookies_to_disk(context, profile_dir: Path) -> bool:
