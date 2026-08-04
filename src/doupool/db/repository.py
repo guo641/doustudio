@@ -269,6 +269,34 @@ class AccountRepository:
         (Account.update(**{field_name: field + by}, updated_at=utcnow())
          .where(Account.id == account_id).execute())
 
+    def decrement_account_quota(
+        self, account_id: str, model: str, *, by: int = 1
+    ) -> None:
+        """v0.2.19:失败退还额度 —— 配合 service 里的网络/prompt 违规退款路径。
+
+        与 increment_account_quota 对称:非法 by(<1)抛 ValueError;非法 model
+        也抛 ValueError;桶下界 0(`max(0, used - by)`),避免跨天 reset 后
+        退款把 used 打成负数。
+
+        注:这里的「退款」只覆盖 service 主动判定为失败的情况 —— 豆包真实
+        是否计费只能等用户第二天看官方账户为准。我们这边只是把桶里
+        多记的 quota 减回来,让用户感觉「提了被拒的任务不会扣我额度」。
+        """
+        if by < 1:
+            raise ValueError(f"decrement by must be >= 1, got {by}")
+        field_name = _quota_field(model)
+        field = getattr(Account, field_name)
+        # 用 SQL 表达式 max(field - by, 0):peewee 没有直接的 GREATEST,
+        # 但 SQLite/MySQL/Postgres 都支持 GREATEST。用 Case 实现兼容性更好。
+        from peewee import Case, SQL
+        new_value = Case(
+            None,
+            [(field - by < 0, SQL("0"))],
+            field - by,
+        )
+        (Account.update(**{field_name: new_value}, updated_at=utcnow())
+         .where(Account.id == account_id).execute())
+
     def create_video_task(
         self,
         account_id: str | None,

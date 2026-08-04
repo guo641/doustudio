@@ -441,3 +441,77 @@ def test_complete_login_creates_new_account_without_touching_others(repository, 
     old = Account.get_by_id("acc-old")
     assert old.video_quota_used_mini == 5
     assert old.video_limited_until == datetime(2026, 8, 3, 16, 0)
+
+
+# --- v0.2.19:decrement_account_quota (失败退还额度) ---
+
+
+def test_decrement_account_quota_subtracts_from_bucket(repository, temp_profile):
+    """v0.2.19:退款按桶减,不影响其它桶。"""
+    account = Account.create(
+        id="acc-refund", display_name="refund", doubao_user_id="u",
+        profile_dir=temp_profile,
+        video_quota_used_mini=15, video_quota_used_std=8, video_quota_used_v2=3,
+    )
+    repository.decrement_account_quota(account.id, model="seedance_v2.0_mini", by=10)
+
+    refreshed = Account.get_by_id(account.id)
+    assert refreshed.video_quota_used_mini == 5
+    # 其它桶不动
+    assert refreshed.video_quota_used_std == 8
+    assert refreshed.video_quota_used_v2 == 3
+
+
+def test_decrement_account_quota_clamps_at_zero(repository, temp_profile):
+    """v0.2.19:跨天 reset 后再退款,used 已经是 0,不能被打成负数。"""
+    account = Account.create(
+        id="acc-clamp", display_name="clamp", doubao_user_id="u",
+        profile_dir=temp_profile,
+        video_quota_used_mini=0, video_quota_used_std=5,
+    )
+    # mini 桶 0,退款 10 点不能变负
+    repository.decrement_account_quota(account.id, model="seedance_v2.0_mini", by=10)
+
+    refreshed = Account.get_by_id(account.id)
+    assert refreshed.video_quota_used_mini == 0
+    # 退错了其它桶也不动
+    assert refreshed.video_quota_used_std == 5
+
+
+def test_decrement_account_quota_rejects_invalid_by(repository, temp_profile):
+    """v0.2.19:by 必须 >= 1,跟 increment 保持对称。"""
+    import pytest
+    account = Account.create(
+        id="acc-bad-refund", display_name="br", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+    with pytest.raises(ValueError, match="decrement by must be >= 1"):
+        repository.decrement_account_quota(account.id, model="seedance_v2.0_mini", by=0)
+    with pytest.raises(ValueError, match="decrement by must be >= 1"):
+        repository.decrement_account_quota(account.id, model="seedance_v2.0_mini", by=-5)
+
+
+def test_decrement_account_quota_rejects_unknown_model(repository, temp_profile):
+    """v0.2.19:非法 model 抛 ValueError(避免悄悄退错桶)。"""
+    import pytest
+    account = Account.create(
+        id="acc-nk-refund", display_name="nk", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+    with pytest.raises(ValueError, match="unsupported model"):
+        repository.decrement_account_quota(account.id, model="bogus_model")
+
+
+def test_increment_then_decrement_is_net_zero(repository, temp_profile):
+    """v0.2.19:扣 10 点后退 10 点,桶回到原值。完整闭环。"""
+    account = Account.create(
+        id="acc-roundtrip", display_name="rt", doubao_user_id="u",
+        profile_dir=temp_profile,
+        video_quota_used_mini=7, video_quota_used_std=4,
+    )
+    repository.increment_account_quota(account.id, model="seedance_v2.0_mini", by=10)
+    assert Account.get_by_id(account.id).video_quota_used_mini == 17
+    repository.decrement_account_quota(account.id, model="seedance_v2.0_mini", by=10)
+    assert Account.get_by_id(account.id).video_quota_used_mini == 7
+    # 其它桶不动
+    assert Account.get_by_id(account.id).video_quota_used_std == 4

@@ -21,12 +21,12 @@ class SuccessfulVideoRunner:
 class StaticSettings:
     def get(self):
         return {
-            "daily_quota_mini": 5, "daily_quota_v2": 5, "daily_quota_std": 5,
+            "daily_quota_mini": 50, "daily_quota_v2": 50, "daily_quota_std": 50,
             "quota_reset_time": "00:00", "max_concurrency": 1,
         }
 
     def get_daily_quotas(self):
-        return {"mini": 5, "v2": 5, "std": 5}
+        return {"mini": 50, "v2": 50, "std": 50}
 
 
 @pytest.mark.asyncio
@@ -125,7 +125,7 @@ async def test_service_cools_limited_account_and_fails_over(repository, tmp_path
     saved = repository.get_video_task(task.id)
     assert saved.status == "succeeded"
     assert saved.account.id == "account-2"
-    assert Account.get_by_id("account-1").video_quota_used_mini == 5
+    assert Account.get_by_id("account-1").video_quota_used_mini == 50
     assert Account.get_by_id("account-1").video_limited_until is not None
 
 
@@ -732,3 +732,136 @@ async def test_concurrent_tasks_do_not_serialise_per_account(repository, tmp_pat
     earliest_end = min(end_times)
     for ts in end_times:
         assert ts - earliest_end < 0.05
+
+
+# --- v0.2.19:失败退还额度 ---
+
+
+class RefundableRunner:
+    """v0.2.19:模拟 runner.run() 在扣完 quota 之后、网络异常/违规失败。
+
+    `should_refund` 决定抛什么异常,以便单测覆盖 NETWORK/POLICY/INVALID 三类。
+    """
+
+    def __init__(self, *, failure_kind: str):
+        if failure_kind == "network":
+            self.exc = RuntimeError("网络请求超时(connect timeout)")
+        elif failure_kind == "policy":
+            self.exc = RuntimeError("生成内容中疑似包含侵权内容,换个主题再试试")
+        elif failure_kind == "invalid":
+            self.exc = RuntimeError("参数无效:图片格式错误")
+        elif failure_kind == "generation_failed":
+            # 不退款的一类 — 应保留 quota
+            self.exc = RuntimeError("视频生成失败")
+        else:
+            raise ValueError(f"unknown failure_kind: {failure_kind}")
+
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        # 先扣 quota(update(generating) → service 内部 increment_account_quota)
+        update(status="generating", conversation_id="conv-refund")
+        # 然后再抛失败 — 这模拟「扣款成功但豆包拒绝/网络断」的真实路径
+        raise self.exc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_kind, should_refund",
+    [
+        ("network", True),
+        ("policy", True),
+        ("invalid", True),
+        ("generation_failed", False),
+    ],
+)
+async def test_service_refunds_quota_on_refundable_failures(
+    repository, temp_profile, failure_kind, should_refund
+):
+    """v0.2.19:NETWORK / POLICY_VIOLATION / INVALID_INPUT 失败时,退还已扣 quota。
+    GENERATION_FAILED 不退(豆包很可能已经计费)。
+    """
+    Account.create(
+        id="acc-refund", display_name="refund", doubao_user_id="u-refund",
+        profile_dir=temp_profile,
+    )
+    runner = RefundableRunner(failure_kind=failure_kind)
+    service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
+
+    # mini 5s = 5 点,cost = quota_cost("seedance_v2.0_mini", 5) = 5
+    task = service.start(f"{failure_kind} 测试", "seedance_v2.0_mini", "1:1", 5)
+    # generation_failed 走 revise_prompt 路径,会触发 2 次重试;
+    # 用 5s 留点余量
+    await asyncio.wait_for(service._tasks[task.id], timeout=5)
+
+    saved = repository.get_video_task(task.id)
+    assert saved.status == "failed"
+    acc = Account.get_by_id("acc-refund")
+    if should_refund:
+        # 扣了 5 点,失败后退还 5 点 → 净 0
+        assert acc.video_quota_used_mini == 0, (
+            f"{failure_kind} 应该退款,但 mini 桶 = {acc.video_quota_used_mini}"
+        )
+    else:
+        # generation_failed 不退。revise_prompt 路径会跑 max_attempts=2 次重试,
+        # 每次扣 5 点(5s × 1.0/s),所以累计 15 点不退。
+        assert acc.video_quota_used_mini == 15, (
+            f"{failure_kind} 不该退款,但 mini 桶 = {acc.video_quota_used_mini}"
+        )
+
+
+class RefundAfterRetryRunner:
+    """v0.2.19:违规失败 → 退款 + 改 prompt 重试,每次失败都退。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        self.calls += 1
+        update(status="generating", conversation_id=f"conv-{self.calls}")
+        # max_attempts=2 → service 会跑 3 次: 1 次原始 + 2 次重试,都抛违规
+        raise RuntimeError("生成内容中疑似包含侵权内容,换个主题再试试")
+
+
+@pytest.mark.asyncio
+async def test_service_refunds_quota_on_each_retry_attempt(repository, temp_profile):
+    """v0.2.19:违规改 prompt 重试时,每次失败都退 — 不然用户同一 prompt 被扣两次。"""
+    Account.create(
+        id="acc-retry-refund", display_name="retry", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+    runner = RefundAfterRetryRunner()
+    service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
+
+    task = service.start("违规测试", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=5)
+
+    # runner 被调 3 次:1 次原始 + max_attempts=2 次重试,每次都失败
+    assert runner.calls == 3
+    acc = Account.get_by_id("acc-retry-refund")
+    # 扣 3 次 5 点,退 3 次 5 点 → 净 0
+    assert acc.video_quota_used_mini == 0
+
+
+class FailBeforeGeneratingRunner:
+    """v0.2.19:runner 抛异常前没调用 update(generating) → quota 没扣 → 退款 noop。"""
+
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        # 模拟「profile 加载失败」这种 — runner 没机会走到 generating
+        raise RuntimeError("profile 加载失败:路径不存在")
+
+
+@pytest.mark.asyncio
+async def test_service_refund_noop_when_quota_was_not_charged(repository, temp_profile):
+    """v0.2.19:runner 在扣 quota 之前就抛了 → 退款路径要安全 noop,桶不动。"""
+    Account.create(
+        id="acc-noref", display_name="noref", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+    runner = FailBeforeGeneratingRunner()
+    service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
+
+    task = service.start("前置失败", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    acc = Account.get_by_id("acc-noref")
+    # 桶没扣(没到 generating),decrement noop 后也是 0
+    assert acc.video_quota_used_mini == 0

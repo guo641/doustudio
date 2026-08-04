@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from doupool.db.models import Account, VideoTask
 from doupool.db.repository import AccountRepository
-from doupool.prompt_reviser import classify_failure, revise_prompt
+from doupool.prompt_reviser import FailureKind, classify_failure, revise_prompt
 from doupool.prompt_parser import split_by_segment_markers
 from doupool import callbacks as callbacks_mod
 from doupool.watermark import (
@@ -546,18 +546,55 @@ class VideoTaskService:
                     return
                 self.repository.update_video_task(task_id, status="starting", error_message=None)
                 quota_recorded = False
+                recorded_cost = 0
 
                 def update(**values) -> None:
-                    nonlocal quota_recorded
+                    nonlocal quota_recorded, recorded_cost
                     if values.get("status") == "generating" and not quota_recorded:
                         # v0.2.11:按 model + duration 算 cost,扣对应桶。
                         # 非法 duration 走兜底 max(1, duration)。
-                        cost = quota_cost(task.model, int(task.duration))
+                        recorded_cost = quota_cost(task.model, int(task.duration))
                         self.repository.increment_account_quota(
-                            account.id, model=task.model, by=cost
+                            account.id, model=task.model, by=recorded_cost
                         )
                         quota_recorded = True
                     self.repository.update_video_task(task_id, **values)
+
+                def refund_quota_if_recorded() -> None:
+                    # v0.2.19:失败退还额度(仅本 runner 调用的扣款)。
+                    # 同一个 except 块调用多次幂等 —— recorded_cost = 0 后再调
+                    # 直接 noop。Bucket 下界由 repository.decrement_account_quota
+                    # 用 max(0, used-by) 保证。
+                    nonlocal quota_recorded, recorded_cost
+                    if quota_recorded and recorded_cost > 0:
+                        try:
+                            self.repository.decrement_account_quota(
+                                account.id, model=task.model, by=recorded_cost
+                            )
+                            self.logger.warning(
+                                "失败退还额度 %d 点 (model=%s): %s",
+                                recorded_cost, task.model, account.id,
+                                extra={
+                                    "event": "video_quota_refunded",
+                                    "account_id": account.id,
+                                    "task_id": task_id,
+                                    "refunded": recorded_cost,
+                                },
+                            )
+                        except Exception as refund_exc:
+                            # 退款本身失败不能阻断主流程 —— 写日志,后续
+                            # 用户看账期对账时可能能发现问题。
+                            self.logger.exception(
+                                "失败退还额度出错(非致命): %s",
+                                refund_exc,
+                                extra={
+                                    "event": "video_quota_refund_failed",
+                                    "account_id": account.id,
+                                    "task_id": task_id,
+                                },
+                            )
+                        quota_recorded = False
+                        recorded_cost = 0
 
                 try:
                     image_paths = []
@@ -671,6 +708,9 @@ class VideoTaskService:
                     continue
                 except Exception as exc:
                     if cancellation.is_set():
+                        # 用户取消:扣款不退还 —— 用户进 generating 后取消,
+                        # 豆包已经在生成,额度已扣。这与「网络/prompt 违规退款」
+                        # 是两条独立路径:用户主动取消 ≠ 豆包拒绝服务。
                         self.repository.assign_video_task(task_id, None)
                         self.repository.update_video_task(
                             task_id, status="queued", error_message="应用已停止，等待下次继续"
@@ -678,6 +718,17 @@ class VideoTaskService:
                         return
                     # 分类失败 → 决定是否改写 prompt 后重试
                     failure = classify_failure(str(exc))
+                    # v0.2.19:网络异常 / 政策违规 / 无效输入 → 退还本 runner
+                    # 已扣的额度。GENERATION_FAILED / UNKNOWN / RATE_LIMITED
+                    # 不退 —— 前两类豆包大概率已计费,后者本来就是配额问题,
+                    # 已经在上面 mark_account_limited 路径里处理。
+                    if failure.kind in (
+                        FailureKind.NETWORK,
+                        FailureKind.POLICY_VIOLATION,
+                        FailureKind.INVALID_INPUT,
+                    ):
+                        refund_quota_if_recorded()
+
                     attempt = getattr(task, "prompt_retry_count", 0) or 0
                     max_attempts = int(settings.get("max_prompt_retries", 2))
                     if failure.revise_prompt and attempt < max_attempts:
