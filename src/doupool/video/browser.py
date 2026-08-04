@@ -626,39 +626,69 @@ class PlaywrightVideoRunner:
 
         第一次:launch_persistent_context + load_browser_context + 缓存
         后续:直接返回缓存
+
+        v0.2.20:anchor page 模式 —— 不关 init page,把它当 anchor 缓存。
+        Playwright 的 BrowserContext 在所有 page 关闭后会自动 close context,
+        一旦 context 进入 "0 page" 状态,后续 task 的 new_page() 就会
+        TargetClosedError。保留 anchor page 同时确保 context 一直活着,
+        也给后续 task 一个可复用的 doubao.com origin 页面,避免 about:blank
+        上 history.replaceState 抛 SecurityError。
         """
         key = str(profile_dir)
         async with self._lock_for(profile_dir):
-            if key not in self._contexts:
-                pw = await self._ensure_playwright()
-                context = await pw.chromium.launch_persistent_context(
-                    str(profile_dir),
-                    **_build_launch_kwargs(),
-                )
-                # 必须先打开 doubao.com 拿到 aegis 风控指纹,否则
-                # COMPLETION_SCRIPT 会被字节拒为 1011(用户未登录)。
-                page = context.pages[0] if context.pages else await context.new_page()
-                await page.goto(
-                    "https://www.doubao.com/chat/",
-                    wait_until="domcontentloaded",
-                    timeout=30_000,
-                )
-                await page.wait_for_timeout(2_000)
-                # 抽完整 TokenBundle 缓存起来
-                bundle = await load_browser_context(page, context, pc_version=pc_version)
-                # 把 init page 关掉,让后续 task 自己 new_page。
-                # context 里的 cookies / localStorage 都还在。
-                await page.close()
-                self._contexts[key] = context
-                self._tokens[key] = bundle
-            return self._contexts[key], self._tokens[key]
+            existing = self._contexts.get(key)
+            if existing is not None:
+                # context 可能被 Playwright 自动 close 了(context 全 page 关掉)
+                # 或被外部 close 了(用户手关窗口 / 进程重启)。先探一下。
+                try:
+                    is_closed = existing.is_closed()
+                except Exception:
+                    is_closed = True
+                if not is_closed:
+                    return existing, self._tokens[key]
+                # 已 close → 清掉缓存走完整重建流程
+                self._contexts.pop(key, None)
+                self._tokens.pop(key, None)
+
+            pw = await self._ensure_playwright()
+            context = await pw.chromium.launch_persistent_context(
+                str(profile_dir),
+                **_build_launch_kwargs(),
+            )
+            # 必须先打开 doubao.com 拿到 aegis 风控指纹,否则
+            # COMPLETION_SCRIPT 会被字节拒为 1011(用户未登录)。
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.goto(
+                "https://www.doubao.com/chat/",
+                wait_until="domcontentloaded",
+                timeout=30_000,
+            )
+            await page.wait_for_timeout(2_000)
+            # 抽完整 TokenBundle 缓存起来
+            bundle = await load_browser_context(page, context, pc_version=pc_version)
+            # v0.2.20:不关 init page —— 保留作 anchor。context 全 page 关闭
+            # 会触发 Playwright 自动 close context,后续 task 就废了。
+            self._contexts[key] = context
+            self._tokens[key] = bundle
+            return context, bundle
 
     async def close(self) -> None:
         """v0.2.19:关闭所有共享 BrowserContext + Playwright 实例。
         service.shutdown() 调用一次即可。
+
+        v0.2.20:context 关闭前先关掉所有 anchor pages,Playwright 才会
+        真正释放 context。否则 context 会因 "还有 page 存活" 保持开启,
+        Chromium 进程不退出,占用 profile_dir 的 Lockfile 直到下次 GC。
         """
-        for context in self._contexts.values():
+        for key, context in list(self._contexts.items()):
             try:
+                # 先关 page,再关 context;不要被个别失败阻塞其余账号
+                for page in list(context.pages):
+                    try:
+                        if not page.is_closed():
+                            await page.close()
+                    except Exception:
+                        pass
                 await context.close()
             except Exception:
                 pass
@@ -750,8 +780,39 @@ class PlaywrightVideoRunner:
         context, token_bundle = await self._get_shared_context(
             profile_dir, pc_version=pc_version
         )
-        page = context.pages[0] if context.pages else await context.new_page()
+        # v0.2.20:复用 anchor page(共享 BrowserContext 时由 _get_shared_context
+        # 保留的那个页面)。如果 anchor 已被外部关了(用户手关窗口 / context
+        # 被 Playwright 自动 close 后我们 fallback new_page),就 new_page。
+        # 无论哪条路,后续 replaceState 都需要文档有 doubao.com origin。
+        page = None
+        for candidate in context.pages:
+            try:
+                if not candidate.is_closed():
+                    page = candidate
+                    break
+            except Exception:
+                continue
+        if page is None:
+            try:
+                page = await context.new_page()
+            except Exception as exc:
+                # context 已 close → 退一层,清掉缓存让下一次重试时重建
+                self._contexts.pop(str(profile_dir), None)
+                self._tokens.pop(str(profile_dir), None)
+                raise RuntimeError(f"视频浏览器窗口已关闭,请重新打开后重试:{exc}") from exc
         try:
+            # v0.2.20:保险 —— 如果 anchor 是 about:blank(用户从 login profile
+            # 拉过一次然后关窗,我们用另一个 instance 重启了 context 的场景),
+            # 显式重定向到 doubao.com 让 history.replaceState 有合法 origin。
+            # recheck_result 早就这么做了,run() 漏了,v0.2.19 直接撞 SecurityError。
+            current_url = page.url
+            if current_url == "about:blank" or not current_url.startswith("https://www.doubao.com/"):
+                await page.goto(
+                    "https://www.doubao.com/chat/",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+                await page.wait_for_timeout(1_500)
             fingerprint = token_bundle.device_id or token_bundle.web_id
 
             uploaded_images: list[dict] = []

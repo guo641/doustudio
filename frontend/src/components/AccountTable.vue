@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue';
-import { UsersRound, Plus, RefreshCw, Trash2 } from '@lucide/vue';
+import { onMounted, onUnmounted, ref, watch } from 'vue';
+import { UsersRound, Plus, RefreshCw, Trash2, Globe2, Globe } from '@lucide/vue';
 import { DpBadge, DpButton, DpEmpty, DpPanel, DpSwitch, DpTable } from '@/ui';
 import {
   getWebMSSDKTokens,
   refreshWebMSSDKTokens,
+  openAccountBrowser,
+  closeAccountBrowser,
+  getAccountBrowserStatus,
   type WebMSSDKTokensResponse,
 } from '@/api';
 
@@ -44,6 +47,15 @@ const emit = defineEmits<{
 const tokenStatus = ref<Record<string, WebMSSDKTokensResponse | null>>({});
 const refreshing = ref<Record<string, boolean>>({});
 const refreshError = ref<Record<string, string>>({});
+
+// v0.2.20:「📂 打开浏览器」按钮状态 —— 哪些账号当前有 Chromium 窗口打开。
+// 后端用 profile_dir 做 registry,前端用轮询(browser-status)跟住状态。
+const browserOpen = ref<Record<string, boolean>>({});
+const browserBusy = ref<Record<string, boolean>>({});
+const browserError = ref<Record<string, string>>({});
+// 兜底兜底:open-browser 后端是异步起 Playwright,我们要周期 re-pull status
+// 才知道用户什么时候自己关了窗口。每 3 秒轮一次,只对正在打开的账号轮。
+let browserPollTimer: number | null = null;
 
 function remove(account: Account) {
   if (confirm(`确定删除账号“${account.display_name}”及其本地会话吗？`)) {
@@ -135,8 +147,95 @@ async function refreshOne(account: Account) {
   }
 }
 
+// v0.2.20:复用账号 profile 拉起 Chromium 窗口。
+// 后端 Playwright 是异步的(daemon thread),服务端 202 后窗口已开始启动;
+// 我们立刻把状态设 true,启动轮询定时器,过几秒跟真实状态对一下。
+async function openBrowser(account: Account) {
+  browserBusy.value[account.id] = true;
+  browserError.value[account.id] = '';
+  try {
+    await openAccountBrowser(account.id);
+    browserOpen.value[account.id] = true;
+    startBrowserPolling();
+  } catch (err) {
+    browserError.value[account.id] = String(err);
+  } finally {
+    browserBusy.value[account.id] = false;
+  }
+}
+
+async function closeBrowser(account: Account) {
+  browserBusy.value[account.id] = true;
+  browserError.value[account.id] = '';
+  try {
+    await closeAccountBrowser(account.id);
+    browserOpen.value[account.id] = false;
+  } catch (err) {
+    browserError.value[account.id] = String(err);
+  } finally {
+    browserBusy.value[account.id] = false;
+  }
+}
+
+// v0.2.20:轮询「窗口是否还开着」。只在有窗口打开的账号上跑,避免无意义请求。
+// 后端 Playwright 一旦 context 关掉,cancel event set → thread 退出 →
+// registry.unregister。所以即使用户点叉叉,我们 3s 内也能跟住。
+async function pollBrowserStatus() {
+  const openIds = Object.entries(browserOpen.value)
+    .filter(([, isOpen]) => isOpen)
+    .map(([id]) => id);
+  if (!openIds.length) {
+    if (browserPollTimer != null) {
+      window.clearInterval(browserPollTimer);
+      browserPollTimer = null;
+    }
+    return;
+  }
+  await Promise.all(
+    openIds.map(async (id) => {
+      try {
+        const res = await getAccountBrowserStatus(id);
+        if (browserOpen.value[id] && !res.open) {
+          // 状态变更(用户主动关掉 / 异常退出),前端跟住
+          browserOpen.value[id] = false;
+        }
+      } catch {
+        // 单个失败不影响其他账号的轮询
+      }
+    }),
+  );
+}
+
+function startBrowserPolling() {
+  if (browserPollTimer != null) return;
+  browserPollTimer = window.setInterval(pollBrowserStatus, 3000);
+}
+
 onMounted(() => {
   if (props.accounts?.length) loadTokenStatus(props.accounts);
+});
+
+// v0.2.20:页面挂载时拉一遍 baseline 状态,避免「之前打开过的窗口」按钮文案错。
+// (用户在前一个页面开过浏览器,跳回来应该看到按钮是「关闭」状态)
+onMounted(async () => {
+  await Promise.all(
+    (props.accounts ?? []).map(async (acc) => {
+      try {
+        const res = await getAccountBrowserStatus(acc.id);
+        browserOpen.value[acc.id] = res.open;
+      } catch {
+        /* 单个失败不阻断其他账号 */
+      }
+    }),
+  );
+  startBrowserPolling();
+});
+
+onUnmounted(() => {
+  if (browserPollTimer != null) {
+    window.clearInterval(browserPollTimer);
+    browserPollTimer = null;
+  }
 });
 
 // 父级换账号列表(添加 / 删除 / 刷新)时,重新拉 token 状态。
@@ -263,6 +362,29 @@ watch(
             <div class="row-actions">
               <DpButton
                 size="sm"
+                :variant="browserOpen[account.id] ? 'solid' : 'ghost'"
+                :disabled="!!browserBusy[account.id]"
+                :aria-label="browserOpen[account.id]
+                  ? `关闭 ${account.display_name} 的浏览器窗口`
+                  : `打开 ${account.display_name} 的浏览器窗口`"
+                @click="browserOpen[account.id] ? closeBrowser(account) : openBrowser(account)"
+              >
+                <component
+                  :is="browserOpen[account.id] ? Globe : Globe2"
+                  :size="12"
+                />
+                {{
+                  browserOpen[account.id]
+                    ? browserBusy[account.id]
+                      ? '关闭中…'
+                      : '🟢 关闭浏览器'
+                    : browserBusy[account.id]
+                      ? '打开中…'
+                      : '📂 打开浏览器'
+                }}
+              </DpButton>
+              <DpButton
+                size="sm"
                 :disabled="!!refreshing[account.id]"
                 :aria-label="`刷新 ${account.display_name} 的 token`"
                 @click="refreshOne(account)"
@@ -280,6 +402,9 @@ watch(
                 删除
               </DpButton>
             </div>
+            <small v-if="browserError[account.id]" class="token-hint error">
+              {{ browserError[account.id] }}
+            </small>
           </td>
         </tr>
       </tbody>

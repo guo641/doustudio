@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,11 +159,15 @@ class LoginService:
         runner: LoginRunner,
         profiles_dir: Path,
         timeout: float = 300,
+        # v0.2.20:扫码成功后,保持浏览器打开 N 秒让用户访问
+        # doubao.com/chat/ 生成 WebMSSDK token。0 = 关闭此功能(保留旧行为)。
+        keepalive_seconds: float = 30.0,
     ):
         self.repository = repository
         self.runner = runner
         self.profiles_dir = Path(profiles_dir)
         self.timeout = timeout
+        self.keepalive_seconds = keepalive_seconds
         self._active_attempt_id: str | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._queues: dict[str, asyncio.Queue[LoginEvent]] = {}
@@ -231,6 +236,42 @@ class LoginService:
             self._queues[attempt_id].put_nowait(
                 LoginEvent(attempt_id, "succeeded", "登录成功")
             )
+            # v0.2.20:keepalive —— 扫码成功后,runner 线程保持浏览器不关,
+            # 让用户在那个窗口里访问 doubao.com/chat/ 让 WebMSSDK 写入 token。
+            # runner 内部阻塞到 keepalive_seconds 自然结束 / 用户取消。
+            # 这里 emit 一条 keepalive 事件给前端,前端显示倒计时。
+            keepalive_seconds = self.keepalive_seconds
+            if keepalive_seconds > 0:
+                self._machines[attempt_id].transition(LoginState.KEEPALIVE)
+                self._queues[attempt_id].put_nowait(LoginEvent(
+                    attempt_id,
+                    "keepalive",
+                    f"扫码成功,请在浏览器里访问 https://www.doubao.com/chat/ 主页停留 5-10 秒,"
+                    f"{int(keepalive_seconds)} 秒后自动关闭",
+                ))
+                # 等 runner 自然跑完 keepalive(它会被 cancel_event 打断或自然超时)
+                # runner_future 已 set_result,所以 await 立刻返回。我们需要一个
+                # 独立的 future 来等 runner 真正退 — 用 _await_runner_thread 等
+                # runner_thread.join。runner 跑完 finally close context 后,这条 join 返回。
+                # 但 await runner_future 已经返回,所以下面手动 wait 线程。
+                # 注:这里我们已知 keepalive 阶段 runner 还没退;其 finally 会在
+                # cancel_event set 后跳 finally。所以 race 是:emit keepalive →
+                # 30s 自然结束 / 用户 cancel → runner 跑完 → finally 关闭 context
+                # → thread 退出。我们只要等 thread.join 即可,然后 emit 收尾。
+                # 但 cancel_event 只在 user 主动 cancel 时 set;自然超时是
+                # runner 自己 stop loop,event 不会被 set。所以这里要主动给
+                # 一个新的 cancel timer —— 但实现上,runner 自己的 keepalive
+                # 时间到了就会 break loop 跳 finally,所以 thread 一定会 join 完。
+                self._await_runner_thread(runner_thread, runner_future, timeout=keepalive_seconds + 5)
+                # keepalive 走完,落回 SUCCEEDED 收尾
+                if self._machines[attempt_id].state is LoginState.KEEPALIVE:
+                    try:
+                        self._machines[attempt_id].transition(LoginState.SUCCEEDED)
+                    except Exception:
+                        pass
+                    self._queues[attempt_id].put_nowait(LoginEvent(
+                        attempt_id, "succeeded", "登录已完成"
+                    ))
         except (TimeoutError, asyncio.TimeoutError):
             cancellation.set()
             self._await_runner_thread(runner_thread, runner_future)

@@ -156,6 +156,31 @@ export async function refreshWebMSSDKTokens(accountId: string): Promise<WebMSSDK
   );
 }
 
+// v0.2.20:「📂 打开浏览器」按钮 —— 复用账号已有 login profile
+// 拉起 Chromium 窗口。同 profile_dir 已有窗口时服务端返回 409。
+export async function openAccountBrowser(accountId: string): Promise<{ ok: boolean; message: string }> {
+  return json(
+    await fetch(`/api/accounts/${accountId}/open-browser`, { method: 'POST', headers }),
+    '打开浏览器失败',
+  );
+}
+
+export async function closeAccountBrowser(
+  accountId: string,
+): Promise<{ ok: boolean; cancel_sent: boolean; message: string }> {
+  return json(
+    await fetch(`/api/accounts/${accountId}/close-browser`, { method: 'POST', headers }),
+    '关闭浏览器失败',
+  );
+}
+
+export async function getAccountBrowserStatus(accountId: string): Promise<{ open: boolean }> {
+  return json(
+    await fetch(`/api/accounts/${accountId}/browser-status`, { headers }),
+    '浏览器状态加载失败',
+  );
+}
+
 export function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();

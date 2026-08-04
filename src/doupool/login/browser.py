@@ -490,10 +490,13 @@ def wait_for_identity(
 
 
 class PlaywrightLoginRunner:
-    """v0.2.7:不再依赖 detector,直接走 yaonieyo 双轨判定。"""
+    """v0.2.7:不再依赖 detector,直接走 yaonieyo 双轨判定。
+    v0.2.20:扫码成功后 keepalive_seconds 秒内不关 context,
+    让用户在那个浏览器窗口里访问 doubao.com/chat/ 生成 WebMSSDK token。
+    """
 
-    def __init__(self):
-        pass
+    def __init__(self, keepalive_seconds: float = 30.0):
+        self.keepalive_seconds = keepalive_seconds
 
     def run(self, attempt_id, profile_dir: Path, emit, cancel_event: threading.Event):
         identity_ready = threading.Event()
@@ -558,6 +561,37 @@ class PlaywrightLoginRunner:
                     profile_dir=profile_dir,
                 )
                 emit("verifying", "已检测到登录，正在确认账号")
+                # v0.2.20:keepalive —— 保持浏览器窗口打开 N 秒,让用户
+                # 在里面访问 doubao.com/chat/ 让 WebMSSDK 写入 leveldb。
+                # 期间 Playwright 需要 pump 事件(用户操作/动画),所以
+                # 主线程不能 sleep —— 用 cancel_event.wait(timeout) 阻塞,
+                # Playwright sync API 在 wait 期间不主动 pump,但 context 是
+                # 真实 Chromium 进程,JS / 渲染照样跑。需要 pump 时我们
+                # 间隔调 active[0].wait_for_timeout(250)。
+                if self.keepalive_seconds > 0 and not cancel_event.is_set():
+                    _LOG.info(
+                        "login keepalive: 浏览器保持打开 %s 秒,请访问 doubao.com/chat/",
+                        self.keepalive_seconds,
+                    )
+                    end_at = _monotonic() + self.keepalive_seconds
+                    while not cancel_event.is_set():
+                        remaining = end_at - _monotonic()
+                        if remaining <= 0:
+                            break
+                        # 250ms 一片,既 pump Playwright 事件,又能即时响应 cancel
+                        active = get_active()
+                        if active:
+                            try:
+                                active[0].wait_for_timeout(250)
+                            except PlaywrightError:
+                                # page 在 keepalive 期间被用户手关 —— 抢救
+                                # cookies 后提前结束
+                                _try_rescue_for_fallback(context, profile_dir)
+                                break
+                        else:
+                            # 没有活动 page,context 自动 close 在即 —— 退出
+                            break
+                    _LOG.info("login keepalive: 窗口已结束")
                 return VerifiedLogin(identity.as_mapping(), str(profile_dir))
             finally:
                 _try_rescue_for_fallback(context, profile_dir)

@@ -13,6 +13,10 @@ class LoginState(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+    # v0.2.20:扫码成功后,留给用户 30 秒在那个浏览器窗口里访问
+    # doubao.com/chat/ 生成 WebMSSDK token 的窗口。keepalive 结束后
+    # 才进入 SUCCEEDED 终态。
+    KEEPALIVE = "keepalive"
 
 
 TERMINAL_STATES = {
@@ -44,6 +48,19 @@ ALLOWED = {
         LoginState.FAILED,
         LoginState.CANCELLED,
         LoginState.TIMED_OUT,
+    },
+    # v0.2.20:SUCCEEDED 可以暂时转 KEEPALIVE(扫码成功但浏览器还在),
+    # KEEPALIVE 必须回到 SUCCEEDED 才算终态。cancel / failed 也允许
+    # 从 KEEPALIVE 离开(用户在 30s 内点取消)。
+    LoginState.SUCCEEDED: {
+        LoginState.KEEPALIVE,
+        LoginState.FAILED,
+        LoginState.CANCELLED,
+    },
+    LoginState.KEEPALIVE: {
+        LoginState.SUCCEEDED,
+        LoginState.FAILED,
+        LoginState.CANCELLED,
     },
 }
 

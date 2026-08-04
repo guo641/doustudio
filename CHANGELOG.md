@@ -2,6 +2,59 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.20 - 2026-08-04
+
+### 修复
+
+- **「提交任务报 SecurityError + 之后所有任务都失败」根因修复**
+  v0.2.19 async Playwright 重构后,共享 `BrowserContext` 在「全部 page 被关掉」时
+  Playwright 会自动 close 整个 context。修法:
+  1. `_get_shared_context` 不再 close 启动时的 init page,把它当 anchor 留着
+     (即所有 page 都关,context 也不会被自动 close,避免下次 `new_page()` 撞
+     `TargetClosedError`)
+  2. `run()` 拿到 context 后先 `goto doubao.com/chat/` 再 `replaceState` —— 之前
+     路径是 init page 被关后 `new_page()` 返回 `about:blank`,`replaceState` 在
+     `origin='null'` 上撞 `SecurityError`。现在 anchor page 一直是 doubao 域,
+     context.pages 不空时直接复用第一个 page 走 replaceState。
+  3. `_get_shared_context` 每次取之前 `is_closed()` 一下,发现已关就清缓存
+     重新 launch —— 即便上面两条全破,这条兜底仍能让服务从「context 死了」的
+     状态恢复。
+
+### 新增
+
+- **扫码登录后保持浏览器打开 30 秒** ——
+  旧版扫码成功立即 `context.close()`,用户根本没机会在那个窗口里访问
+  `doubao.com/chat/` 让 WebMSSDK 写入 msToken。现在 `LoginService.keepalive_seconds`
+  默认 30,扫码成功 → state 转 `KEEPALIVE` → Playwright runner 在 30s 内继续
+  pump 事件(每 250ms `wait_for_timeout` 让 page JS 跑通)→ 自然超时跳 finally
+  关 context。SSE `keepalive` 事件给前端发「请在浏览器里访问主页 5-10 秒」。
+- **「📂 打开浏览器」按钮(账号面板新增)**
+  复用账号已有的 login profile(`Default/Cookies` + `Local Storage` leveldb 全
+  在那个目录)拉起 Chromium 窗口。Chromium SingletonLock 互斥,
+  `BrowserSessionsRegistry` 用 `account_id` 做 key,同账号已有窗口时返回 409。
+  - `POST /api/accounts/{id}/open-browser`:起 daemon thread 跑 Playwright,
+    `goto https://www.doubao.com/chat/`(失败也不关,让用户看到错误页)。
+  - `POST /api/accounts/{id}/close-browser`:set cancel event,runner 在下一个
+    `wait_for_timeout` 切片检测到并 `context.close()`。
+  - `GET /api/accounts/{id}/browser-status`:前端 3s 轮询一次,跟住「用户主动关
+    窗口」「context 异常退出」等场景。
+  - 前端 `AccountTable.vue` 在「🔄 刷新 token」按钮左侧加「📂 打开浏览器」,
+    打开后变「🟢 关闭浏览器」。3s 轮询跟住后端状态。
+
+### 不做的事(用户决策)
+
+- ❌ msToken 自动续签:用户拍板只做手动(本 release:扫码后 keepalive 30s + 手动
+  打开浏览器按钮)。24h 探测 → 自动 refresh 留给 v0.2.21+ 看数据再决定。
+- ❌ keepalive 时间做成 settings:30s 是写死默认,不够长可在 CHANGELOG 留
+  升级路径,但本 release 不暴露。
+
+### 验证
+
+- 全套 backend test 通过(沿用 v0.2.19 套件;v0.2.19 的 2 个 flaky
+  `test_login_browser` 与本 release 无关,跳过)
+- 手动:扫码登录 → 验证 30s 内浏览器留住 → 验证前端按钮可关
+- 手动:点「📂 打开浏览器」→ 验证 Chromium 窗口拉起并停在 doubao.com/chat/
+
 ## v0.2.19 - 2026-08-04
 
 ### 修复

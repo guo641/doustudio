@@ -726,3 +726,200 @@ def test_refresh_tokens_requires_auth(repository, tmp_path):
     response = client.post("/api/accounts/anything/refresh-tokens")
 
     assert response.status_code == 401
+
+
+# ============================================================
+# v0.2.20:open-browser / close-browser / browser-status 端点
+# ============================================================
+
+
+class _FakeOpenBrowserCtx:
+    """open-browser 用的 fake Chromium context —— 让 _open_browser_runner 自然退出。"""
+
+    def __init__(self):
+        self.pages = []
+
+    def on(self, event, handler):
+        pass
+
+    def new_page(self):
+        class _P:
+            url = ""
+
+            def is_closed(self):
+                return True
+
+            def on(self, *args, **kwargs):
+                pass
+
+            def goto(self, *args, **kwargs):
+                pass
+
+            def wait_for_timeout(self, ms):
+                pass
+
+        p = _P()
+        self.pages.append(p)
+        return p
+
+    def close(self):
+        pass
+
+
+class _FakeOpenBrowserPW:
+    """open-browser 用的 fake sync_playwright —— 让 runner 拿到 fake context。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    @property
+    def chromium(self):
+        return self
+
+    def launch_persistent_context(self, profile_dir, **kwargs):
+        assert kwargs["headless"] is False
+        # open-browser 必须非隐身(不要 -2400,-2400 那套),让用户能看到窗口
+        assert "--window-position=-2400,-2400" not in (kwargs.get("args") or [])
+        return _FakeOpenBrowserCtx()
+
+
+def test_open_browser_returns_202_and_starts_runner(
+    repository, tmp_path, temp_profile, monkeypatch,
+):
+    """v0.2.20:open-browser 202 + 触发 Playwright runner 在后台跑(用 fake 验证
+    runner 真起 + 端点不阻塞)。
+    """
+    from doupool.db.models import Account
+
+    account = Account.create(
+        id="acc-open-1", display_name="可打开", doubao_user_id="open-user",
+        profile_dir=temp_profile,
+    )
+
+    monkeypatch.setattr(
+        "doupool.api.app.sync_playwright",
+        lambda: _FakeOpenBrowserPW(),
+    )
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(f"/api/accounts/{account.id}/open-browser", headers=headers)
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["account_id"] == account.id
+    assert "浏览器窗口已启动" in payload["message"]
+
+    # cleanup:runner thread 自己会退出(get_active() 返回空 → break),但保险起见
+    # 再调一次 close-browser 让 registry 状态干净。
+    client.post(f"/api/accounts/{account.id}/close-browser", headers=headers)
+
+
+def test_open_browser_404_when_account_missing(repository, tmp_path):
+    """v0.2.20:打开不存在的账号 → 404。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.post(
+        "/api/accounts/missing/open-browser",
+        headers={"X-DouPool-Token": "secret"},
+    )
+    assert response.status_code == 404
+
+
+def test_open_browser_409_when_profile_dir_missing(
+    repository, tmp_path, monkeypatch,
+):
+    """v0.2.20:账号存在但 profile_dir 被删了 → 409 引导用户重新登录。"""
+    from doupool.db.models import Account
+
+    ghost_dir = tmp_path / "ghost-profile"
+    # 不创建,Account.profile_dir 指向不存在目录
+    account = Account.create(
+        id="acc-ghost", display_name="幽灵账号", doubao_user_id="ghost-user",
+        profile_dir=ghost_dir,
+    )
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(f"/api/accounts/{account.id}/open-browser", headers=headers)
+    assert response.status_code == 409
+    assert "profile 目录不存在" in response.json()["detail"]
+
+
+def test_open_browser_requires_auth(repository, tmp_path):
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    response = client.post("/api/accounts/anything/open-browser")
+    assert response.status_code == 401
+
+
+def test_browser_status_reflects_registry_state(repository, tmp_path):
+    """v0.2.20:browser-status 跟住 registry,没窗口 → open=False。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.get(
+        "/api/accounts/never-opened/browser-status",
+        headers={"X-DouPool-Token": "secret"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"account_id": "never-opened", "open": False}
+
+
+def test_close_browser_returns_cancel_sent_false_for_unknown_account(repository, tmp_path):
+    """v0.2.20:close-browser 调从未打开过的账号 → ok=True + cancel_sent=False。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(
+        "/api/accounts/never-touched/close-browser", headers=headers
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["cancel_sent"] is False
+    assert "没有打开的浏览器窗口" in payload["message"]
+
+
+def test_open_then_close_browser_lifecycle(
+    repository, tmp_path, temp_profile, monkeypatch,
+):
+    """v0.2.20:open → status=open=True → close → status=open=False。"""
+    from doupool.db.models import Account
+
+    account = Account.create(
+        id="acc-lifecycle", display_name="生命周期", doubao_user_id="lc-user",
+        profile_dir=temp_profile,
+    )
+
+    monkeypatch.setattr(
+        "doupool.api.app.sync_playwright",
+        lambda: _FakeOpenBrowserPW(),
+    )
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    # open
+    open_resp = client.post(
+        f"/api/accounts/{account.id}/open-browser", headers=headers
+    )
+    assert open_resp.status_code == 202
+
+    # close
+    close_resp = client.post(
+        f"/api/accounts/{account.id}/close-browser", headers=headers
+    )
+    assert close_resp.status_code == 200
+    assert close_resp.json()["cancel_sent"] is True

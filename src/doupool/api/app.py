@@ -5,6 +5,7 @@ import json
 import logging
 import secrets
 import shutil
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,6 +18,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from doupool.db.models import Account, LoginAttempt
+from doupool.login.browser_sessions import (
+    BrowserAlreadyOpen,
+    BrowserSession,
+    get_browser_sessions_registry,
+)
 from doupool.login.service import LoginAlreadyRunning
 from doupool.logging.setup import set_log_level
 from doupool.updater import check_for_update
@@ -146,6 +152,9 @@ def create_app(
         if video_service is not None and hasattr(video_service, "resume_queued"):
             await video_service.resume_queued()
         yield
+        # v0.2.20:app 退出时关掉所有「📂 打开浏览器」留下的窗口,避免
+        # Chromium 进程游离在系统里。
+        get_browser_sessions_registry().shutdown()
         if video_service is not None:
             await video_service.shutdown()
         await login_service.shutdown()
@@ -581,6 +590,183 @@ def create_app(
             **_token_bundle_dict(bundle, available=True),
             "hint": f"刷新成功,耗时 {elapsed:.1f}s",
         }
+
+    # v0.2.20:「📂 打开浏览器」按钮 ——
+    # 复用账号已有的 login profile(cookies / identity / WebMSSDK leveldb
+    # 缓存全在那个目录里)重新拉起一个可视化 Chromium 窗口,让用户可以在
+    # 那个窗口里访问 doubao.com/chat/ 生成 WebMSSDK token,
+    # 或者只是随便看一下自己的登录态。窗口会一直留着,直到用户主动关掉
+    # 或前端调 close-browser。同 profile_dir 互斥,避免 Chromium
+    # SingletonLock 冲突。
+
+    def _open_browser_runner(account_id: str, profile_dir: Path, cancel: threading.Event) -> None:
+        """在独立 daemon 线程里跑 Playwright,直到 cancel 或 context 自然关闭。
+
+        必须用 sync_playwright() + chromium.launch_persistent_context,与登录
+        runner 一致 —— 用同一个 profile_dir 才能让 cookies / identity / leveldb
+        完全复用,不要走 _build_launch_kwargs 的「视频提交专用 stealth args」,
+        用户打开浏览器就是要用正常 UI,不是隐身爬虫。
+
+        active_pages 监听模式参考 login/browser.py:_on_initial_page_close,
+        所有页 close 时主动 cancel context 让 run() 自然返回。
+        """
+        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import Error as PlaywrightError
+
+        active_pages: list = []
+        lock = threading.Lock()
+
+        def add_page(page):
+            with lock:
+                if page not in active_pages:
+                    active_pages.append(page)
+
+        def remove_page(page):
+            with lock:
+                if page in active_pages:
+                    active_pages.remove(page)
+
+        def get_active():
+            with lock:
+                return [p for p in active_pages if not p.is_closed()]
+
+        context = None
+        try:
+            with sync_playwright() as pw:
+                context = pw.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    headless=False,
+                    viewport={"width": 1180, "height": 820},
+                    args=[
+                        # v0.2.20:用户手动打开浏览器窗口,不要再隐身到屏幕外。
+                        # refresh-tokens 用 -2400,-2400 是因为那种是 headless 模拟,
+                        # 这里是真的让人看。
+                        "--window-position=80,80",
+                        "--window-size=1180,820",
+                    ],
+                )
+                context.on("page", add_page)
+                initial = context.pages[0] if context.pages else context.new_page()
+                add_page(initial)
+
+                def _on_any_close(_payload):
+                    remove_page(initial if _payload == initial else _payload)
+                    # 所有 page 都被关掉,自然结束 run()
+                    if not get_active():
+                        cancel.set()
+
+                initial.on("close", _on_any_close)
+
+                try:
+                    initial.goto(
+                        "https://www.doubao.com/chat/",
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                except PlaywrightError as exc:
+                    logging.getLogger("doupool.api").warning(
+                        "打开浏览器:goto doubao.com 失败 account=%s err=%s",
+                        account_id, exc,
+                    )
+                    # 即使 goto 失败也留着窗口,让用户看到错误自己处理
+                    pass
+
+                # 用户主动关窗口 → cancel 被 set;或 API cancel-browser →
+                # cancel 被 set。两种都跳出循环,跑到 finally 关 context。
+                while not cancel.is_set():
+                    active = get_active()
+                    if not active:
+                        break
+                    try:
+                        active[0].wait_for_timeout(500)
+                    except PlaywrightError:
+                        # Playwright 自己已关掉(context close 后 page 失效),
+                        # 跳出即可
+                        break
+        except Exception:
+            logging.getLogger("doupool.api").exception(
+                "「📂 打开浏览器」runner 异常 account=%s", account_id
+            )
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+    @app.post("/api/accounts/{account_id}/open-browser", status_code=202)
+    async def open_browser(
+        account_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.20:复用账号已有的 login profile 拉起 Chromium 窗口。
+
+        设计:Playwright 跑在独立 daemon 线程,不阻塞 FastAPI 事件循环。
+        同 profile_dir 已有窗口时返回 409。线程结束(cancel / 用户关窗口 /
+        context 异常)后 registry 自动 unregister。
+        """
+        authorize(x_doupool_token, authorization)
+        account = Account.get_or_none(Account.id == account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        profile_dir = Path(account.profile_dir)
+        if not profile_dir.exists():
+            raise HTTPException(
+                status_code=409,
+                detail="账号 profile 目录不存在,请先重新登录",
+            )
+        registry = get_browser_sessions_registry()
+        cancel = threading.Event()
+        thread = threading.Thread(
+            target=_open_browser_runner,
+            args=(account_id, profile_dir, cancel),
+            name=f"open-browser-{account_id}",
+            daemon=True,
+        )
+        try:
+            registry.register(account_id, BrowserSession(thread, cancel, profile_dir))
+        except BrowserAlreadyOpen as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        thread.start()
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "message": "浏览器窗口已启动,关闭浏览器或调用 /close-browser 后自动结束",
+        }
+
+    @app.post("/api/accounts/{account_id}/close-browser")
+    def close_browser(
+        account_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.20:主动关掉 open-browser 打开的窗口。
+
+        cancel event set 之后 Playwright runner 会在下一个 wait_for_timeout
+        切片检测到并 close context,thread 自然退出,registry 自动 unregister。
+        """
+        authorize(x_doupool_token, authorization)
+        registry = get_browser_sessions_registry()
+        sent = registry.request_cancel(account_id)
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "cancel_sent": sent,
+            "message": "已通知浏览器关闭" if sent else "该账号没有打开的浏览器窗口",
+        }
+
+    @app.get("/api/accounts/{account_id}/browser-status")
+    def browser_status(
+        account_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.20:前端轮询当前账号的「打开浏览器」状态,以决定按钮显示
+        「打开」还是「关闭」。"""
+        authorize(x_doupool_token, authorization)
+        registry = get_browser_sessions_registry()
+        return {"account_id": account_id, "open": registry.is_open(account_id)}
 
     assets = frontend_dir / "assets"
     if assets.exists():
