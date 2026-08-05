@@ -2,6 +2,41 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.23 - 2026-08-05
+
+### 修复
+
+- **豆包新拒绝文案不再卡 5min「永远生成中」**
+  v0.2.22 加拒绝改写重试时,`_POLICY_PATTERNS` 只覆盖老文案
+  (`生成内容中疑似包含侵权` / `换个主题再试试` / `无法返回该内容` / `sensitive
+  content` 等)。豆包近期上线新通用模板 **`我暂时无法生成你要求的内容。请尝试
+  输入其他要求`** —— 一字不沾老 pattern,polling 拿到的 chain 一直返 None,
+  5min 后才被 `RuntimeError("视频生成超时")` 兜住。用户日志佐证:12:20 那条
+  任务超时前**没有任何** `video_content_rejected` / `video_content_reject_revise`
+  事件,正是「豆包说拒绝、软件还是生成中」的现场。
+  - `prompt_reviser._POLICY_PATTERNS` 补 5 条新模板:
+    `(我/抱歉.{0,30})?(暂时)?无法(生成|满足|响应|提供)`、
+    `不符合.*?(规范|准则|要求|政策|规定)`、`涉及.*?敏感`、
+    `重新描述(一下|后再)?试试`、`换个(要求|话题|方向|思路)再试试`。
+    第一条覆盖 8 种常见组合(用户截图的拒绝句首尾无外乎这几种)。
+  - 命中 → 立即抛 `DoubaoContentRejected` → 走 v0.2.22 的
+    `prompt_reviser.revise_prompt` 改写重试,不再超时。
+
+- **`max_reject_retries` 默认 0 → 2(拒绝类自动重试,quota 仍不浪费)**
+  v0.2.22 把改写重试做成 opt-in 是想保守,但用户真实反馈:「这种报错也是提示词
+  的问题,让豆包自己修改后重新生成就可以,除非是额度不够,剩下的报错都是提示
+  词的问题」 —— 拒绝类基本都改一改能过,默认关等于让用户每次手动开。改默认
+  2 = 1 次原 prompt + 2 次改写 = 3 次总尝试,基本够「剥离违规关键词 + 安全
+  模板兜底」(见 `revise_prompt` 的 `attempt >= 2 → safe template` 分支)。
+  - quota 安全:`prompt_reviser.classify_failure` 对 `RATE_LIMITED`
+    设 `revise_prompt=False`,额度耗尽时不会进 retry loop,扣 1 次 + 退款
+    走 `DoubaoRateLimited` 分支。runner 内部仍 clamp 到 0..3,setting 被
+    改成 100 也最多 3 次。
+  - 想完全关回 v0.2.21 行为的用户,设置里显式填 0。
+
+- 测试:`test_prompt_reviser.py` 加 8 个 parametrize case 覆盖新拒绝模板,
+  `test_video_protocol.py` 加 1 个 case 覆盖截图里的真实文案 → 52 tests pass。
+
 ## v0.2.22 - 2026-08-05
 
 ### 修复

@@ -25,6 +25,25 @@ class TestClassifyFailure:
         info = classify_failure("换个主题再试试")
         assert info.kind == FailureKind.POLICY_VIOLATION
 
+    # v0.2.23:豆包新文案「我暂时无法生成你要求的内容,请尝试输入其他要求」
+    # 此前不在 _POLICY_PATTERNS → polling 一直 None,5min 后才 timeout。
+    # 这些 case 是用户真实截图里的拒绝模板,必须命中 POLICY_VIOLATION
+    # 才能让 run() retry loop 触发 prompt 改写。
+    @pytest.mark.parametrize("msg", [
+        "我暂时无法生成你要求的内容。请尝试输入其他要求",
+        "抱歉,我无法满足你的请求",
+        "抱歉,暂时无法生成此类内容",
+        "我无法提供这个内容",
+        "抱歉,这个请求涉及敏感内容,无法生成",
+        "不符合平台内容规范,无法生成",
+        "内容不符合社区规范,请重新描述试试",
+        "换个要求再试试",
+    ])
+    def test_policy_violation_new_templates_v0_2_23(self, msg):
+        info = classify_failure(msg)
+        assert info.kind == FailureKind.POLICY_VIOLATION, f"missed: {msg!r}"
+        assert info.revise_prompt is True
+
     def test_rate_limited(self):
         info = classify_failure("今日免费额度已用完,请明天再来")
         assert info.kind == FailureKind.RATE_LIMITED

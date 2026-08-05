@@ -121,7 +121,7 @@ async function onCheckUpdate() {
             <option value="round_robin">轮询</option>
           </DpSelect>
         </DpField>
-        <!-- v0.2.22 Q1:豆包拒绝后自动改写 prompt 重试,默认关闭沿用 v0.2.21 行为 -->
+        <!-- v0.2.23:默认改为 2,拒绝类常见改写一次就过;想完全关闭显式设 0 -->
         <DpField label="豆包拒绝改写重试" for-id="setting-max-reject-retries">
           <DpInput
             id="setting-max-reject-retries"
@@ -130,7 +130,7 @@ async function onCheckUpdate() {
             :min="0"
             :max="3"
           />
-          <span class="watermark-hint">0=关闭(沿用 v0.2.21);1-3=改写最大重试次数</span>
+          <span class="watermark-hint">0=关闭(失败立即报错);1-3=改写最大重试次数(默认 2,quota 限流不会触发)</span>
         </DpField>
         <!-- v0.2.22 Q2:生成时 Chromium 窗口可见,默认隐藏。注意 Playwright launch_persistent_context
              创建后无法改 window-position,改动只对新 profile_dir / 重启进程生效 -->

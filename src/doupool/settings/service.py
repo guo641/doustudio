@@ -34,10 +34,15 @@ class SettingsService:
         "watermark_key": "",
         # 失败自动改 prompt 重试
         "max_prompt_retries": 2,
-        # v0.2.22 Q1:豆包内容审核拒绝后,自动改写 prompt 在同一 page 上重提交。
-        # 0 = 关闭(沿用 v0.2.21:收到拒绝立即 failed + 退款);>0 = 改写后最大
-        # 重试次数。runner 内部会限制 0..3,防止风控误判放大攻击。
-        "max_reject_retries": 0,
+        # v0.2.23 Q1:豆包内容审核拒绝后,自动改写 prompt 在同一 page 上重提交。
+        # 用户真实反馈:「这种报错也是提示词的问题,让豆包自己修改后重新生成
+        # 就可以,除非是额度不够」 —— 拒绝类基本都是 prompt 改一改能过的场景,
+        # 之前 v0.2.22 默认 0 等于让用户每次手动开,体感差。改默认 2:1 次原 prompt
+        # + 2 次改写 = 3 次总尝试,基本够「剥离违规关键词 + 安全模板兜底」。
+        # quota 限流走 RATE_LIMITED 分支(见 prompt_reviser),revise_prompt=False,
+        # 不浪费豆包次数。runner 内部仍 clamp 到 0..3,防止 setting 被改成 100 攻击。
+        # 想完全关掉此行为的用户(老 v0.2.21 习惯)显式设 0 即可。
+        "max_reject_retries": 2,
         # v0.2.22 Q2:视频生成时 Chromium 窗口是否显示在桌面。默认 False
         # 保持 v0.2.21 隐身行为(窗口放到屏幕外 -2000,-2000)。仅在
         # BrowserContext 首次创建时生效;cached context 复用前次位置,

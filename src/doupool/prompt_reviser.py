@@ -46,6 +46,20 @@ _POLICY_PATTERNS = [
     re.compile(r"内容可能违反.*?(?:规定|政策|法律)"),
     re.compile(r"sensitive content", re.IGNORECASE),
     re.compile(r"content.{0,20}violat", re.IGNORECASE),
+    # v0.2.23:豆包近期常用的「我无法生成你要求的内容」类通用拒绝模板。
+    # 此前只有「侵权 / 换个主题 / 无法返回该内容」会命中,新版拒绝文案
+    # 走 polling 一直返 None,要 5min 后才被 timeout 兜住,期间用户视角
+    # 「永远生成中」。把这些补上 → 立即触发 DoubaoContentRejected →
+    # max_reject_retries(默认 2)自动改写重试,而不是直接失败。
+    # 注:第一行覆盖「我无法生成/满足/响应/提供 / 抱歉我无法... / 暂时无法...」
+    # 等各种组合 —— 在豆包对话上下文里这几个动词基本只出现在拒绝场景,
+    # 误判代价低(改写一次不成功就 fall back safe template),漏判代价高(用户
+    # 卡 5 分钟),值得放宽。
+    re.compile(r"(?:我|抱歉.{0,30})?(?:暂时)?无法(?:生成|满足|响应|提供)"),
+    re.compile(r"不符合.*?(?:规范|准则|要求|政策|规定)"),
+    re.compile(r"涉及.*?敏感"),
+    re.compile(r"重新描述(?:一下|后再)?试试"),
+    re.compile(r"换个(?:要求|话题|方向|思路)再试试"),
 ]
 
 _RATE_LIMIT_PATTERNS = [

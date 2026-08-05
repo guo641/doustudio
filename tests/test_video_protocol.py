@@ -346,6 +346,23 @@ def test_parse_creation_result_raises_on_copyright_violation_text():
     assert "侵权" in excinfo.value.error_message
 
 
+def test_parse_creation_result_raises_on_new_rejection_template():
+    """v0.2.23:豆包新文案「我暂时无法生成你要求的内容」也要识别 —— 此前不在
+    _POLICY_PATTERNS → polling 一直 None → 5min 后才 timeout,期间用户视角
+    「永远生成中」。抛 DoubaoContentRejected 后,runner 会用 prompt_reviser
+    改写重试(max_reject_retries 默认 2)。"""
+    response = _wrap([{
+        "block_type": 10000,
+        "content": {"text_block": {"text": "我暂时无法生成你要求的内容,请尝试输入其他要求"}},
+    }])
+
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_creation_result(response)
+    # 错误信息里能看到原文片段(供 service 层记日志 + 退款标记)
+    assert "无法生成" in excinfo.value.error_message
+    assert excinfo.value.response_text
+
+
 def test_parse_creation_result_raises_on_creation_block_error_msg():
     """creation_block 失败状态附带的 error_msg / disallow_reason 也要识别。"""
     response = _wrap([{
