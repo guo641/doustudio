@@ -38,8 +38,14 @@ class TestClassifyFailure:
         "不符合平台内容规范,无法生成",
         "内容不符合社区规范,请重新描述试试",
         "换个要求再试试",
+        # v0.2.24:回归 + 新增 verb 「返回」(用户实拍:「您请求的内容无法返回」)。
+        # 之前 verb 集合只覆盖 生成/满足/响应/提供,漏「返回」导致另一类新文案
+        # 仍会卡 5min timeout。补上后 scan_sse_for_policy_rejection 就能识别。
+        "请重新描述一下再试试",
+        "很抱歉,您请求的内容无法返回",
+        "抱歉,此内容无法返回,请稍后再试",
     ])
-    def test_policy_violation_new_templates_v0_2_23(self, msg):
+    def test_policy_violation_new_templates_v0_2_24(self, msg):
         info = classify_failure(msg)
         assert info.kind == FailureKind.POLICY_VIOLATION, f"missed: {msg!r}"
         assert info.revise_prompt is True

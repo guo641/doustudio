@@ -310,6 +310,18 @@ def build_completion_payload(
 
 
 def parse_sse_ack(text: str) -> dict[str, str]:
+    """解析豆包 /chat/completion SSE 响应,返回 conversation / section / question_id。
+
+    v0.2.24:重构为「先把整个 SSE 流扫一遍、再 return」——
+    返回 ack 之前先扫所有 TEXT_* 包的 text_block.text,命中 `_POLICY_PATTERNS`
+    立即抛 `DoubaoContentRejected`。原因:豆包新版拒绝时,拒绝文案塞在
+    SSE `TEXT_MESSAGE` 事件里立刻发出,但后续 `/im/chain/single` 轮询永远
+    返 `creation_block.status=1`,`parse_creation_result` 看不见拒绝,
+    polling 卡到 5min timeout,用户视角「永远生成中」。在 SSE_ACK 解析之前
+    抢先识别 → run() retry loop 接住 → max_reject_retries 次自动改写重试。
+    """
+    seen_sse_ack = False
+    ack_payload: dict | None = None
     for packet in text.replace("\r\n", "\n").split("\n\n"):
         event = ""
         data = ""
@@ -329,15 +341,98 @@ def parse_sse_ack(text: str) -> dict[str, str]:
                 raise DoubaoRateLimited(message, text[:2000], is_risk_control=is_risk)
             raise RuntimeError(message)
         if event == "SSE_ACK":
+            ack_payload = json.loads(data)
+            seen_sse_ack = True
+
+    if not seen_sse_ack or ack_payload is None:
+        raise RuntimeError("豆包响应缺少 SSE_ACK")
+
+    # v0.2.24:ack 解析完之后、return 之前,扫一遍拒绝文案。reject 与
+    # SSE_ACK 同包到达 → 视为最终结果,直接抛(避免再 poll chain)。
+    rejection = scan_sse_for_policy_rejection(text)
+    if rejection is not None:
+        raise DoubaoContentRejected(rejection, response_text=text[:2000])
+
+    meta = ack_payload.get("ack_client_meta", {})
+    queries = ack_payload.get("query_list") or [{}]
+    return {
+        "conversation_id": str(meta.get("conversation_id", "")),
+        "section_id": str(meta.get("section_id", "")),
+        "question_id": str(queries[0].get("question_id", "")),
+    }
+
+
+def scan_sse_for_policy_rejection(sse_text: str) -> str | None:
+    """v0.2.24:扫描豆包 SSE 响应文本里的拒绝文案。
+
+    触发场景:豆包新版拒绝时,`/chat/completion` 的 SSE 流里会立刻发
+    `TEXT_MESSAGE` / `TEXT_CHUNK` 事件,正文是「我暂时无法生成你要求的内容,
+    请尝试输入其他要求」类拒绝模板。后续 `/im/chain/single` 轮询永远返
+    `creation_block.status=1`,`parse_creation_result` 看不见拒绝,
+    polling 卡到 5min timeout。
+
+    这里在 SSE_ACK 之前先扫一遍,把拒绝挡在 polling 之前 → run() retry
+    loop 接 DoubaoContentRejected → max_reject_retries 次自动改写重试。
+
+    扫描策略(防御性):
+    - 拆 `event:` / `data:` 双行包
+    - 跳过 SSE_ACK / STREAM_ERROR / SSE_HEARTBEAT(已由 parse_sse_ack 处理或无内容)
+    - 凡是 data 是 JSON,递归收集 text_block.text —— 适配 event 命名漂移
+      (Doubao 不同版本混用 TEXT_MESSAGE / TEXT_CHUNK / 无 event)
+    - 拼接所有 text → 跑 _POLICY_PATTERNS(复用,不再写新 regex)
+    - 返回首个命中的 match.group(0)[:200],未命中 None
+    """
+    chunks: list[str] = []
+
+    def _walk(payload: object) -> None:
+        """递归收集 payload 里所有 text_block.text 字符串。"""
+        if isinstance(payload, dict):
+            tb = payload.get("text_block")
+            if isinstance(tb, dict):
+                t = tb.get("text")
+                if isinstance(t, str) and t:
+                    chunks.append(t)
+            cbs = payload.get("content_block")
+            if isinstance(cbs, list):
+                for cb in cbs:
+                    _walk(cb)
+            content = payload.get("content")
+            if isinstance(content, dict):
+                _walk(content)
+            msg = payload.get("message")
+            if isinstance(msg, dict):
+                _walk(msg)
+        elif isinstance(payload, list):
+            for item in payload:
+                _walk(item)
+
+    for packet in sse_text.replace("\r\n", "\n").split("\n\n"):
+        event = ""
+        data = ""
+        for line in packet.splitlines():
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data += line[5:].strip()
+        if not data or data == "{}":
+            continue
+        # 已由 parse_sse_ack 处理的事件不要重复扫
+        if event in {"SSE_ACK", "STREAM_ERROR", "SSE_HEARTBEAT"}:
+            continue
+        try:
             payload = json.loads(data)
-            meta = payload.get("ack_client_meta", {})
-            queries = payload.get("query_list") or [{}]
-            return {
-                "conversation_id": str(meta.get("conversation_id", "")),
-                "section_id": str(meta.get("section_id", "")),
-                "question_id": str(queries[0].get("question_id", "")),
-            }
-    raise RuntimeError("豆包响应缺少 SSE_ACK")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        _walk(payload)
+
+    if not chunks:
+        return None
+    combined = "\n".join(chunks)
+    for pat in _POLICY_PATTERNS:
+        m = pat.search(combined)
+        if m:
+            return m.group(0)[:200]
+    return None
 
 
 def parse_creation_result(response: dict) -> dict[str, str] | None:

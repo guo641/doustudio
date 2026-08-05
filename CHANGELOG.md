@@ -2,6 +2,41 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.24 - 2026-08-05
+
+### 修复
+
+- **v0.2.23 漏修:拒绝文案仍然卡 5min「永远生成中」**
+  v0.2.23 在 `_POLICY_PATTERNS` 补了 5 条新模板,但**忘了**真正的扫描点在
+  哪里:`parse_creation_result` 读的是 `/im/chain/single` 端点,而豆包新拒绝
+  行为是:
+  1. `/chat/completion` SSE 流**立刻**发 `TEXT_MESSAGE` / `TEXT_CHUNK` 事件,
+     正文是拒绝文案(前端 React 实时渲染)
+  2. chain endpoint 永远只返 `creation_block.status=1`(还在生成),UI 上的
+     拒绝文本**不会**回流到 chain endpoint
+  3. `parse_creation_result` 看不见拒绝,polling 循环一直返 None,5min 后
+     `RuntimeError("视频生成超时")` 才把它标 failed
+
+  v0.2.23 用户的实测日志佐证:20:04:58 创建的任务,8 分钟里 `applog` 表
+  **没有任何** `video_content_rejected` / `video_content_reject_revise` 事件
+  → SSE 流完全没被扫描 → 正则再准也没用。
+  - `src/doupool/video/protocol.py:parse_sse_ack` 重构为「先把整个 SSE 流扫
+    一遍、再 return ack」;新增 `scan_sse_for_policy_rejection(text)` 拆
+    `event:` / `data:` 包,跳过 `SSE_ACK` / `STREAM_ERROR` / `SSE_HEARTBEAT`,
+    递归收集所有 `text_block.text` 拼起来跑 `_POLICY_PATTERNS`(复用,不再
+    写新 regex)。命中即抛 `DoubaoContentRejected(rejection, response_text=
+    text[:2000])`,被 `browser.run()` retry loop 接住 → 改写重试。
+  - `_POLICY_PATTERNS` 微调两处兜底:
+    - 动词补 `返回`(用户后续实拍:`很抱歉,您请求的内容无法返回`)
+    - `无法...生成` / `重新描述...试试` 之间允许 ≤5 个任意字符(包括 `\n`),
+      适配拒绝文案被拆成多个 `TEXT_CHUNK` 流式到达的场景
+
+- **`runner_window_visible` 默认 False → True(生成时浏览器可见)**
+  用户反馈:生成时看不到浏览器界面,不知道到底有没有在工作。
+  v0.2.22 引入 `runner_window_visible` 时默认 False 是为了「隐身行为」,
+  现在改为默认 True(用户视角优先)。窗口落在 `(80, 80)` 而非 `(-2000, -2000)`。
+  仍可在设置里手动关掉。`SettingsPage.vue` 提示文案同步更新。
+
 ## v0.2.23 - 2026-08-05
 
 ### 修复

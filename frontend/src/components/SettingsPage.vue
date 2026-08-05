@@ -132,8 +132,9 @@ async function onCheckUpdate() {
           />
           <span class="watermark-hint">0=关闭(失败立即报错);1-3=改写最大重试次数(默认 2,quota 限流不会触发)</span>
         </DpField>
-        <!-- v0.2.22 Q2:生成时 Chromium 窗口可见,默认隐藏。注意 Playwright launch_persistent_context
-             创建后无法改 window-position,改动只对新 profile_dir / 重启进程生效 -->
+        <!-- v0.2.24 Q2:生成时 Chromium 窗口可见,默认开启(用户反馈看不到
+             浏览器在工作)。Playwright launch_persistent_context 创建后无法
+             改 window-position,改动只对新 profile_dir / 重启进程生效。 -->
         <DpField label="显示 Chromium 窗口" for-id="setting-runner-window-visible" span2>
           <input
             id="setting-runner-window-visible"
@@ -142,8 +143,10 @@ async function onCheckUpdate() {
             class="checkbox"
           />
           <span class="watermark-hint">
-            开启后,视频生成时 Chromium 窗口会显示在屏幕 (80,80)。可能被风控识别为异常登录态,
-            生产建议关闭。修改后只对新启动的 profile / 重启进程生效。
+            开启后,视频生成时 Chromium 窗口会显示在屏幕 (80,80)。用户视角:能
+            看到浏览器在跑、确认有在生成。关闭则窗口放屏幕外 (-2000,-2000)。
+            可能被风控识别为异常登录态,生产建议关闭。修改后只对新启动的
+            profile / 重启进程生效。
           </span>
         </DpField>
       </div>

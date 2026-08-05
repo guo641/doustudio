@@ -43,11 +43,12 @@ class SettingsService:
         # 不浪费豆包次数。runner 内部仍 clamp 到 0..3,防止 setting 被改成 100 攻击。
         # 想完全关掉此行为的用户(老 v0.2.21 习惯)显式设 0 即可。
         "max_reject_retries": 2,
-        # v0.2.22 Q2:视频生成时 Chromium 窗口是否显示在桌面。默认 False
-        # 保持 v0.2.21 隐身行为(窗口放到屏幕外 -2000,-2000)。仅在
-        # BrowserContext 首次创建时生效;cached context 复用前次位置,
-        # 改 setting 后只对下次新建 context 生效。
-        "runner_window_visible": False,
+        # v0.2.24 Q2:视频生成时 Chromium 窗口是否显示在桌面。v0.2.22 默认
+        # False 是为了「隐身行为」(窗口放到屏幕外 -2000,-2000),但用户反馈
+        # 看不到界面不知道是不是在工作。改为默认 True(窗口落在 80,80),
+        # 仍可在设置里手动关。仅在 BrowserContext 首次创建时生效;cached
+        # context 复用前次位置,改 setting 后只对下次新建 context 生效。
+        "runner_window_visible": True,
         # v0.2.17:浏览器 PC 端版本号,被 video/browser.py 读取塞到
         # payload.client_meta.pc_version。不暴露前端(17-b 时一起加 UI),
         # 升级时只需改这里 + 重启服务。

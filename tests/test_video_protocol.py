@@ -427,3 +427,83 @@ def test_parse_creation_result_raises_on_sensitive_content_english():
 
     with pytest.raises(DoubaoContentRejected):
         parse_creation_result(response)
+
+
+# ---------- v0.2.24:SSE 内 TEXT_MESSAGE 拒绝文案实时检测 ----------
+
+
+def test_scan_sse_for_policy_rejection_detects_text_message():
+    """v0.2.24:豆包新版拒绝把文案塞 SSE TEXT_MESSAGE 事件 —— 必须在
+    parse_sse_ack 里就被识别,不等 5min timeout。"""
+    text = (
+        'event: SSE_HEARTBEAT\ndata: {}\n\n'
+        'event: TEXT_MESSAGE\ndata: {"content_block":[{"content":{'
+        '"text_block":{"text":"我暂时无法生成你要求的内容,请尝试输入其他要求"'
+        '}}}]}\n\n'
+        'event: SSE_ACK\ndata: {"ack_client_meta":{"conversation_id":"c1",'
+        '"section_id":"s1"},"query_list":[{"question_id":"q1"}]}\n\n'
+    )
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_sse_ack(text)
+    assert "无法生成" in excinfo.value.error_message
+    # raw SSE (≤2000 字符)透传进 response_text,跟 DoubaoRateLimited 一致
+    assert excinfo.value.response_text == text
+
+
+def test_scan_sse_for_policy_rejection_does_not_false_positive_on_benign_text():
+    """正常生成中消息(无 policy 关键词)必须不被误判为拒绝。"""
+    text = (
+        'event: TEXT_MESSAGE\ndata: {"content_block":[{"content":{'
+        '"text_block":{"text":"好的,正在为你生成视频,请稍候..."}}}]}\n\n'
+        'event: SSE_ACK\ndata: {"ack_client_meta":{"conversation_id":"c1",'
+        '"section_id":"s1"},"query_list":[{"question_id":"q1"}]}\n\n'
+    )
+    ack = parse_sse_ack(text)
+    assert ack == {
+        "conversation_id": "c1",
+        "section_id": "s1",
+        "question_id": "q1",
+    }
+
+
+def test_scan_sse_for_policy_rejection_concatenates_multiple_text_chunks():
+    """拒绝文案可能被拆成多个 TEXT_CHUNK 包,必须拼接后再扫描,不能漏。"""
+    text = (
+        'event: TEXT_CHUNK\ndata: {"content_block":[{"content":{'
+        '"text_block":{"text":"抱歉,我暂时无法"}}}]}\n\n'
+        'event: TEXT_CHUNK\ndata: {"content_block":[{"content":{'
+        '"text_block":{"text":"生成你要求的内容"}}}]}\n\n'
+        'event: SSE_ACK\ndata: {"ack_client_meta":{"conversation_id":"c1",'
+        '"section_id":"s1"},"query_list":[{"question_id":"q1"}]}\n\n'
+    )
+    with pytest.raises(DoubaoContentRejected):
+        parse_sse_ack(text)
+
+
+def test_scan_sse_for_policy_rejection_detects_new_return_verb():
+    """v0.2.24:动词集合补了「返回」 —— 命中「您请求的内容无法返回」。"""
+    text = (
+        'event: TEXT_MESSAGE\ndata: {"content_block":[{"content":{'
+        '"text_block":{"text":"很抱歉,您请求的内容无法返回,请尝试其他描述"'
+        '}}}]}\n\n'
+        'event: SSE_ACK\ndata: {"ack_client_meta":{"conversation_id":"c1",'
+        '"section_id":"s1"},"query_list":[{"question_id":"q1"}]}\n\n'
+    )
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_sse_ack(text)
+    assert "无法返回" in excinfo.value.error_message
+
+
+def test_parse_sse_ack_response_text_truncated_at_2000():
+    """v0.2.24:response_text 用 raw sse_text[:2000],跟 DoubaoRateLimited 一致。"""
+    long_data = '{"content_block":[{"content":{"text_block":{"text":"我暂时无法生成"}}}]}'
+    sse = (
+        f'event: TEXT_MESSAGE\ndata: {long_data}\n\n'
+        f'event: SSE_ACK\ndata: {{"ack_client_meta":{{"conversation_id":"c1",'
+        f'"section_id":"s1"}},"query_list":[{{"question_id":"q1"}}]}}\n\n'
+    )
+    padded = sse + ("\n# padding\n" * 5000)  # > 2000 chars
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_sse_ack(padded)
+    assert len(excinfo.value.response_text) <= 2000
+    assert "无法生成" in excinfo.value.response_text
