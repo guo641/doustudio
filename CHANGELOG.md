@@ -2,6 +2,71 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.22 - 2026-08-05
+
+### 修复
+
+- **「豆包内容审核拒绝」可自动改写 prompt 重试(默认关闭,opt-in)**
+  v0.2.21 收到豆包 `无法返回该内容 / 提示词侵权违规` 等政策文案立即
+  `failed + 退款`,用户反馈「软件应该自己改写一下重新生成」。新加 setting
+  「豆包拒绝改写重试」(0 = 关闭沿用 v0.2.21,1-3 = 改写最大重试次数)。
+  - `video/browser.py:run()` 把 submit+poll 抽到 `_submit_and_poll`,loop 外
+    层在 `run()` 里,共享同一个 page;`page.close()` 外移到 `finally`,retry
+    不重复创建 / 销毁 page。i2v 图片上传(`page.evaluate(UPLOAD_IMAGE_SCRIPT)`)
+    前置在 loop 外 —— 上传一次,retry 不重复上传。
+  - `prompt_reviser.classify_failure()` + `revise_prompt()`(v0.2.21 已存在
+    但未挂入主路径)现在被 `run()` 直接调用:catch `DoubaoContentRejected`
+    → `classify_failure` 判别 → `revise_prompt` 生成改写 prompt → 把
+    `error_message` 更新成「豆包拒绝(第 N/M 次改写重试中)」→ loop 继续。
+  - **quota 安全**:retry 期间 `update("generating")` 由 `_submit_and_poll`
+    触发,`update` 闭包有 `if values.get("status") == "generating" and not
+    quota_recorded` 闸门,只扣 1 次 quota。最后仍拒 → `refund_quota_if_recorded`
+    退 1 次。同 prompt 改写(无法改)→ 直接 raise,不再循环。
+  - 风控提示:连续多次 COMPLETION_SCRIPT 可能被 shark_admin 识别,生产建议
+    保持 0;只在调试 / 单账号时开到 2-3。
+
+- **视频生成时 Chromium 窗口可显示(opt-in,默认仍隐藏)**
+  旧版 `--window-position=-2000,-2000` 把 Chromium 窗口藏到屏幕外,用户调试
+  时看不到流程。新加 setting「显示 Chromium 窗口」,开启后 `_build_launch_kwargs`
+  把位置改成 `(80,80)`,窗口出现在屏幕左上角。
+  - **`launch_persistent_context` 创建后无法改 window-position**,改动只对
+    下次新 profile_dir / 重启进程生效。SettingsPage hint 里已标注。
+  - 默认 `False` 沿用 v0.2.21 隐身行为,生产建议保持关闭 —— 浏览器窗口可见
+    可能被风控识别为异常登录态。
+
+- **账号面板加「🔄 刷新额度」按钮 + 修首次进入不刷新 diff bug**
+  v0.2.21 任务终态后 4s 内的 quota 刷新只对停留在 `videos / results` 页的
+  用户生效。账号面板没有 4s 轮询,用户停在账号面板时 quota 永远不更新。
+  - 账号面板右上角加「🔄 刷新额度」按钮(`AccountTable.vue` 新增 `refresh`
+    emit),点击立刻 `refreshAccounts()`,无需切走再切回。
+  - **修 diff bug**:`App.vue:refreshTasks()` 原来把 `tasks.value = fresh`
+    放在 `hadTerminal` 构造之前。首次进入 videos 页时 `fresh` 即是首次数据,
+    `hadTerminal` 直接包含所有 task,`newTerminal` 永远空,`refreshAccounts()`
+    从不触发 → 后续从 videos 切到 accounts 也对不上。把 `hadTerminal` 构造
+    挪到 `tasks.value = fresh;` 之前,首次进入也能拿到正确的「新增终态」。
+  - 与 4s `refreshTasks` 节奏不冲突,按钮是手动补刀,不替代轮询。
+
+- **下载结果视频失败时自动重新解析签名 URL(同步端点)**
+  旧版 `task.result_url` 是豆包签名 CDN 链接,TTL 短(分钟-小时),几天后
+  失效 → 用户点下载 → `DownloadButton` 三层 fallback (cors → no-cors →
+  window.open) 全失败 → 系统 Edge 弹出 `ERR_INVALID_RESPONSE / 无法访问此页面`。
+  现在前端下载失败时自动 `POST /api/results/{task_id}/refresh-url`,后端
+  调 `runner.recheck_result(deadline=60s)` 重解析 CDN URL,**不消耗 quota、
+  不改 status、不发 callback、不跑 watermark**,只更新 `result_url /
+  fallback_result_url`,返回最新 task 给前端立即重试下载。
+  - `video/service.schedule_refresh_url()` + `_refresh_url_body()`:与
+    `retry_result` 共用 `_retry_tasks` / `_retry_cancellations` 池,并发走
+    `_lock_for(profile_dir)` 串行化。校验:`status != succeeded` → 409,
+    任务不存在 → 404,账号不可用 → 409。`refreshedResultIds` Set 防同一
+    task 短时间内被多次刷新。
+  - `DownloadButton.vue` 三层 fallback 全失败时不再 `throw`(throw 在 Vue
+    template event handler 里只能 Vue warn,用户无反馈),改成 `emit('download-failed')`
+    冒到 `App.vue:onResultDownloadFailed`。前端 toast 流程:launching「下载
+    链接已过期,正在重新获取…」→ succeeded「链接已刷新,请重新点击下载」 /
+    failed「已尝试刷新链接,仍无法下载」。
+  - 后端 endpoint `POST /api/results/{task_id}/refresh-url` 同步等待 body
+    跑完(最多 60s),返回更新后的完整 task dict。
+
 ## v0.2.21 - 2026-08-04
 
 ### 修复

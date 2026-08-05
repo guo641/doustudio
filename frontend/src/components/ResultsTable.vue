@@ -20,6 +20,10 @@ type ResultTask = {
 };
 
 defineProps<{ tasks: ResultTask[] }>();
+// v0.2.22 Q4:DownloadButton 三层 fallback 全失败时(reason 来自签名
+// CDN URL 过期),冒到 App.vue → onResultDownloadFailed → POST
+// /api/results/:id/refresh-url 重解析签名 URL。
+const emit = defineEmits<{ 'download-failed': [taskId: string] }>();
 
 // v0.2.11:去掉 seedance_v2.0(收费模型)label,std 改名为 Fast。
 // 如果有老任务用 v2,fallback 到原值给用户看,不静默消失。
@@ -88,6 +92,7 @@ function hasCleanVideo(task: ResultTask): boolean {
                 v-if="pickDownloadUrl(task)"
                 :href="pickDownloadUrl(task)!"
                 :filename="`doubao-${task.id}${hasCleanVideo(task) ? '-clean' : ''}.mp4`"
+                @download-failed="() => emit('download-failed', task.id)"
               >
                 <Download :size="12" />
                 {{ hasCleanVideo(task) ? '下载无水印' : '下载视频' }}

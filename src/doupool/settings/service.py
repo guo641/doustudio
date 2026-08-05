@@ -34,6 +34,15 @@ class SettingsService:
         "watermark_key": "",
         # 失败自动改 prompt 重试
         "max_prompt_retries": 2,
+        # v0.2.22 Q1:豆包内容审核拒绝后,自动改写 prompt 在同一 page 上重提交。
+        # 0 = 关闭(沿用 v0.2.21:收到拒绝立即 failed + 退款);>0 = 改写后最大
+        # 重试次数。runner 内部会限制 0..3,防止风控误判放大攻击。
+        "max_reject_retries": 0,
+        # v0.2.22 Q2:视频生成时 Chromium 窗口是否显示在桌面。默认 False
+        # 保持 v0.2.21 隐身行为(窗口放到屏幕外 -2000,-2000)。仅在
+        # BrowserContext 首次创建时生效;cached context 复用前次位置,
+        # 改 setting 后只对下次新建 context 生效。
+        "runner_window_visible": False,
         # v0.2.17:浏览器 PC 端版本号,被 video/browser.py 读取塞到
         # payload.client_meta.pc_version。不暴露前端(17-b 时一起加 UI),
         # 升级时只需改这里 + 重启服务。

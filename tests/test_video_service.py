@@ -940,3 +940,251 @@ async def test_content_rejected_skips_prompt_retry(repository, temp_profile):
     assert saved.prompt == "违规再测"
     # runner 只跑一次(没重试)
     assert runner.calls == 1
+
+
+# ---------- v0.2.22 Q1:内容审核拒绝自动改写 prompt 重试(opt-in,默认 0) ----------
+
+
+class ReviseMockRunner:
+    """v0.2.22 Q1:模拟 browser.py 中 PlaywrightVideoRunner 的内部 revise retry loop。
+
+    真实实现中,service._run_inner 调一次 self.runner.run(),runner.run 内部
+    while-loop 抓 DoubaoContentRejected → revise_prompt → _submit_and_poll 改
+    prompt 重提交,直到 max_reject_retries 用完。所以 service 视角下 self.runner.run()
+    只调 1 次;但每次 invoke 内部,run() 自己会触发 1+max_reject_retries 次
+    _submit_and_poll 等价物。
+
+    本 mock 把内部循环直接复制出来,以便不依赖真实 Playwright 即可测试整条路径。
+    """
+
+    def __init__(self, *, always_reject: bool, success_after: int = 0):
+        self.always_reject = always_reject
+        self.success_after = success_after  # 第 N 次调用时改成返回 success
+        self.service_calls = 0  # service → runner.run() 次数
+        self.internal_attempts = 0  # runner 内部 _submit_and_poll 等价物次数
+        self.prompts_seen: list[str] = []
+
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        self.service_calls += 1
+        max_reject_retries = int(kwargs.get("max_reject_retries", 0))
+        from doupool.prompt_reviser import classify_failure, revise_prompt
+        prompt_to_send = prompt
+        attempt = 0
+        while True:
+            self.internal_attempts += 1
+            self.prompts_seen.append(prompt_to_send)
+            # runner 内部 update("generating") 触发扣款(quota_recorded 闸门只扣 1 次)
+            update(status="generating", conversation_id=f"conv-{self.internal_attempts}")
+            should_reject = self.always_reject or (self.internal_attempts <= self.success_after)
+            if should_reject:
+                if max_reject_retries <= 0 or attempt >= max_reject_retries:
+                    raise DoubaoContentRejected(
+                        "无法返回该内容",
+                        response_text='{"downlink_body":{"messages":[{"text":"无法返回该内容"}]}}',
+                    )
+                attempt += 1
+                failure = classify_failure("无法返回该内容")
+                new_prompt = revise_prompt(prompt_to_send, failure, attempt=attempt)
+                if not new_prompt or new_prompt == prompt_to_send:
+                    raise DoubaoContentRejected(
+                        "无法返回该内容",
+                        response_text='{"downlink_body":{"messages":[{"text":"无法返回该内容"}]}}',
+                    )
+                update(error_message=f"豆包拒绝(第 {attempt}/{max_reject_retries} 次改写重试中)")
+                prompt_to_send = new_prompt
+                continue
+            return {
+                "remote_task_id": f"remote-{self.internal_attempts}",
+                "result_url": f"https://example.test/video-{self.internal_attempts}.mp4",
+                "cover_url": f"https://example.test/cover-{self.internal_attempts}.jpg",
+            }
+
+
+class ReviseSettings:
+    """v0.2.22 Q1:StaticSettings 子类,允许测试覆盖 max_reject_retries。"""
+
+    def __init__(self, max_reject_retries: int = 0):
+        self._max = max_reject_retries
+
+    def get(self):
+        return {
+            "daily_quota_mini": 50, "daily_quota_v2": 50, "daily_quota_std": 50,
+            "quota_reset_time": "00:00", "max_concurrency": 1,
+            "max_reject_retries": self._max,
+        }
+
+    def get_daily_quotas(self):
+        return {"mini": 50, "v2": 50, "std": 50}
+
+
+@pytest.mark.asyncio
+async def test_content_rejected_revise_when_enabled_uses_two_attempts(repository, temp_profile):
+    """v0.2.22 Q1:max_reject_retries=2 时,runner 拒 2 次后第三次成功——
+    service 调 1 次 runner.run,内部 3 次 attempt(1 原始 + 2 改写),
+    最终 succeeded,扣款仅 1 次,每次 prompt 不同(改写器真在改)。"""
+    Account.create(
+        id="acc-rev1", display_name="rev1", doubao_user_id="u-rev1",
+        profile_dir=temp_profile,
+    )
+    runner = ReviseMockRunner(always_reject=False, success_after=2)
+    service = VideoTaskService(
+        repository, runner, ReviseSettings(max_reject_retries=2),
+        account_poll_interval=0.01,
+    )
+
+    task = service.start("习近平出场", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    # 1. 最终 succeeded
+    assert saved.status == "succeeded"
+    # 2. service 调 runner.run 只 1 次(内部循环)
+    assert runner.service_calls == 1
+    # 3. 内部 attempt 3 次(1 原始 + 2 revise)
+    assert runner.internal_attempts == 3
+    # 4. 每次 prompt 不同(改写器真在改)
+    assert runner.prompts_seen[0] == "习近平出场"
+    assert runner.prompts_seen[1] != "习近平出场"
+    assert runner.prompts_seen[2] != runner.prompts_seen[1]
+    # 5. 扣款只 1 次(quota_recorded 闸门):5 点 mini
+    acc = Account.get_by_id("acc-rev1")
+    assert acc.video_quota_used_mini == 5
+    # 6. task.prompt 仍是原文(revise 只改传输中的 prompt_to_send,DB 不写)
+    assert saved.prompt == "习近平出场"
+
+
+@pytest.mark.asyncio
+async def test_content_rejected_revise_exhausts_after_max_attempts(repository, temp_profile):
+    """v0.2.22 Q1:max_reject_retries=2 但 runner 永远拒 —— runner 内部跑 3 次
+    (1+2) attempt 后 re-raise,service 接住 → failed + 退还额度(0) + error_message
+    含「豆包拒绝」。"""
+    Account.create(
+        id="acc-rev2", display_name="rev2", doubao_user_id="u-rev2",
+        profile_dir=temp_profile,
+    )
+    runner = ReviseMockRunner(always_reject=True)
+    service = VideoTaskService(
+        repository, runner, ReviseSettings(max_reject_retries=2),
+        account_poll_interval=0.01,
+    )
+
+    task = service.start("色情片", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    # 1. failed
+    assert saved.status == "failed"
+    # 2. service 调 runner.run 1 次,内部 3 次(1+2) attempt 后 re-raise
+    assert runner.service_calls == 1
+    assert runner.internal_attempts == 3
+    # 3. 退还额度(0,扣 5 退 5)
+    acc = Account.get_by_id("acc-rev2")
+    assert acc.video_quota_used_mini == 0
+    # 4. error_message 含「豆包拒绝」
+    assert "豆包拒绝" in (saved.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_content_rejected_revise_disabled_keeps_v0_2_21_behavior(repository, temp_profile):
+    """v0.2.22 Q1:max_reject_retries=0(默认)时,行为与 v0.2.21 一致:
+    service 调 1 次 runner.run,内部 1 次 attempt 即 re-raise,失败 + 退款。
+    回归保护。"""
+    Account.create(
+        id="acc-rev3", display_name="rev3", doubao_user_id="u-rev3",
+        profile_dir=temp_profile,
+    )
+    runner = ReviseMockRunner(always_reject=True)
+    service = VideoTaskService(
+        repository, runner, ReviseSettings(max_reject_retries=0),
+        account_poll_interval=0.01,
+    )
+
+    task = service.start("违规再试", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    # service 调 runner.run 1 次,内部 1 次 attempt 即 re-raise(没开改写)
+    assert runner.service_calls == 1
+    assert runner.internal_attempts == 1
+    assert saved.status == "failed"
+    assert runner.prompts_seen == ["违规再试"]
+    # 退款后为 0
+    assert Account.get_by_id("acc-rev3").video_quota_used_mini == 0
+
+
+# ---------- v0.2.22 Q4:同步 refresh-url 端点 ----------
+
+
+@pytest.mark.asyncio
+async def test_refresh_url_returns_fresh_signed_url(repository, temp_profile):
+    """v0.2.22 Q4:DownloadButton 下载失败 → 前端调 schedule_refresh_url。
+    后端用 runner.recheck_result(deadline=60s) 拿新签名 URL,只刷
+    result_url / backup_result_url / fallback_result_url,不动 status /
+    不发 callback / 不跑 watermark / 不消耗 quota。"""
+    Account.create(
+        id="acc-rfu", display_name="acc", doubao_user_id="u", profile_dir=temp_profile
+    )
+    account = Account.get_by_id("acc-rfu")
+    account.video_quota_used_mini = 8  # 假装此前已扣过若干次
+    account.save()
+
+    task = repository.create_video_task("acc-rfu", "x", "seedance_v2.0_mini", "1:1", 5)
+    task.conversation_id = "conv-rfu"
+    task.status = "succeeded"
+    task.result_url = "https://old.example/video.mp4"
+    task.backup_result_url = "https://old.example/backup.mp4"
+    task.save()
+
+    fresh_result = {
+        "result_url": "https://fresh.example/video.mp4",
+        "backup_result_url": "https://fresh.example/backup.mp4",
+        "fallback_result_url": "https://fresh.example/fallback.mp4",
+        "cover_url": "https://fresh.example/cover.jpg",
+    }
+    runner = RecheckRunner(fresh_result)
+    service = VideoTaskService(repository, runner, StaticSettings())
+
+    wrapper = service.schedule_refresh_url(task.id)
+    # 同步语义:前端 await wrapper 拿新 task,内部 body 已跑完。
+    refreshed = await wrapper
+    assert refreshed.id == task.id
+
+    saved = repository.get_video_task(task.id)
+    # 1. status 仍是 succeeded(没拿到新 result 时回滚,这里拿到了就保持)
+    assert saved.status == "succeeded"
+    # 2. result_url 三个字段都被刷新
+    assert saved.result_url == "https://fresh.example/video.mp4"
+    assert saved.backup_result_url == "https://fresh.example/backup.mp4"
+    assert saved.fallback_result_url == "https://fresh.example/fallback.mp4"
+    # 3. cover_url 拿到但不写库(refresh-url 只动 result 系列,不动 cover_url)
+    #    —— 这个保持 nil,因为 update_video_task 没传 cover_url
+    assert saved.cover_url is None
+    # 4. error_message 清空
+    assert not saved.error_message
+    # 5. 关键:不扣额度
+    assert Account.get_by_id("acc-rfu").video_quota_used_mini == 8
+
+
+@pytest.mark.asyncio
+async def test_refresh_url_rejects_non_succeeded_task(repository, temp_profile):
+    """v0.2.22 Q4:仅 succeeded 任务支持 refresh-url。
+    failed / generating / queued 任务应当抛 ValueError,前端拿到 409。"""
+    Account.create(
+        id="acc-rfu2", display_name="x", doubao_user_id="u", profile_dir=temp_profile
+    )
+    task = repository.create_video_task("acc-rfu2", "x", "seedance_v2.0_mini", "1:1", 5)
+    task.conversation_id = "conv-rfu2"
+    task.status = "failed"  # 非 succeeded
+    task.save()
+
+    service = VideoTaskService(repository, RecheckRunner(None), StaticSettings())
+    with pytest.raises(ValueError, match="仅 succeeded"):
+        service.schedule_refresh_url(task.id)
+
+
+@pytest.mark.asyncio
+async def test_refresh_url_rejects_missing_task(repository):
+    """v0.2.22 Q4:任务不存在 → ValueError,前端拿 404。"""
+    service = VideoTaskService(repository, RecheckRunner(None), StaticSettings())
+    with pytest.raises(ValueError, match="任务不存在"):
+        service.schedule_refresh_url("does-not-exist")

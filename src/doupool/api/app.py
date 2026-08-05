@@ -435,6 +435,51 @@ def create_app(
         quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
         return _video_task_dict(task, quotas["mini"])
 
+    @app.post("/api/results/{task_id}/refresh-url")
+    async def refresh_result_url(
+        task_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.22 Q4:重解析 succeeded 任务的 result_url 链。
+
+        背景:task.result_url 是豆包签名 CDN,TTL 几分钟-几小时,几天后
+        Edge 直接「无法访问此页面 ERR_INVALID_RESPONSE」。前端 DownloadButton
+        三层 fallback (cors / no-cors / window.open) 全失败时调这个端点,
+        拿到 fresh URL 后再触发下载。
+
+        同步语义:POST 等待(最长 60s)拿到最新 result_url 才返回,前端拿到
+        响应里的 result_url 立即重试下载。和 retry-result 的「异步 + 轮询」
+        区分 —— 重下载场景下用户已经在 UI 前等待,不需要再轮询一次。
+
+        状态码:
+          - 200:成功,响应体是新 task 行(result_url 已更新)
+          - 404:task_id 不存在
+          - 409:任务非 succeeded / 缺少 conversation_id / 原账号不可用 /
+           已有 retry 在跑 / 重解析超时
+          - 503:video_service 未启动
+        """
+        authorize(x_doupool_token, authorization)
+        if video_service is None:
+            raise HTTPException(status_code=503, detail="视频服务未启动")
+        try:
+            wrapper = video_service.schedule_refresh_url(task_id)
+            task = await wrapper
+        except ValueError as exc:
+            msg = str(exc)
+            if "任务不存在" in msg:
+                raise HTTPException(status_code=404, detail=msg) from exc
+            raise HTTPException(status_code=409, detail=msg) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if task is None:
+            raise HTTPException(
+                status_code=409,
+                detail="刷新下载链接超时,远端尚未生成完成",
+            )
+        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
+        return _video_task_dict(task, quotas["mini"])
+
     @app.delete("/api/requests/{task_id}", status_code=204)
     def delete_video_task(
         task_id: str,

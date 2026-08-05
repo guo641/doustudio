@@ -41,6 +41,10 @@ const emit = defineEmits<{
   toggle: [value: { id: string; enabled: boolean }];
   delete: [id: string];
   relogin: [id: string];
+  // v0.2.22 Q3:用户停在账号面板时,后台视频任务跑完 quota 变化不会自动
+  // 推送(只有 videos / results 页有 setInterval(refreshTasks, 4s))。
+  // 加一个手动「🔄 刷新额度」按钮,父级 (App.vue) 接到后调 listAccounts()。
+  refresh: [];
 }>();
 
 // v0.2.17:token 状态。Record<accountId, bundle>,无 token 时 hint 引导用户去刷。
@@ -250,6 +254,13 @@ watch(
 <template>
   <DpPanel title="账号列表" :subtitle="`${accounts.length} 个账号`">
     <template #actions>
+      <DpButton
+        aria-label="刷新账号额度"
+        @click="$emit('refresh')"
+      >
+        <RefreshCw :size="15" :stroke-width="2.25" />
+        刷新额度
+      </DpButton>
       <DpButton variant="solid" :disabled="busy" @click="$emit('add')">
         <Plus :size="15" :stroke-width="2.25" />
         {{ busy ? '等待登录…' : '＋ 添加账号' }}

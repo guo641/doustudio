@@ -923,3 +923,104 @@ def test_open_then_close_browser_lifecycle(
     )
     assert close_resp.status_code == 200
     assert close_resp.json()["cancel_sent"] is True
+
+
+# ---------- v0.2.22 Q4:POST /api/results/{task_id}/refresh-url ----------
+
+
+class FakeVideoServiceWithRefresh(FakeVideoService):
+    """v0.2.22 Q4:复刻 service.schedule_refresh_url 的最小契约。
+
+    返回的 wrapper 可 await,await 后直接修改 task.result_url 并返回新 task,
+    够 API 层测试路由 + 状态码映射(404/409/200)。"""
+    def __init__(self, repository, *, raise_value_error: str | None = None, raise_runtime_error: str | None = None):
+        super().__init__(repository)
+        self.raise_value_error = raise_value_error
+        self.raise_runtime_error = raise_runtime_error
+
+    def schedule_refresh_url(self, task_id: str):
+        if self.raise_value_error:
+            async def boom():
+                raise ValueError(self.raise_value_error)
+            return boom()
+        if self.raise_runtime_error:
+            async def boom():
+                raise RuntimeError(self.raise_runtime_error)
+            return boom()
+
+        async def wrapper():
+            task = self.repository.get_video_task(task_id)
+            if task is None:
+                raise ValueError("任务不存在")
+            # 模拟 runner.recheck_result 拿到 fresh URL
+            self.repository.update_video_task(
+                task_id,
+                result_url="https://fresh.example/video.mp4",
+                backup_result_url="https://fresh.example/backup.mp4",
+                fallback_result_url="https://fresh.example/fallback.mp4",
+            )
+            return self.repository.get_video_task(task_id)
+
+        return wrapper()
+
+
+def test_refresh_url_endpoint_writes_fresh_url(repository, tmp_path):
+    """v0.2.22 Q4:POST /api/results/:task_id/refresh-url → 200 + 新 result_url。"""
+    task = repository.create_video_task(None, "下载", "seedance_v2.0_mini", "1:1", 5)
+    repository.update_video_task(
+        task.id, status="succeeded", result_url="https://old.example/video.mp4",
+    )
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(
+        create_app(
+            "secret", tmp_path / "missing", repository, login,
+            video_service=FakeVideoServiceWithRefresh(repository),
+        )
+    )
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(f"/api/results/{task.id}/refresh-url", headers=headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == task.id
+    assert body["result_url"] == "https://fresh.example/video.mp4"
+    assert body["backup_result_url"] == "https://fresh.example/backup.mp4"
+    assert body["fallback_result_url"] == "https://fresh.example/fallback.mp4"
+
+
+def test_refresh_url_endpoint_missing_task_returns_404(repository, tmp_path):
+    """v0.2.22 Q4:任务不存在 → 404(不是 500)。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(
+        create_app(
+            "secret", tmp_path / "missing", repository, login,
+            video_service=FakeVideoServiceWithRefresh(
+                repository, raise_value_error="任务不存在",
+            ),
+        )
+    )
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post("/api/results/does-not-exist/refresh-url", headers=headers)
+    assert response.status_code == 404
+    assert "任务不存在" in response.json()["detail"]
+
+
+def test_refresh_url_endpoint_non_succeeded_returns_409(repository, tmp_path):
+    """v0.2.22 Q4:仅 succeeded 任务支持 refresh-url,失败/排队中 → 409。"""
+    task = repository.create_video_task(None, "未完成", "seedance_v2.0_mini", "1:1", 5)
+    # 默认 status = queued
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(
+        create_app(
+            "secret", tmp_path / "missing", repository, login,
+            video_service=FakeVideoServiceWithRefresh(
+                repository, raise_value_error="仅 succeeded 任务支持刷新下载链接",
+            ),
+        )
+    )
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(f"/api/results/{task.id}/refresh-url", headers=headers)
+    assert response.status_code == 409
+    assert "仅 succeeded" in response.json()["detail"]

@@ -30,7 +30,10 @@ const props = withDefaults(
   { bypass: false },
 );
 
-defineEmits<{ error: [message: string] }>();
+// v0.2.22 Q4:三层 fallback 全失败时把 reason 冒给父级 App.vue,触发
+// /api/results/:id/refresh-url 重解析签名 URL。
+// v0.2.22 之前此处 throw err 让 Vue warn 一下就丢掉,用户什么反馈也看不到。
+const emit = defineEmits<{ 'download-failed': [reason: string] }>();
 
 const busy = ref(false);
 
@@ -174,8 +177,11 @@ async function handleClick() {
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : '下载失败';
-    // 把消息冒给上层 toast
-    throw err instanceof Error ? err : new Error(msg);
+    // v0.2.22 Q4:把 reason 抛给上层 App.vue → onResultDownloadFailed →
+    // POST /api/results/:id/refresh-url 重解析签名 URL。
+    // 不再 throw(throw 在 Vue template event handler 里只能 Vue warn,
+    // 用户看不到任何反馈)。
+    emit('download-failed', msg);
   } finally {
     busy.value = false;
   }

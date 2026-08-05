@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import mimetypes
 import random
 import re
@@ -15,8 +16,10 @@ from pathlib import Path
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
+from ..prompt_reviser import classify_failure, revise_prompt
 from .protocol import (
     EXTRA_CLIENT_META_KEYS,
+    DoubaoContentRejected,
     build_completion_payload,
     find_creation_directory,
     find_video_node,
@@ -24,6 +27,9 @@ from .protocol import (
     parse_download_info,
     parse_sse_ack,
 )
+
+# v0.2.22:模块级 logger,retry loop 用 warn 级记「revise 重试」事件
+_LOGGER = logging.getLogger(__name__)
 
 
 PC_VERSION = "3.27.4"
@@ -557,8 +563,16 @@ async def load_browser_context(page, context, *, pc_version: str | None = None) 
     )
 
 
-def _build_launch_kwargs() -> dict:
-    """v0.2.17:launch_persistent_context 的「拟人化」参数。"""
+def _build_launch_kwargs(*, window_visible: bool = False) -> dict:
+    """v0.2.17:launch_persistent_context 的「拟人化」参数。
+
+    v0.2.22:加 `window_visible` 开关 —— 默认 False 保持 v0.2.21 隐身行为
+    (窗口放到屏幕外 -2000,-2000);开启后窗口显示在 (80,80),与手动
+    `POST /api/accounts/{id}/open-browser` 同位置。launch 后无法动态改
+    位置,所以这个开关只在 BrowserContext 第一次创建时生效(同 profile
+    重启进程才能换位置)。
+    """
+    position = "80,80" if window_visible else "-2000,-2000"
     return {
         "headless": False,
         "viewport": {
@@ -567,7 +581,7 @@ def _build_launch_kwargs() -> dict:
         },
         "args": [
             "--window-size=1000,720",
-            "--window-position=-2000,-2000",
+            f"--window-position={position}",
             *_STEALTH_LAUNCH_ARGS,
         ],
         "locale": _BROWSER_LOCALE,
@@ -621,7 +635,13 @@ class PlaywrightVideoRunner:
             self._pw = await async_playwright().start()
         return self._pw
 
-    async def _get_shared_context(self, profile_dir: Path, pc_version: str | None):
+    async def _get_shared_context(
+        self,
+        profile_dir: Path,
+        pc_version: str | None,
+        *,
+        window_visible: bool = False,
+    ):
         """拿到共享的 BrowserContext + 缓存的 TokenBundle。
 
         第一次:launch_persistent_context + load_browser_context + 缓存
@@ -633,6 +653,9 @@ class PlaywrightVideoRunner:
         TargetClosedError。保留 anchor page 同时确保 context 一直活着,
         也给后续 task 一个可复用的 doubao.com origin 页面,避免 about:blank
         上 history.replaceState 抛 SecurityError。
+
+        v0.2.22:`window_visible` —— 决定 Chromium 窗口是否显示到桌面。
+        仅在 context 首次创建时生效;cached context 复用前次位置。
         """
         key = str(profile_dir)
         async with self._lock_for(profile_dir):
@@ -653,7 +676,7 @@ class PlaywrightVideoRunner:
             pw = await self._ensure_playwright()
             context = await pw.chromium.launch_persistent_context(
                 str(profile_dir),
-                **_build_launch_kwargs(),
+                **_build_launch_kwargs(window_visible=window_visible),
             )
             # 必须先打开 doubao.com 拿到 aegis 风控指纹,否则
             # COMPLETION_SCRIPT 会被字节拒为 1011(用户未登录)。
@@ -776,9 +799,21 @@ class PlaywrightVideoRunner:
         mode: str = "t2v",
         image_paths: list[str] | None = None,
         pc_version: str | None = None,
+        max_reject_retries: int = 0,
+        window_visible: bool = False,
     ) -> dict[str, str]:
+        """单账号一次性视频生成。
+
+        v0.2.22 Q1:加 `max_reject_retries`(opt-in,默认 0 沿用 v0.2.21)。
+        收到豆包内容审核拒绝时,用 prompt_reviser 改写 prompt 后,在同一
+        page 上 history.replaceState + COMPLETION_SCRIPT 重提交。共享
+        page / 上传好的图片 / 缓存的 TokenBundle —— retry 不重做这些。
+
+        v0.2.22 Q2:`window_visible` 决定 Chromium 窗口是否显示;只在
+        BrowserContext 首次创建时生效,见 _get_shared_context 注释。
+        """
         context, token_bundle = await self._get_shared_context(
-            profile_dir, pc_version=pc_version
+            profile_dir, pc_version=pc_version, window_visible=window_visible,
         )
         # v0.2.20:复用 anchor page(共享 BrowserContext 时由 _get_shared_context
         # 保留的那个页面)。如果 anchor 已被外部关了(用户手关窗口 / context
@@ -815,6 +850,8 @@ class PlaywrightVideoRunner:
                 await page.wait_for_timeout(1_500)
             fingerprint = token_bundle.device_id or token_bundle.web_id
 
+            # i2v 图片上传一次性完成,retry 不重复上传(豆包图片上传有独立
+            # 签名逻辑,重传会拿到不同 OSS key,反而被风控)。
             uploaded_images: list[dict] = []
             if mode == "i2v":
                 paths = [Path(item) for item in (image_paths or [])]
@@ -836,41 +873,99 @@ class PlaywrightVideoRunner:
                     )
                     uploaded_images.append(uploaded)
 
-            payload = build_completion_payload(
-                prompt,
-                model,
-                ratio,
-                duration,
-                fingerprint,
-                mode=mode,
-                images=uploaded_images or None,
-                # v0.2.17:WebMSSDK / TeaSDK 真实指纹(从登录 profile 抽)透传给
-                # payload.client_meta — 走 EXTRA_CLIENT_META_KEYS 白名单。
-                **token_bundle.to_client_meta(),
-            )
-            local_id = payload["client_meta"]["local_conversation_id"]
-            await page.evaluate("id => history.replaceState({}, '', '/chat/' + id)", local_id)
-            response = await page.evaluate(COMPLETION_SCRIPT, {"payload": payload})
-            if response["status"] != 200:
-                raise RuntimeError(f"豆包提交接口返回 HTTP {response['status']}")
-            ack = parse_sse_ack(response["text"])
-            update(status="generating", **ack)
-
-            deadline = time.monotonic() + self.timeout
-            while time.monotonic() < deadline:
-                if cancel_event.is_set():
-                    raise RuntimeError("任务已取消")
-                chain = await page.evaluate(CHAIN_SCRIPT, {"conversationId": ack["conversation_id"]})
-                if chain["status"] != 200:
-                    raise RuntimeError(f"豆包结果接口返回 HTTP {chain['status']}")
-                result = parse_creation_result(chain["data"])
-                if result:
-                    update(status="resolving", **result)
-                    return await self._resolve_original_download(page, result, cancel_event)
-                await page.wait_for_timeout(self.poll_interval * 1000)
-            raise RuntimeError("视频生成超时")
+            # Q1:retry loop —— 共享 page、TokenBundle、uploaded_images。
+            # quota 扣款发生在 service._run_inner.update("generating") 时,
+            # 且有 quota_recorded 闸门只扣 1 次 —— 重试不重复扣。
+            prompt_to_send = prompt
+            attempt = 0
+            while True:
+                try:
+                    return await self._submit_and_poll(
+                        page,
+                        prompt_to_send,
+                        model,
+                        ratio,
+                        duration,
+                        fingerprint,
+                        token_bundle,
+                        mode,
+                        uploaded_images,
+                        update,
+                        cancel_event,
+                    )
+                except DoubaoContentRejected as exc:
+                    attempt += 1
+                    if max_reject_retries <= 0 or attempt > max_reject_retries:
+                        raise
+                    failure = classify_failure(str(exc))
+                    new_prompt = revise_prompt(prompt_to_send, failure, attempt=attempt)
+                    # revise 拿回原 prompt 或空字符串 → 改写器认为无药可救,
+                    # 别浪费豆包次数,直接报失败让上层退款。
+                    if not new_prompt or new_prompt == prompt_to_send:
+                        raise
+                    _LOGGER.warning(
+                        "event=video_content_reject_revise attempt=%d max=%d reason=%s",
+                        attempt, max_reject_retries, exc.error_message,
+                    )
+                    update(error_message=f"豆包拒绝(第 {attempt}/{max_reject_retries} 次改写重试中)")
+                    prompt_to_send = new_prompt
+                    continue
         finally:
             await page.close()
+
+    async def _submit_and_poll(
+        self,
+        page: Page,
+        prompt: str,
+        model: str,
+        ratio: str,
+        duration: int,
+        fingerprint: str,
+        token_bundle,
+        mode: str,
+        uploaded_images: list[dict],
+        update: Callable[..., None],
+        cancel_event: threading.Event,
+    ) -> dict[str, str]:
+        """v0.2.22:run() 的 submit + poll 切片,被 retry loop 复用。
+
+        与 run() 的差别:这里只管单次「payload 拼装 → COMPLETION_SCRIPT 提交
+        → CHAIN_SCRIPT 轮询 → _resolve_original_download」,不管 page
+        选择 / 上传图片 / page.close。run() 负责一次性搭好上下文 + 收尾。
+        """
+        payload = build_completion_payload(
+            prompt,
+            model,
+            ratio,
+            duration,
+            fingerprint,
+            mode=mode,
+            images=uploaded_images or None,
+            # v0.2.17:WebMSSDK / TeaSDK 真实指纹(从登录 profile 抽)透传给
+            # payload.client_meta — 走 EXTRA_CLIENT_META_KEYS 白名单。
+            **token_bundle.to_client_meta(),
+        )
+        local_id = payload["client_meta"]["local_conversation_id"]
+        await page.evaluate("id => history.replaceState({}, '', '/chat/' + id)", local_id)
+        response = await page.evaluate(COMPLETION_SCRIPT, {"payload": payload})
+        if response["status"] != 200:
+            raise RuntimeError(f"豆包提交接口返回 HTTP {response['status']}")
+        ack = parse_sse_ack(response["text"])
+        update(status="generating", **ack)
+
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            if cancel_event.is_set():
+                raise RuntimeError("任务已取消")
+            chain = await page.evaluate(CHAIN_SCRIPT, {"conversationId": ack["conversation_id"]})
+            if chain["status"] != 200:
+                raise RuntimeError(f"豆包结果接口返回 HTTP {chain['status']}")
+            result = parse_creation_result(chain["data"])
+            if result:
+                update(status="resolving", **result)
+                return await self._resolve_original_download(page, result, cancel_event)
+            await page.wait_for_timeout(self.poll_interval * 1000)
+        raise RuntimeError("视频生成超时")
 
     async def _resolve_original_download(self, page, result: dict[str, str], cancel_event: threading.Event) -> dict[str, str]:
         fallback = {**result, "result_url": result["fallback_result_url"]}

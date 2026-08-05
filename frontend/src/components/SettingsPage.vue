@@ -19,6 +19,10 @@ type Settings = {
   watermark_enabled: boolean;
   watermark_uid: string;
   watermark_key: string;
+  // v0.2.22 Q1:豆包拒绝后改写 prompt 重试次数,0 = 关闭(沿用 v0.2.21);1-3 = 最大改写次数。
+  max_reject_retries: number;
+  // v0.2.22 Q2:视频生成时 Chromium 窗口是否可见,默认隐藏(opt-in)。
+  runner_window_visible: boolean;
 };
 
 const settings = ref<Settings | null>(null);
@@ -116,6 +120,31 @@ async function onCheckUpdate() {
             <option value="least_used">最少使用优先</option>
             <option value="round_robin">轮询</option>
           </DpSelect>
+        </DpField>
+        <!-- v0.2.22 Q1:豆包拒绝后自动改写 prompt 重试,默认关闭沿用 v0.2.21 行为 -->
+        <DpField label="豆包拒绝改写重试" for-id="setting-max-reject-retries">
+          <DpInput
+            id="setting-max-reject-retries"
+            v-model.number="settings.max_reject_retries"
+            type="number"
+            :min="0"
+            :max="3"
+          />
+          <span class="watermark-hint">0=关闭(沿用 v0.2.21);1-3=改写最大重试次数</span>
+        </DpField>
+        <!-- v0.2.22 Q2:生成时 Chromium 窗口可见,默认隐藏。注意 Playwright launch_persistent_context
+             创建后无法改 window-position,改动只对新 profile_dir / 重启进程生效 -->
+        <DpField label="显示 Chromium 窗口" for-id="setting-runner-window-visible" span2>
+          <input
+            id="setting-runner-window-visible"
+            v-model="settings.runner_window_visible"
+            type="checkbox"
+            class="checkbox"
+          />
+          <span class="watermark-hint">
+            开启后,视频生成时 Chromium 窗口会显示在屏幕 (80,80)。可能被风控识别为异常登录态,
+            生产建议关闭。修改后只对新启动的 profile / 重启进程生效。
+          </span>
         </DpField>
       </div>
     </DpCard>

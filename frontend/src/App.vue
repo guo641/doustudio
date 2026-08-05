@@ -10,6 +10,7 @@ import {
   listAccounts,
   listVideoTasks,
   loginEvents,
+  refreshResultUrl,
   startLogin,
   updateAccount,
 } from './api';
@@ -148,17 +149,17 @@ async function refreshTasks() {
     const fresh = await listVideoTasks();
     // 只有最新的 fetch 才写回,避免 stale 响应盖掉新数据
     if (mySeq !== tasksFetchSeq) return;
-    tasks.value = fresh;
-    // v0.2.21:检测本轮刷新里「刚出现的终态任务」(succeeded/failed/cancelled),
-    // 立即拉一次 accounts —— 任务 succeeded 时 worker 已经 increment_account_quota
-    // 写库,但前端 accounts ref 只在 onMounted / 登录完成 / 增删 toggle 时刷新,
-    // 用户得切走再切回或者整页 F5 才能看到「今日额度」变化。4s 轮询内补一次,
-    // quota 数字就在 UI 上跟上了。
+    // v0.2.22 Q3:hadTerminal 必须在 fresh 覆盖 tasks.value 之前构建。
+    // v0.2.21 的实现顺序是「tasks.value = fresh; hadTerminal = ...」——
+    // 首次进入 videos 页时 fresh 就是首次数据,hadTerminal ≡ fresh.terminal,
+    // newTerminal 永远空,refreshAccounts() 从不触发,用户停在账号面板
+    // 永远看不到 quota 变化。挪到 fresh 覆盖前就拿到「上一轮终态」。
     const hadTerminal = new Set(
       tasks.value
         .filter((t) => (TERMINAL_STATUSES as readonly string[]).includes(t.status))
         .map((t) => `${t.id}:${t.status}`),
     );
+    tasks.value = fresh;
     const newTerminal = fresh.filter(
       (t) => (TERMINAL_STATUSES as readonly string[]).includes(t.status) && !hadTerminal.has(`${t.id}:${t.status}`),
     );
@@ -379,6 +380,43 @@ function applyDefaults(value: any) {
   if (value.default_duration) duration.value = value.default_duration;
 }
 
+// v0.2.22 Q4:DownloadButton 三层 fallback (cors / no-cors / window.open) 全
+// 失败时(典型:签名 CDN URL 过期,Edge 报 ERR_INVALID_RESPONSE),自动调
+// /api/results/:id/refresh-url 拿新签名 URL,再让用户重试下载。
+//
+// 防刷:Set 记录已为本轮调过 refresh-url 的 task_id,避免同 task 多次失败
+// 把后端打爆。Set 在每次成功刷到 URL 后清空(下一次失败允许再刷 —— 这次
+// 拿到的 URL 可能也过期了)。
+const refreshedResultIds = new Set<string>();
+
+async function onResultDownloadFailed(taskId: string) {
+  if (refreshedResultIds.has(taskId)) {
+    showToast('failed', '已尝试刷新链接,仍无法下载,请稍后再试');
+    return;
+  }
+  showToast('launching', '下载链接已过期,正在重新获取…');
+  try {
+    const fresh = await refreshResultUrl(taskId);
+    refreshedResultIds.add(taskId);
+    const idx = tasks.value.findIndex((t) => t.id === taskId);
+    if (idx >= 0) {
+      tasks.value[idx] = {
+        ...tasks.value[idx],
+        result_url: fresh.result_url,
+        backup_result_url: fresh.backup_result_url,
+        fallback_result_url: fresh.fallback_result_url,
+        error: undefined,
+      };
+    }
+    showToast('succeeded', '链接已刷新,请重新点击下载');
+    // 给用户几秒看到 toast,然后清掉 Set —— 下次再点下载(新过期 URL)
+    // 还能再刷一次。后端 schedule_refresh_url 同步等待最长 60s。
+    window.setTimeout(() => refreshedResultIds.delete(taskId), 8000);
+  } catch (err) {
+    showToast('failed', err instanceof Error ? err.message : '刷新下载链接失败');
+  }
+}
+
 function showToast(nextState: string, nextMessage: string) {
   state.value = nextState;
   message.value = nextMessage;
@@ -474,6 +512,7 @@ onBeforeUnmount(() => {
           @toggle="toggleAccount"
           @delete="removeAccount"
           @relogin="add"
+          @refresh="refreshAccounts"
         />
 
         <template v-else-if="page === 'videos'">
@@ -492,7 +531,7 @@ onBeforeUnmount(() => {
           <VideoTaskTable :tasks="tasks" @retry="retryVideoTask" @delete="onDeleteVideoTask" />
         </template>
 
-        <ResultsTable v-else-if="page === 'results'" :tasks="results" />
+        <ResultsTable v-else-if="page === 'results'" :tasks="results" @download-failed="onResultDownloadFailed" />
         <LogsPage v-else-if="page === 'logs'" />
         <SettingsPage v-else @saved="applyDefaults" />
       </section>

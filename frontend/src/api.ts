@@ -203,6 +203,24 @@ export async function getAccountBrowserStatus(accountId: string): Promise<{ open
   );
 }
 
+// v0.2.22 Q4:DownloadButton 下载失败时调用,同步拿新签名 URL。
+// 后端调 runner.recheck_result(deadline=60s),不消耗 quota,只刷
+// task.result_url / backup_result_url / fallback_result_url 三个字段。
+export async function refreshResultUrl(taskId: string): Promise<{
+  id: string;
+  status?: string;
+  result_url?: string;
+  backup_result_url?: string;
+  fallback_result_url?: string;
+  cover_url?: string;
+  error?: string;
+}> {
+  return json(
+    await fetch(`/api/results/${taskId}/refresh-url`, { method: 'POST', headers }),
+    '刷新下载链接失败',
+  );
+}
+
 export function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();

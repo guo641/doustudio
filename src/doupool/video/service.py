@@ -308,6 +308,108 @@ class VideoTaskService:
         """
         return self.retry_result(task_id)
 
+    # ---------- v0.2.22 Q4 refresh-url 入口 ----------
+    def schedule_refresh_url(self, task_id: str) -> asyncio.Task[VideoTask]:
+        """v0.2.22:同步语义的重解析,前端 DownloadButton 下载失败时 POST 调用。
+
+        与 retry_result 的差别:
+          - retry_result:异步(注册协程后立刻返回),UI 轮询 task 状态,给后台
+           工具 / 脚本用。
+          - schedule_refresh_url:同步等待(返回的 wrapper await 后才拿到新
+           task 行),前端拿新 URL 立即重试下载。
+
+        内部调 runner.recheck_result(deadline=60s),只刷新 result_url /
+        backup_result_url / fallback_result_url —— 不动 status、不发
+        callback、不跑 watermark、不消耗 quota。
+        """
+        try:
+            task = self.repository.get_video_task(task_id)
+        except Exception:
+            raise ValueError("任务不存在") from None
+        if task is None:
+            raise ValueError("任务不存在")
+        if task.status != "succeeded":
+            raise ValueError("仅 succeeded 任务支持刷新下载链接")
+        if not task.conversation_id:
+            raise ValueError("任务缺少 conversation_id")
+        if task.account_id is None:
+            raise ValueError("原账号不可用")
+        account = Account.get_or_none(Account.id == task.account_id)
+        if account is None or not Path(account.profile_dir).exists():
+            raise ValueError("原账号不可用,无法重解析")
+        if task_id in self._retry_tasks and not self._retry_tasks[task_id].done():
+            raise RuntimeError("已有 retry-result 在运行")
+        cancellation = threading.Event()
+        self._retry_cancellations[task_id] = cancellation
+        self._retry_tasks[task_id] = asyncio.create_task(
+            self._refresh_url_body(task_id, account.profile_dir, cancellation)
+        )
+        return self._retry_tasks[task_id]
+
+    async def _refresh_url_body(
+        self, task_id: str, profile_dir: str, cancellation: threading.Event
+    ) -> VideoTask:
+        """v0.2.22 Q4:refresh-url 后台协程 —— 只刷 result_url 系列字段,
+        保留 status / watermark / callback 不变。
+
+        错误兜底:同 _retry_result_body,失败时不动 status(避免覆盖旧
+        succeeded),仅在 error_message 留痕 —— 旧 result_url 仍可下载。
+        """
+        try:
+            task = self.repository.get_video_task(task_id)
+        except Exception:
+            return None
+        if task is None:
+            return None
+        try:
+            # recheck_result 已共用 _get_shared_context,serialized by profile_dir lock
+            result = await self.runner.recheck_result(
+                profile_dir,
+                task.conversation_id or "",
+                lambda **values: None,  # 不刷 UI status,纯后台
+                cancellation,
+                deadline_seconds=60,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.repository.update_video_task(
+                task_id,
+                error_message=f"刷新下载链接失败:{exc}",
+            )
+            self.logger.warning(
+                "event=video_refresh_url_failed task_id=%s error=%s",
+                task_id, exc,
+                extra={"event": "video_refresh_url_failed", "task_id": task_id},
+            )
+            return None
+        if result is None:
+            self.repository.update_video_task(
+                task_id,
+                error_message="刷新下载链接超时,远端尚未生成完成",
+            )
+            return None
+        # 拿到新 result:只写 result_url 系列字段,不动 status / watermark。
+        self.repository.update_video_task(
+            task_id,
+            result_url=result.get("result_url"),
+            backup_result_url=result.get("backup_result_url"),
+            fallback_result_url=result.get("fallback_result_url"),
+            error_message=None,
+        )
+        self.logger.info(
+            "event=video_refresh_url_succeeded task_id=%s",
+            task_id,
+            extra={"event": "video_refresh_url_succeeded", "task_id": task_id},
+        )
+        try:
+            return self.repository.get_video_task(task_id)
+        except Exception:
+            return None
+        finally:
+            self._retry_tasks.pop(task_id, None)
+            self._retry_cancellations.pop(task_id, None)
+
     # ---------- v0.2.11 任务删除入口 ----------
     def delete(self, task_id: str) -> None:
         """v0.2.11:删除一条视频任务。
@@ -605,6 +707,16 @@ class VideoTaskService:
                             image_paths = []
                     # v0.2.19:runner.run 现在是 async(共享 BrowserContext),
                     # 直接 await,不再走 asyncio.to_thread。
+                    # v0.2.22 Q1:max_reject_retries 透传给 runner.run,0 关闭
+                    # 改写重试(沿用 v0.2.21 默认);>0 时 runner 内部 catch
+                    # DoubaoContentRejected 后用 prompt_reviser 改写 prompt 在
+                    # 同一 page 重提交。retry 期间 update("generating") 仍由
+                    # runner 触发,quota_recorded 闸门只扣一次。
+                    # v0.2.22 Q2:window_visible 透传给 runner.run →
+                    # _get_shared_context,决定 BrowserContext 首次创建时
+                    # Chromium 窗口是否显示在桌面。
+                    max_reject_retries = max(0, min(3, int(settings.get("max_reject_retries", 0) or 0)))
+                    runner_window_visible = bool(settings.get("runner_window_visible", False))
                     result = await self.runner.run(
                         account.profile_dir,
                         task.prompt,
@@ -619,6 +731,8 @@ class VideoTaskService:
                         # 透传给 runner.run → load_browser_context,塞进
                         # payload.client_meta.pc_version。
                         pc_version=settings.get("pc_version"),
+                        max_reject_retries=max_reject_retries,
+                        window_visible=runner_window_visible,
                     )
                     self.repository.update_video_task(task_id, status="succeeded", **result)
                     self.logger.info(
