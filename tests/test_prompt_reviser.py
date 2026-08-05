@@ -116,54 +116,75 @@ class TestClassifyFailure:
 
 # ---------- revise_prompt ----------
 
+# v0.2.25:策略变了 —— revise_prompt 不再剥关键词/套模板,而是在原 prompt 末尾
+# 追加一句固定指令,让豆包自己改写并重生成。每次重试都由浏览器层 retry 循环
+# 把上次的 new_prompt 写回 prompt_to_send → 后缀自然累积(累计 N 次失败 → 末尾
+# 出现 N 段指令)。
+_INSTRUCTION = "把这段提示词修改成不违反平台规则的提示词,并生成视频"
+
 
 class TestRevisePrompt:
     def test_no_revise_for_non_revise_failure(self):
+        # quota / network / invalid_input / unknown → 不动原 prompt
         prompt = "原始 prompt"
-        info = classify_failure("网络超时")
-        assert revise_prompt(prompt, info) == prompt
+        for msg in ("网络超时", "今日额度已用完", "参数无效"):
+            info = classify_failure(msg)
+            assert revise_prompt(prompt, info) == prompt, msg
 
-    def test_policy_violation_strips_risky_keywords(self):
-        prompt = "请生成一个nude美女在裸体海滩上做爱视频"
-        info = classify_failure("生成内容中疑似包含侵权内容,换个主题再试试")
+    def test_policy_violation_appends_instruction(self):
+        # v0.2.25:POLICY_VIOLATION → 原 prompt + 空格 + 固定指令
+        prompt = "一段美丽的风景"
+        info = classify_failure("我暂时无法生成你要求的内容,请尝试输入其他要求")
         assert info.revise_prompt is True
         revised = revise_prompt(prompt, info)
-        assert "nude" not in revised.lower()
-        assert "裸体" not in revised
-        assert "做爱" not in revised
+        assert revised.startswith(prompt)
+        assert _INSTRUCTION in revised
+        # 不再做任何关键词剥离 — 原内容应保留
+        assert "风景" in revised
 
-    def test_policy_violation_attempt_2_falls_back_to_template(self):
-        prompt = "请生成一个nude美女视频"
+    def test_policy_violation_attempt_2_keeps_accumulating(self):
+        # v0.2.25:attempt=2 也走同一策略(累积),不再 attempt>=2 切换安全模板
+        prompt = "一段美丽的风景"
         info = classify_failure("换个主题再试试")
         assert info.revise_prompt is True
         revised = revise_prompt(prompt, info, attempt=2)
-        # 第二次走安全模板,跟原 prompt 无关
-        assert "nude" not in revised.lower()
-        assert "温馨" in revised or "阳光" in revised
+        assert prompt in revised
+        assert _INSTRUCTION in revised
 
-    def test_generation_failed_simplifies(self):
-        prompt = "一段非常非常长的描述,包含很多细节,场景复杂,色调丰富,镜头切换多"
+    def test_generation_failed_uses_same_strategy(self):
+        # v0.2.25:GENERATION_FAILED 也走 append 指令串,不再简化/截断
+        prompt = "一段非常长的描述" * 20
         info = classify_failure("视频生成失败")
+        assert info.revise_prompt is True
         revised = revise_prompt(prompt, info)
-        # 简化策略: 加 "简化版" 前缀
-        assert "简化版" in revised or len(revised) < len(prompt) + 20
+        assert prompt in revised
+        assert _INSTRUCTION in revised
+        # 不再截断: 长度应 >= 原 prompt 长度
+        assert len(revised) >= len(prompt)
 
-    def test_generation_failed_attempt_2_truncates(self):
-        prompt = "a" * 200
-        info = classify_failure("视频生成失败")
-        revised = revise_prompt(prompt, info, attempt=2)
-        # 第二次直接截断到 60 字符左右
-        assert len(revised) <= 65
+    def test_retry_loop_accumulates_suffix(self):
+        # 模拟浏览器层 retry 循环:每次都把上次的 new_prompt 作为下次 base
+        prompt = "原始 prompt"
+        info = classify_failure("我暂时无法生成你要求的内容")
+        revised1 = revise_prompt(prompt, info, attempt=1)
+        revised2 = revise_prompt(revised1, info, attempt=2)
+        revised3 = revise_prompt(revised2, info, attempt=3)
+        # 三次累积,末尾应该出现三次指令
+        assert revised1.count(_INSTRUCTION) == 1
+        assert revised2.count(_INSTRUCTION) == 2
+        assert revised3.count(_INSTRUCTION) == 3
+        # 原 prompt 内容仍在开头(累积 append,不替换)
+        assert revised3.startswith(prompt)
 
     def test_empty_prompt_returns_empty(self):
         info = classify_failure("违规")
         assert revise_prompt("", info) == ""
         assert revise_prompt("   ", info) == "   "
 
-    def test_revise_preserves_safe_prompt_content(self):
-        prompt = "一只熊猫在竹林中漫步,镜头缓慢推进,治愈风格"
-        info = classify_failure("违规")
+    def test_instruction_is_attached_not_replacing(self):
+        # 关键不变量:原 prompt 永远在结果里,后缀只 append,不替换
+        prompt = "特定可识别的画面描述 xyz123"
+        info = classify_failure("换个主题再试试")
         revised = revise_prompt(prompt, info)
-        # 干净 prompt 应该原样保留 + 加软化前缀
-        assert "熊猫" in revised or "温馨" in revised
-        assert "竹林" in revised or "积极" in revised
+        assert "xyz123" in revised
+        assert revised != prompt

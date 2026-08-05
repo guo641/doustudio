@@ -137,46 +137,26 @@ def classify_failure(error_message: str, status_code: Optional[int] = None) -> F
 
 # ---------- Prompt 改写策略 ----------
 
-
-# 高风险关键词(可能在 prompt 中触发了政策违规)
-# 不依赖 \b word boundary,因为中英混排时 \b 在中文之间不触发
-_RISKY_KEYWORDS = [
-    r"(?:nude|naked|nsfw|sex|porn)",
-    r"(?:violence|blood|gore|kill|murder)",
-    r"(?:gun|weapon|explosive)",
-    r"(?:裸体|裸照|色情|情色|做爱|性交|自慰)",
-    r"(?:血腥|暴力|凶杀|枪支|武器|爆炸)",
-    r"(?:吸毒|毒品|冰毒|大麻|海洛因)",
-    r"(?:习近平|毛泽东|江泽民|胡锦涛|温家宝|李克强|国家领导人|中共中央)",
-    r"(?:台湾|新疆|西藏|香港).{0,8}(?:独立|分离|建国)",
-]
-
-
-def _strip_risky_keywords(prompt: str) -> str:
-    """去掉触发违规的关键词,留下骨架"""
-    cleaned = prompt
-    for pat in _RISKY_KEYWORDS:
-        cleaned = re.sub(pat, " ", cleaned, flags=re.IGNORECASE)
-    # 合并多余空白
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned
-
-
-def _soften_description(prompt: str) -> str:
-    """把直白的画面描述柔化,适合合规重试"""
-    softening_prefixes = [
-        "请生成一段温和、符合平台规范的短视频:",
-        "请基于以下合规、安全的画面描述生成视频:",
-        "请生成一段适合公开分享的短视频,画面内容:",
-    ]
-    return f"{softening_prefixes[0]} {prompt}"
+# v0.2.25:用户新策略 —— 拒绝类失败时,在原 prompt 末尾追加这一段指令,让豆包
+# 自己改写并继续生成。每次重试都基于「上次发送的 prompt」(浏览器层 retry 循环
+# 把返回的 new_prompt 写回 prompt_to_send),所以这条后缀会被累积 append:
+#   attempt 1 原文 + 后缀
+#   attempt 2 (原文 + 后缀) + 后缀
+#   attempt 3 (原文 + 后缀 + 后缀) + 后缀
+# 不再做关键词剥离 / 软化前缀 / 安全模板兜底 — 全部交给豆包自己改写。
+_REVISION_INSTRUCTION = "把这段提示词修改成不违反平台规则的提示词,并生成视频"
 
 
 def revise_prompt(prompt: str, failure: FailureInfo, attempt: int = 1) -> str:
     """
     根据失败分类改写 prompt,用于重试。
 
-    attempt: 1 = 第一次改写,2 = 第二次(更激进的策略)
+    v0.2.25 行为变更:策略违规和生成失败时,统一在「上次发送的 prompt」末尾追加
+    一段让豆包自己改写并重生成的指令。不再启发式剥关键词或替换为安全模板 —
+    把改写权完全交给豆包。
+
+    attempt: 1 = 第一次改写,2 = 第二次(更激进的策略)。当前实现下 attempt 只
+    影响日志 / 未来扩展,不再区分 prompt 内容(累积同一段后缀已够覆盖)。
 
     返回改写后的 prompt。失败分类不需要改 prompt 时,返回原 prompt。
     """
@@ -187,24 +167,10 @@ def revise_prompt(prompt: str, failure: FailureInfo, attempt: int = 1) -> str:
     if not base:
         return base
 
-    if failure.kind == FailureKind.POLICY_VIOLATION:
-        # 违规: 先剥离风险关键词,再软化描述
-        cleaned = _strip_risky_keywords(base)
-        if not cleaned:
-            cleaned = "一段温馨、阳光、积极向上的短视频"
-        if attempt >= 2:
-            # 第二次尝试: 直接走安全模板,不依赖原 prompt
-            return "一段适合各年龄段观看的阳光、积极、温馨的短视频,色调明亮,画面干净"
-        return f"请生成一段温和、符合平台规范的短视频:{cleaned}"
-
-    if failure.kind == FailureKind.GENERATION_FAILED:
-        # 生成失败但原因不明: 简化描述,缩短长度,降低复杂度
-        if attempt >= 2:
-            simplified = re.sub(r"[，。；、,.;:]", " ", base)
-            simplified = re.sub(r"\s+", " ", simplified).strip()
-            if len(simplified) > 60:
-                simplified = simplified[:60] + "……"
-            return simplified or base
-        return f"简化版的画面描述:{base[:80]}"
+    # v0.2.25:POLICY_VIOLATION / GENERATION_FAILED 走同一策略 —— append 指令串。
+    # 浏览器层 retry 循环已把上次的 new_prompt 写回 prompt_to_send,所以这里 base
+    # 就是「上次实际发给豆包的 prompt」,后缀会自然累积。
+    if failure.kind in (FailureKind.POLICY_VIOLATION, FailureKind.GENERATION_FAILED):
+        return f"{base} {_REVISION_INSTRUCTION}"
 
     return base

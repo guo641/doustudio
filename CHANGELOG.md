@@ -2,6 +2,29 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.25 - 2026-08-05
+
+### 变更
+
+- **`revise_prompt` 改写策略:从启发式剥关键词换成单一固定后缀**
+  用户新需求:「如果是因为提示词的问题返回错误,应该在原来的提示词后面加上
+  这句话发给豆包后,让他重新生成 —— 把这段提示词修改成不违反平台规则的
+  提示词,并生成视频。如果还不行就继续加上这句话让他修改」。
+  - `src/doupool/prompt_reviser.py:revise_prompt` 重写。`POLICY_VIOLATION`
+    和 `GENERATION_FAILED` 不再做关键词剥离 (`_RISKY_KEYWORDS` /
+    `_strip_risky_keywords`) 或安全模板兜底,统一返回
+    `f"{原 prompt} 把这段提示词修改成不违反平台规则的提示词,并生成视频"`。
+  - 浏览器层 `browser.run()` retry 循环已把每次返回的 `new_prompt` 写回
+    `prompt_to_send`,所以后缀天然累积:
+    - attempt 1: `原 prompt + 指令`
+    - attempt 2: `原 prompt + 指令 + 指令`
+    - attempt 3: `原 prompt + 指令 + 指令 + 指令`
+    不回退到原 prompt,严格按用户「继续加上这句话让他修改」执行。
+  - 仍区分 `revise_prompt=True/False`:quota / network / invalid_input
+    类失败不触发改写,直接退款重派。
+  - 删除 `_RISKY_KEYWORDS` / `_strip_risky_keywords` / `_soften_description`
+    三个私有函数,改写策略从「软件启发式 + 兜底模板」简化为「让豆包自己改」。
+
 ## v0.2.24 - 2026-08-05
 
 ### 修复
