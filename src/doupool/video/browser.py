@@ -593,6 +593,22 @@ def _build_launch_kwargs(*, window_visible: bool = False) -> dict:
     }
 
 
+def _is_context_alive(context) -> bool:
+    """v0.2.26:安全判断 BrowserContext 是否还活着。
+
+    Playwright 的 `BrowserContext.is_closed()` 是 sync 调用,理论上不会抛,
+    但旧版本 / 远程 driver / context 已被 GC 时偶尔抛 RuntimeError。这里
+    统一用 try/except 兜底,异常一律视作「已关闭」,让调用方走清缓存 + 报错
+    路径,不要把底层异常原文透出去到 UI。
+
+    返回 True = 还能 new_page();False = context 已死,别再操作。
+    """
+    try:
+        return not context.is_closed()
+    except Exception:
+        return False
+
+
 def load_image_base64(path: Path) -> tuple[str, str, str]:
     data = path.read_bytes()
     mime = mimetypes.guess_type(path.name)[0] or "image/png"
@@ -750,7 +766,21 @@ class PlaywrightVideoRunner:
         调用方负责写回 VideoTask。
         """
         context, _bundle = await self._get_shared_context(profile_dir, pc_version=None)
-        page = context.pages[0] if context.pages else await context.new_page()
+        # v0.2.26:不复用 anchor page(同 run() 一样的修复 —— 详见 run() 注释)。
+        # 必须 new_page() 才不会让 finally page.close() 把 anchor 关掉 → context
+        # 0 page → Playwright 自动 close context → 同账号并发任务全炸。
+        if not _is_context_alive(context):
+            self._contexts.pop(str(profile_dir), None)
+            self._tokens.pop(str(profile_dir), None)
+            raise RuntimeError("视频浏览器上下文已关闭,请重试")
+        try:
+            page = await context.new_page()
+        except Exception as exc:
+            self._contexts.pop(str(profile_dir), None)
+            self._tokens.pop(str(profile_dir), None)
+            raise RuntimeError(
+                f"视频浏览器窗口已关闭,请重新打开后重试:{exc}"
+            ) from exc
         try:
             # 必须先打开 doubao.com 拿到 aegis 风控指纹,否则 CHAIN_SCRIPT
             # 会被字节拒为 1011(用户未登录)——和首次提交一样的硬约束。
@@ -815,26 +845,28 @@ class PlaywrightVideoRunner:
         context, token_bundle = await self._get_shared_context(
             profile_dir, pc_version=pc_version, window_visible=window_visible,
         )
-        # v0.2.20:复用 anchor page(共享 BrowserContext 时由 _get_shared_context
-        # 保留的那个页面)。如果 anchor 已被外部关了(用户手关窗口 / context
-        # 被 Playwright 自动 close 后我们 fallback new_page),就 new_page。
-        # 无论哪条路,后续 replaceState 都需要文档有 doubao.com origin。
-        page = None
-        for candidate in context.pages:
-            try:
-                if not candidate.is_closed():
-                    page = candidate
-                    break
-            except Exception:
-                continue
-        if page is None:
-            try:
-                page = await context.new_page()
-            except Exception as exc:
-                # context 已 close → 退一层,清掉缓存让下一次重试时重建
-                self._contexts.pop(str(profile_dir), None)
-                self._tokens.pop(str(profile_dir), None)
-                raise RuntimeError(f"视频浏览器窗口已关闭,请重新打开后重试:{exc}") from exc
+        # v0.2.26:每个 task 必须 new_page() —— 不复用 anchor。
+        # 旧逻辑「遍历 context.pages 选未关闭的」会让 task 拿到 anchor page
+        # (context.pages[0],由 _get_shared_context 保留防止 context 进入
+        # "0 page" 状态被 Playwright 自动 close)。task 完成后 finally
+        # page.close() 会把 anchor 关掉 → 同账号并发任务全部抛
+        # TargetClosedError。改为始终 new_page(),anchor 仍由 _get_shared_context
+        # 持有,生命周期跟 context 走(runner.close() 时统一关)。
+        if not _is_context_alive(context):
+            self._contexts.pop(str(profile_dir), None)
+            self._tokens.pop(str(profile_dir), None)
+            raise RuntimeError("视频浏览器上下文已关闭,请重试")
+        try:
+            page = await context.new_page()
+        except Exception as exc:
+            # context 已 close(用户手关窗 / Playwright 因外部原因 close /
+            # 进程重启后缓存指向旧 context 等)。清掉缓存,下次重试会走完整
+            # 重建流程;不要把底层 Playwright 异常原文直接透到 UI。
+            self._contexts.pop(str(profile_dir), None)
+            self._tokens.pop(str(profile_dir), None)
+            raise RuntimeError(
+                f"视频浏览器窗口已关闭,请重新打开后重试:{exc}"
+            ) from exc
         try:
             # v0.2.20:保险 —— 如果 anchor 是 about:blank(用户从 login profile
             # 拉过一次然后关窗,我们用另一个 instance 重启了 context 的场景),

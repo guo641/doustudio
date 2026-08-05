@@ -2,6 +2,40 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.26 - 2026-08-05
+
+### 修复
+
+- **同账号多任务并发时 anchor page 被关闭 → context 崩溃**
+  用户反馈:同一个账号(50 quota 桶)同时跑多个任务,只要有一个任务**成功**,
+  浏览器界面立刻关闭,其他正在轮询链路的并发任务立刻抛
+  `Target page, context or browser has been closed`。
+  - 根因:`PlaywrightVideoRunner` 是 per-profile_dir 共享 BrowserContext,
+    由 `_get_shared_context` 创建一个 anchor page 留在 `context.pages[0]`,
+    防止 context 进入「0 page」状态被 Playwright 自动 close。但 `run()` 和
+    `recheck_result()` 之前会**优先复用** `context.pages[0]`,然后 finally
+    关掉 → task 拿到的是 anchor → 关掉 anchor → context 0 page → 自动 close
+    context → 同账号并发任务在 `wait_for_timeout` 轮询时全部抛错。
+  - 修复:`src/doupool/video/browser.py`
+    - 新增模块级 helper `_is_context_alive(context)`,try/except 包装
+      `context.is_closed()`,统一兜底让 UI 拿到可读提示而非底层异常。
+    - `run()` 第 822-840 行改为**始终** `await context.new_page()`,
+      不再遍历 `context.pages` 选未关闭的;context 已 close 时清缓存 + 抛
+      `RuntimeError("视频浏览器上下文已关闭,请重试")` 或
+      `RuntimeError("视频浏览器窗口已关闭,请重新打开后重试:...")`。
+    - `recheck_result()` 第 753 行同步改为 `new_page()` 路径。
+  - anchor page 仍由 `_get_shared_context` 持有,生命周期跟 context 走,
+    `runner.close()` 时统一关闭。task 各自 new 出来的 page 在 finally 正常
+    关闭,不再污染 anchor。
+  - 调度层 `service.py` 不动:`_global_semaphore` 无 per-account 锁是 v0.2.19
+    显式决定(50 quota 账号要能并发),bug 只在 `run()` 误用 anchor。
+  - 测试:`tests/test_video_browser.py` 新增 5 个用例覆盖
+    - `run()` 自己 new_page 且不动 anchor
+    - 两个并发 run() 互不影响
+    - context 已 close 时清晰报错
+    - `recheck_result()` 同样不碰 anchor
+    - 5 轮 run() 后 anchor 仍 `pages[0]` 且未关闭
+
 ## v0.2.25 - 2026-08-05
 
 ### 变更
