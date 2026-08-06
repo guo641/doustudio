@@ -851,9 +851,11 @@ class VideoTaskService:
                     continue
                 except Exception as exc:
                     if cancellation.is_set():
-                        # 用户取消:扣款不退还 —— 用户进 generating 后取消,
-                        # 豆包已经在生成,额度已扣。这与「网络/prompt 违规退款」
-                        # 是两条独立路径:用户主动取消 ≠ 豆包拒绝服务。
+                        # v0.2.27:行为变更 —— 用户主动取消也退还额度。
+                        # 取消 ≠ 任务成功,豆包即便已部分生成,用户没拿到视频就
+                        # 算失败,不应扣 quota。与 NETWORK/POLICY/INVALID/TIMEOUT
+                        # 退款是同一条「失败 = 退」语义路径。
+                        refund_quota_if_recorded()
                         self.repository.assign_video_task(task_id, None)
                         self.repository.update_video_task(
                             task_id, status="queued", error_message="应用已停止，等待下次继续"
@@ -865,10 +867,13 @@ class VideoTaskService:
                     # 已扣的额度。GENERATION_FAILED / UNKNOWN / RATE_LIMITED
                     # 不退 —— 前两类豆包大概率已计费,后者本来就是配额问题,
                     # 已经在上面 mark_account_limited 路径里处理。
+                    # v0.2.27:加入 TIMEOUT —— 本地 deadline 等不到结果 = 用户
+                    # 没拿到视频,应退。
                     if failure.kind in (
                         FailureKind.NETWORK,
                         FailureKind.POLICY_VIOLATION,
                         FailureKind.INVALID_INPUT,
+                        FailureKind.TIMEOUT,
                     ):
                         refund_quota_if_recorded()
 

@@ -753,6 +753,9 @@ class RefundableRunner:
         elif failure_kind == "generation_failed":
             # 不退款的一类 — 应保留 quota
             self.exc = RuntimeError("视频生成失败")
+        elif failure_kind == "timeout":
+            # v0.2.27:本地 deadline 超时,应退款 —— 豆包没出结果,没真实扣费。
+            self.exc = RuntimeError("视频生成超时")
         else:
             raise ValueError(f"unknown failure_kind: {failure_kind}")
 
@@ -770,6 +773,7 @@ class RefundableRunner:
         ("network", True),
         ("policy", True),
         ("invalid", True),
+        ("timeout", True),  # v0.2.27:本地 deadline 超时也退款
         ("generation_failed", False),
     ],
 )
@@ -778,6 +782,7 @@ async def test_service_refunds_quota_on_refundable_failures(
 ):
     """v0.2.19:NETWORK / POLICY_VIOLATION / INVALID_INPUT 失败时,退还已扣 quota。
     GENERATION_FAILED 不退(豆包很可能已经计费)。
+    v0.2.27:加入 TIMEOUT —— 本地 deadline 超时也算退(豆包没出结果)。
     """
     Account.create(
         id="acc-refund", display_name="refund", doubao_user_id="u-refund",
@@ -1188,3 +1193,77 @@ async def test_refresh_url_rejects_missing_task(repository):
     service = VideoTaskService(repository, RecheckRunner(None), StaticSettings())
     with pytest.raises(ValueError, match="任务不存在"):
         service.schedule_refresh_url("does-not-exist")
+
+
+# --- v0.2.27:用户取消也退还额度 ---
+
+
+class CancellingRunner:
+    """v0.2.27 测试用:runner 进入 generating 后主动 set cancel event,然后
+    抛异常 —— 模拟「用户在生成中途点了停止」。这会走 service.py:853-863 的
+    `if cancellation.is_set()` 分支,期望:退还 quota + 任务回 queued。
+
+    runner 自己抛异常而不是返回成功,是为了让 service 进 except 分支(cancellation
+    检查在 except 块里)。
+    """
+
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        # 先扣 quota
+        update(status="generating", conversation_id="conv-cancel")
+        # 模拟用户在 generating 阶段点了停止 — set cancel,然后让 except 块
+        # 命中 cancellation.is_set() True 分支
+        cancel_event.set()
+        raise RuntimeError("任务已取消")
+
+
+@pytest.mark.asyncio
+async def test_service_refunds_quota_on_user_cancel(repository, temp_profile):
+    """v0.2.27 行为变更:用户主动取消也退还额度(之前不退)。
+
+    之前 v0.2.19-v0.2.26 的逻辑是「cancel = 不退,因为豆包已经在跑」,但这
+    对用户不公平 —— 用户没拿到视频 = 失败,不应扣 quota。这次统一改成
+    「失败 = 退」。
+    """
+    Account.create(
+        id="acc-cancel", display_name="cancel", doubao_user_id="u-cancel",
+        profile_dir=temp_profile,
+    )
+    runner = CancellingRunner()
+    service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
+
+    # mini 5s = 5 点
+    task = service.start("取消测试", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    # 取消后任务回 queued,等下次继续
+    assert saved.status == "queued", f"取消后应为 queued,实际 {saved.status}"
+    # 关键:quota 净 0(扣 5 退 5)
+    acc = Account.get_by_id("acc-cancel")
+    assert acc.video_quota_used_mini == 0, (
+        f"取消应退款,但 mini 桶 = {acc.video_quota_used_mini}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_service_cancel_refund_noop_when_quota_not_charged(repository, temp_profile):
+    """v0.2.27:runner 在扣 quota 前就 cancel → refund_quota_if_recorded()
+    安全 noop,不报错,quota 不动。"""
+    Account.create(
+        id="acc-cancel-noop", display_name="cn", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+
+    class CancelBeforeChargingRunner:
+        async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+            cancel_event.set()
+            raise RuntimeError("任务已取消")
+
+    runner = CancelBeforeChargingRunner()
+    service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
+
+    task = service.start("早取消", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    acc = Account.get_by_id("acc-cancel-noop")
+    assert acc.video_quota_used_mini == 0  # 从未扣过,refund 路径要安全

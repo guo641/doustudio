@@ -2,6 +2,41 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.27 - 2026-08-06
+
+### 修复
+
+- **超时任务退还额度**
+  用户反馈:同账号一次性提交 5 个任务,3 个 succeeded、2 个 timeout。豆包没
+  出结果,本地代码兜底超时抛 `RuntimeError("视频生成超时")` → 走
+  `classify_failure` 落到 `GENERATION_FAILED`/`UNKNOWN`,这两个分类不在
+  退款白名单 → 用户被误扣 quota。
+  - 修复:`src/doupool/prompt_reviser.py`
+    - 新增 `FailureKind.TIMEOUT = "timeout"` 枚举值。
+    - 新增 `_TIMEOUT_PATTERNS`(放在 `_GENERATION_FAILED_PATTERNS` **之前**,
+      因为「视频生成超时」包含「视频生成失败」子串 —— 顺序错就漏退款)。
+      模式精确化:`r"视频生成超时"`、`r"生成超时"`、`r"请求超时"` 等。
+    - `classify_failure()` 加 TIMEOUT 分支:`retryable=True, revise_prompt=False`。
+      超时 ≠ prompt 内容问题,改写 prompt 没意义,正确动作是退款。
+  - 修复:`src/doupool/video/service.py` 退款白名单加入 `FailureKind.TIMEOUT`。
+  - 行为变更:**用户主动取消也退还额度**(原来 v0.2.19-v0.2.26 取消 = 不退)。
+    现在统一「失败 = 退」语义 —— 用户没拿到视频 = 失败,不该扣 quota。任务
+    仍回 queued 等下次继续(取消 ≠ 永远放弃)。
+
+### 新增
+
+- **设置 → 调度 → 任务超时(分钟)**
+  - 全局默认值,范围 1-20 分钟,默认 7(沿用旧 hardcode 420s)。
+  - 提交任务表单不再单独暴露超时,避免 UI 复杂化(全局足够)。
+  - 实现:`src/doupool/settings/service.py` DEFAULTS 加 `default_timeout_minutes: 7`,
+    `_validate()` 校验 1-20;`main.py` 启动时读 settings 把分钟 × 60 写入
+    `PlaywrightVideoRunner.timeout`。
+  - **只对下一个 task 生效**:用户在生成途中改设置不影响正在跑的任务(避免
+    deadline 突变成更短的值让跑一半的任务立刻超时);runner.timeout 是模块
+    属性,下一次 `run()` 调用读 `self.timeout` 时自然拿到新值。
+  - UI:「调度」卡片末尾加 `DpField` `任务超时(分钟)`,hint 写明「超时未成功
+    将自动退还额度」让用户感知退款行为。
+
 ## v0.2.26 - 2026-08-05
 
 ### 修复

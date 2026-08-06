@@ -25,6 +25,9 @@ class FailureKind(str, Enum):
     NETWORK = "network"                     # 网络异常 / 超时 / 5xx
     INVALID_INPUT = "invalid_input"         # 输入格式错误 / 描述不清
     GENERATION_FAILED = "generation_failed" # 豆包明确说"视频生成失败"
+    # v0.2.27:本地等待豆包超时 —— 浏览器层 deadline 到了还没收到结果,默认
+    # 退款(用户没成功拿到视频 = 豆包大概率也没扣费)。
+    TIMEOUT = "timeout"
     UNKNOWN = "unknown"
 
 
@@ -90,6 +93,19 @@ _GENERATION_FAILED_PATTERNS = [
     re.compile(r"video.{0,20}generation.{0,20}fail", re.IGNORECASE),
 ]
 
+# v0.2.27:本地 deadline 超时 —— 区分于 NETWORK(timeout 是本地等,网络层
+# 没失败)。模式必须放在 _GENERATION_FAILED_PATTERNS **之前** 因为「视频生成
+# 超时」包含「视频生成失败」子串,会被它先吃掉 → 退款路径不命中。
+# 精确化到「生成」语境:connection timed out 这种纯网络错继续走 NETWORK
+# (NETWORK 也退款,只是分类更准确)。
+_TIMEOUT_PATTERNS = [
+    re.compile(r"视频生成超时"),       # browser.py:1000 RuntimeError("视频生成超时")
+    re.compile(r"生成超时"),
+    re.compile(r"请求超时"),
+    re.compile(r"等待.{0,8}(?:超时|超时未响应)"),
+    re.compile(r"deadline.{0,10}exceeded", re.IGNORECASE),
+]
+
 
 def classify_failure(error_message: str, status_code: Optional[int] = None) -> FailureInfo:
     """
@@ -123,6 +139,11 @@ def classify_failure(error_message: str, status_code: Optional[int] = None) -> F
     for pat in _NETWORK_PATTERNS:
         if pat.search(msg):
             return FailureInfo(FailureKind.NETWORK, retryable=True, revise_prompt=False, detail=pat.search(msg).group(0))
+
+    # v0.2.27:必须在 _GENERATION_FAILED_PATTERNS 之前(见 _TIMEOUT_PATTERNS 注释)。
+    for pat in _TIMEOUT_PATTERNS:
+        if pat.search(msg):
+            return FailureInfo(FailureKind.TIMEOUT, retryable=True, revise_prompt=False, detail=pat.search(msg).group(0))
 
     for pat in _GENERATION_FAILED_PATTERNS:
         if pat.search(msg):

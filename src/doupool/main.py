@@ -49,9 +49,15 @@ def main() -> None:
         settings.login_timeout_seconds,
         keepalive_seconds=30.0,
     )
+    video_runner = PlaywrightVideoRunner()
+    # v0.2.27:把 settings 里的全局超时默认值转成秒喂给 runner.timeout。
+    # runner.timeout 在每次 run() 启动 deadline 循环时读(见 browser.py:988),
+    # 所以用户改完设置保存后,下一个 task 立即用新超时 —— 不需要 live reload,
+    # 也不需要重启进程。task 已经跑起来的部分不会中途变更 timeout。
+    video_runner.timeout = settings_service.get().get("default_timeout_minutes", 7) * 60
     video_service = VideoTaskService(
         repository,
-        PlaywrightVideoRunner(),
+        video_runner,
         settings_service,
         assets_dir=settings.data_dir,
     )

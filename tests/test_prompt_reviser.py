@@ -83,6 +83,37 @@ class TestClassifyFailure:
         assert info.retryable is True
         assert info.revise_prompt is False
 
+    # v0.2.27:本地 deadline 超时 —— 必须走 TIMEOUT 路径,否则退款白名单
+    # 不命中 → 用户被误扣额度。critical:「视频生成超时」包含「视频生成失败」
+    # 子串,所以 _TIMEOUT_PATTERNS 必须在 GENERATION 之前匹配。
+    def test_timeout_matches_video_generation_timeout(self):
+        info = classify_failure("视频生成超时")
+        assert info.kind == FailureKind.TIMEOUT, f"应命中 TIMEOUT,实际 {info.kind}"
+        assert info.retryable is True
+        assert info.revise_prompt is False  # 超时 ≠ prompt 问题,不重写
+
+    def test_timeout_matches_generating_timeout(self):
+        info = classify_failure("生成超时,请稍后重试")
+        assert info.kind == FailureKind.TIMEOUT
+
+    def test_timeout_matches_request_timeout(self):
+        info = classify_failure("请求超时,请重试")
+        assert info.kind == FailureKind.TIMEOUT
+
+    def test_timeout_does_not_match_bare_network_timeout(self):
+        # 纯网络超时(connection timed out)仍走 NETWORK(因为 NETWORK 模式先
+        # 命中)。这条作为「模式不误伤」的回归测试 —— NETWORK 路径也已退款,
+        # 双重保险不影响退款结果。
+        info = classify_failure("Connection timed out after 30s")
+        assert info.kind == FailureKind.NETWORK
+
+    def test_timeout_priority_over_generation_failed(self):
+        # 关键回归:「视频生成超时」包含「视频生成失败」子串。
+        # TIMEOUT 模式必须放在 GENERATION 之前 —— 否则会被 GENERATION 先吃掉,
+        # 退到 GENERATION_FAILED 白名单外,用户被误扣。
+        info = classify_failure("视频生成超时")
+        assert info.kind != FailureKind.GENERATION_FAILED
+
     def test_empty_message(self):
         info = classify_failure("")
         assert info.kind == FailureKind.UNKNOWN

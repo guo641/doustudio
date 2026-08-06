@@ -23,6 +23,8 @@ type Settings = {
   max_reject_retries: number;
   // v0.2.22 Q2:视频生成时 Chromium 窗口是否可见,默认隐藏(opt-in)。
   runner_window_visible: boolean;
+  // v0.2.27:每个任务等待豆包生成的最长时长(分钟)。超时未成功自动退还额度。
+  default_timeout_minutes: number;
 };
 
 const settings = ref<Settings | null>(null);
@@ -147,6 +149,22 @@ async function onCheckUpdate() {
             看到浏览器在跑、确认有在生成。关闭则窗口放屏幕外 (-2000,-2000)。
             可能被风控识别为异常登录态,生产建议关闭。修改后只对新启动的
             profile / 重启进程生效。
+          </span>
+        </DpField>
+        <!-- v0.2.27:每个任务等待豆包生成的最长时长。超过该时间仍未成功 →
+             任务回 queued,quota 自动退还(不再误扣)。范围 1-20 分钟,
+             默认 7 —— 超时上限 20 是产品决策:再长会拖慢整批任务周转。 -->
+        <DpField label="任务超时(分钟)" for-id="setting-default-timeout-minutes">
+          <DpInput
+            id="setting-default-timeout-minutes"
+            v-model.number="settings.default_timeout_minutes"
+            type="number"
+            :min="1"
+            :max="20"
+          />
+          <span class="watermark-hint">
+            1-20 分钟,默认 7。每个任务等待豆包生成的最长时间,超时未成功将自动退还额度。
+            修改后对下一个提交的任务生效,正在跑的任务不受影响。
           </span>
         </DpField>
       </div>

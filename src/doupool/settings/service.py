@@ -49,6 +49,11 @@ class SettingsService:
         # 仍可在设置里手动关。仅在 BrowserContext 首次创建时生效;cached
         # context 复用前次位置,改 setting 后只对下次新建 context 生效。
         "runner_window_visible": True,
+        # v0.2.27:每个任务等待豆包生成的最长时长(分钟)。超时未成功自动退还
+        # 额度(见 video/service.py 退款白名单 + FailureKind.TIMEOUT)。main.py
+        # 启动时把 minutes × 60 写入 PlaywrightVideoRunner.timeout。修改设置
+        # 后只对下一个 task 生效(live update 不做,见 plan 注释)。
+        "default_timeout_minutes": 7,
         # v0.2.17:浏览器 PC 端版本号,被 video/browser.py 读取塞到
         # payload.client_meta.pc_version。不暴露前端(17-b 时一起加 UI),
         # 升级时只需改这里 + 重启服务。
@@ -139,5 +144,9 @@ class SettingsService:
             raise ValueError("日志级别无效")
         if not 1 <= int(values["log_retention_days"]) <= 365:
             raise ValueError("日志保留天数必须在 1 到 365 之间")
+        # v0.2.27:超时上限 20 分钟由用户决定 —— 太长会让「真的卡死」的任务
+        # 在队列里占名额太久,反而拖慢整批任务周转。1 分钟下限避免误设 0。
+        if not 1 <= int(values["default_timeout_minutes"]) <= 20:
+            raise ValueError("任务超时必须在 1 到 20 分钟之间")
         if not Path(values["download_dir"]).expanduser().is_absolute():
             raise ValueError("下载目录必须是绝对路径")
