@@ -2,6 +2,41 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.31 - 2026-08-06
+
+### 修复
+
+- **第一次改写后豆包再次报错但软件不触发下一轮改写的 bug**
+  用户反馈:第一次改写 prompt 发送过去之后,豆包立即拒绝,
+  但软件没识别到这个拒绝,没有进入下一轮改写重试,任务
+  一直卡在「生成中」直到 timeout。
+  - 根因:[protocol.py](src/doupool/video/protocol.py) 里
+    `scan_sse_for_policy_rejection` 的 `_walk` 递归只盯着
+    `text_block` / `content_block` / `content` / `message`
+    几个固定 key。如果豆包把第二次拒绝文案塞到 `delta.text` /
+    `reply_message` / 顶层 `text` / `choices[*].delta.content`
+    等新字段(版本漂移),scan 直接漏,不会抛
+    `DoubaoContentRejected`,retry loop 不触发,任务掉进
+    polling loop 等 5-20min timeout。
+  - 修复:`_walk` 改成递归走 payload 里**所有 string 值**,
+    用 `_NON_TEXT_KEYS`(id/status/session_id/timestamp 等
+    已知元数据)+ `_MAX_TEXT_LEN = 8000` 截断避免误命中和
+    拖慢正则,兜住豆包未来把拒绝文案塞到任意字段。
+  - 配套改进:[browser.py](src/doupool/video/browser.py)
+    `_submit_and_poll` 的 polling loop 加 DEBUG 节流日志
+    (`poll_log_every = max(5, timeout/6)`,默认 20min 超时
+    下每 3min 一行),用户下次再撞「卡生成中」时用
+    `LOGURU_LEVEL=DEBUG` 起程序即可看到 chain 还在跑、
+    还要等多久 — 不再是完全无输出的黑盒。
+
+### 测试
+
+- `test_video_protocol.py` 加 4 个 v0.2.31 测试:
+  - `top_level_text` 命中(原 _walk 不扫)
+  - `choices[*].delta.content` 命中(原 _walk 不扫)
+  - `_NON_TEXT_KEYS` 元数据字段被跳过(防误命中)
+  - 超长字符串被截断到 8000(防正则拖慢 / 误塞 base64)
+
 ## v0.2.30 - 2026-08-06
 
 ### 修复

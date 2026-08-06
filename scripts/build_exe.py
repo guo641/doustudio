@@ -242,19 +242,37 @@ def upload_release(zip_path: Path, sha_path: Path, version: str, repo: str, toke
         name = f.name
         url = f"{upload_base}?name={urllib.parse.quote(name)}"
         print(f"[upload] {name} ({size} bytes) -> {url}")
-        req = urllib.request.Request(
-            url,
-            data=f.read_bytes(),
-            method="POST",
-            headers={
-                **headers,
-                "Content-Type": "application/octet-stream",
-                "Content-Length": str(size),
-            },
-        )
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        print(f"[upload] ok -> {payload.get('browser_download_url')}")
+        # v0.2.31:大文件(>200MB)上传 GitHub 偶发 ConnectionResetError / 写超时,
+        # 加指数退避重试。zip + sha 各最多重试 5 次,每次间隔 2/4/8/16/32s。
+        import time as _time
+        data = f.read_bytes()
+        attempt = 0
+        last_exc: Exception | None = None
+        while attempt < 5:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    method="POST",
+                    headers={
+                        **headers,
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": str(size),
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                print(f"[upload] ok -> {payload.get('browser_download_url')}")
+                last_exc = None
+                break
+            except (urllib.error.URLError, ConnectionResetError, TimeoutError) as exc:
+                last_exc = exc
+                attempt += 1
+                wait = 2 ** attempt
+                print(f"[upload] {name} 第 {attempt}/5 次失败: {exc};{wait}s 后重试", file=sys.stderr)
+                _time.sleep(wait)
+        if last_exc is not None:
+            raise last_exc
 
 
 def main() -> int:
@@ -262,14 +280,27 @@ def main() -> int:
     ap.add_argument("--mode", choices=["onedir", "onefile"], default="onedir")
     ap.add_argument("--version", default="", help="版本号(如 v0.2.0)")
     ap.add_argument("--upload", action="store_true", help="打包后上传到 GitHub Release")
+    ap.add_argument(
+        "--upload-only",
+        action="store_true",
+        help="跳过 build/zip,只上传 dist/ 下既有的 zip + sha(用于重试上传)",
+    )
     args = ap.parse_args()
 
-    dist = build(args.mode)
-    if args.mode == "onedir":
-        lift_up_browsers(dist)
     version = args.version or os.environ.get("GITHUB_REF_NAME", "dev")
-    zip_path = package_zip(dist, args.mode, version)
-    sha_path = zip_path.with_suffix(".zip.sha256")
+    if args.upload_only:
+        plat = _detect_platform()
+        zip_path = REPO_ROOT / "dist" / f"DouStudio-{version}-{plat}.zip"
+        sha_path = zip_path.with_suffix(".zip.sha256")
+        if not (zip_path.exists() and sha_path.exists()):
+            raise SystemExit(f"--upload-only 需要 {zip_path} 与 {sha_path} 存在")
+        print(f"[upload-only] 跳过 build,直接用 {zip_path.name} ({zip_path.stat().st_size // 1024} KB)")
+    else:
+        dist = build(args.mode)
+        if args.mode == "onedir":
+            lift_up_browsers(dist)
+        zip_path = package_zip(dist, args.mode, version)
+        sha_path = zip_path.with_suffix(".zip.sha256")
 
     if args.upload:
         token = os.environ.get("GH_TOKEN", "")

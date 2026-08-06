@@ -986,6 +986,8 @@ class PlaywrightVideoRunner:
         update(status="generating", **ack)
 
         deadline = time.monotonic() + self.timeout
+        poll_log_every = max(5, int(self.timeout / 6))  # 默认 20min → 每 3min 一条;最短 5
+        poll_count = 0
         while time.monotonic() < deadline:
             if cancel_event.is_set():
                 raise RuntimeError("任务已取消")
@@ -996,6 +998,16 @@ class PlaywrightVideoRunner:
             if result:
                 update(status="resolving", **result)
                 return await self._resolve_original_download(page, result, cancel_event)
+            poll_count += 1
+            # v0.2.31:polling 期间节流打日志,避免之前「卡生成中」无任何输出,
+            # 让用户能看到 chain 还在跑、还要等多久。DEBUG 级别,默认不打印;
+            # 出问题用 `LOGURU_LEVEL=DEBUG` 起程序即可看到。
+            if poll_count % poll_log_every == 0:
+                remaining = max(0, int(deadline - time.monotonic()))
+                _LOGGER.debug(
+                    "video poll still waiting conv=%s polls=%d remaining=%ds",
+                    ack.get("conversation_id", "?"), poll_count, remaining,
+                )
             await page.wait_for_timeout(self.poll_interval * 1000)
         raise RuntimeError("视频生成超时")
 

@@ -494,6 +494,68 @@ def test_scan_sse_for_policy_rejection_detects_new_return_verb():
     assert "无法返回" in excinfo.value.error_message
 
 
+def test_scan_sse_for_policy_rejection_detects_rejection_in_top_level_text():
+    """v0.2.31:豆包若把拒绝文案塞到 SSE 顶层 text 字段(不再是 text_block.text),
+    也必须命中。新版 _walk 走全 payload 字符串值,只过滤已知元数据。"""
+    text = (
+        'event: TEXT_MESSAGE\ndata: {"text":"抱歉,我暂时无法生成这个视频,请换个主题再试试",'
+        '"status":"failed","id":"abc"}\n\n'
+        'event: SSE_ACK\ndata: {"ack_client_meta":{"conversation_id":"c1",'
+        '"section_id":"s1"},"query_list":[{"question_id":"q1"}]}\n\n'
+    )
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_sse_ack(text)
+    # 任一拒绝子串都算命中(具体哪个 substring 由 _POLICY_PATTERNS 顺序决定,
+    # 不能写死 — 只想确认触发到了 DoubaoContentRejected 路径)
+    assert any(
+        kw in excinfo.value.error_message
+        for kw in ("无法生成", "换个主题", "无法满足", "无法响应")
+    )
+
+
+def test_scan_sse_for_policy_rejection_detects_rejection_in_delta_text():
+    """v0.2.31:豆包若把拒绝文案塞到 delta.text / choices[*].delta.content 等
+    流式字段 —— 这种字段路径不在原 _walk 固定 key 集合里,新版必须兜住。"""
+    text = (
+        'event: TEXT_MESSAGE\ndata: {"choices":[{"delta":{"content":"'
+        '生成内容中疑似包含侵权,请更换主题再试"}}],'
+        '"id":"msg_abc","model":"seedance"}\n\n'
+        'event: SSE_ACK\ndata: {"ack_client_meta":{"conversation_id":"c1",'
+        '"section_id":"s1"},"query_list":[{"question_id":"q1"}]}\n\n'
+    )
+    with pytest.raises(DoubaoContentRejected):
+        parse_sse_ack(text)
+
+
+def test_scan_sse_for_policy_rejection_ignores_metadata_short_strings():
+    """v0.2.31:id/status/session_id/timestamp 等元数据字段不会进 chunks,
+    不会触发误判。即使这些字段恰好拼出 "无法返回" 之类也不能误命中(这里用
+    「无法满足」+ status=拒绝两个值验证 status 字段被跳过)。"""
+    # 「无法满足」是一句完整拒绝,放 status 字段 — 不应被识别成拒绝
+    text = (
+        'event: TEXT_MESSAGE\ndata: {"id":"msg_1","status":"我无法满足您",'
+        '"session_id":"sess_1","created_at":1234567890}\n\n'
+        'event: SSE_ACK\ndata: {"ack_client_meta":{"conversation_id":"c1",'
+        '"section_id":"s1"},"query_list":[{"question_id":"q1"}]}\n\n'
+    )
+    ack = parse_sse_ack(text)
+    assert ack["conversation_id"] == "c1"
+
+
+def test_scan_sse_for_policy_rejection_truncates_overlong_strings():
+    """v0.2.31:超长字符串(>8k)被截断,不会拖慢正则匹配或把 base64 视频 URL
+    之类误塞进 chunks(基线测试,确保 chunk 不爆炸)。"""
+    big_payload_text = "好的,正在生成视频" + "x" * 20000
+    text = (
+        f'event: TEXT_MESSAGE\ndata: {{"text":"{big_payload_text}",'
+        f'"id":"msg_abc"}}\n\n'
+        f'event: SSE_ACK\ndata: {{"ack_client_meta":{{"conversation_id":"c1",'
+        f'"section_id":"s1"}},"query_list":[{{"question_id":"q1"}}]}}\n\n'
+    )
+    ack = parse_sse_ack(text)
+    assert ack["conversation_id"] == "c1"
+
+
 def test_parse_sse_ack_response_text_truncated_at_2000():
     """v0.2.24:response_text 用 raw sse_text[:2000],跟 DoubaoRateLimited 一致。"""
     long_data = '{"content_block":[{"content":{"text_block":{"text":"我暂时无法生成"}}}]}'

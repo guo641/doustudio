@@ -363,6 +363,20 @@ def parse_sse_ack(text: str) -> dict[str, str]:
     }
 
 
+# v0.2.31:已知非文本字段(纯元数据,不会包含拒绝文案),扫到时跳过,
+# 既保留针对性又避免误命中。长度阈值防把"id"、"status" 之类短字符串误进 chunks。
+_NON_TEXT_KEYS = {
+    "id", "ids", "event_id", "session_id", "user_id", "question_id",
+    "conversation_id", "section_id", "message_id", "request_id",
+    "type", "event_type", "status", "code", "status_code", "err_code",
+    "timestamp", "created_at", "updated_at", "time", "role",
+    "model", "name", "version", "request_type",
+    "is_final", "is_end", "is_error", "final", "end", "done",
+    "tool_call_id", "function_call_id",
+}
+_MAX_TEXT_LEN = 8000  # 防御:豆包偶然回超大 base64 / 视频 URL 也只取前 N 字
+
+
 def scan_sse_for_policy_rejection(sse_text: str) -> str | None:
     """v0.2.24:扫描豆包 SSE 响应文本里的拒绝文案。
 
@@ -378,31 +392,29 @@ def scan_sse_for_policy_rejection(sse_text: str) -> str | None:
     扫描策略(防御性):
     - 拆 `event:` / `data:` 双行包
     - 跳过 SSE_ACK / STREAM_ERROR / SSE_HEARTBEAT(已由 parse_sse_ack 处理或无内容)
-    - 凡是 data 是 JSON,递归收集 text_block.text —— 适配 event 命名漂移
-      (Doubao 不同版本混用 TEXT_MESSAGE / TEXT_CHUNK / 无 event)
+    - v0.2.31:递归走 payload 所有 string 值(不再只盯着 text_block.text /
+      content_block / content / message 几个固定 key),过滤 _NON_TEXT_KEYS
+      元数据 + 长度阈值,避免误命中 id/status/session_id 之类短字符串,
+      同时兜住豆包未来把拒绝文案塞到 delta.text / reply_message / 顶层
+      text / choices[*].delta.content 等新字段。
     - 拼接所有 text → 跑 _POLICY_PATTERNS(复用,不再写新 regex)
     - 返回首个命中的 match.group(0)[:200],未命中 None
     """
     chunks: list[str] = []
 
     def _walk(payload: object) -> None:
-        """递归收集 payload 里所有 text_block.text 字符串。"""
+        """递归收集 payload 里所有可能是文本内容的 string 值。"""
         if isinstance(payload, dict):
-            tb = payload.get("text_block")
-            if isinstance(tb, dict):
-                t = tb.get("text")
-                if isinstance(t, str) and t:
-                    chunks.append(t)
-            cbs = payload.get("content_block")
-            if isinstance(cbs, list):
-                for cb in cbs:
-                    _walk(cb)
-            content = payload.get("content")
-            if isinstance(content, dict):
-                _walk(content)
-            msg = payload.get("message")
-            if isinstance(msg, dict):
-                _walk(msg)
+            for k, v in payload.items():
+                if isinstance(v, str):
+                    if k in _NON_TEXT_KEYS:
+                        continue
+                    if len(v) > _MAX_TEXT_LEN:
+                        v = v[:_MAX_TEXT_LEN]
+                    if v:
+                        chunks.append(v)
+                elif isinstance(v, (dict, list)):
+                    _walk(v)
         elif isinstance(payload, list):
             for item in payload:
                 _walk(item)
