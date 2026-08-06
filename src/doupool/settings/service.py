@@ -12,14 +12,10 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 class SettingsService:
     DEFAULTS = {
         "max_concurrency": 1,
-        # v0.2.9:按 seedance 模型拆 daily_quota。旧 daily_quota 保留做 legacy
-        # fallback(老 DB 导出 / 还没升级设置的实例,get_daily_quotas() 会兜底)。
-        # v0.2.19:默认值从 5 改成 50 — 豆包每天每账号 50 点,mini 1 点/秒 / fast 1.5 点/秒。
-        # 老 DB 已经存了 5 的话 get_daily_quotas 仍会读老值,需要用户手动改一次。
-        "daily_quota": 50,
-        "daily_quota_mini": 50,
-        "daily_quota_v2": 50,
-        "daily_quota_std": 50,
+        # v0.2.29:豆包官方按账号每日总配额(共享池),不再按 model 拆桶。
+        # 旧 daily_quota / daily_quota_mini/v2/std 保留只读,get_daily_quotas()
+        # 仍会兜底,新装实例或重置后只用一个 daily_quota_shared。
+        "daily_quota_shared": 50,
         "quota_reset_time": "00:00",
         "scheduler_strategy": "least_used",
         "default_model": "seedance_v2.0_mini",
@@ -60,11 +56,11 @@ class SettingsService:
         "pc_version": "3.27.4",
     }
 
-    # seedance 模型 → quota 桶名。供 repository / video_service 单一真值源使用。
+    # v0.2.29:共享池下不再按 model 拆桶,保留常量以兼容老调用点的 import。
     MODEL_QUOTA_BUCKETS = {
-        "seedance_v2.0_mini": "mini",
-        "seedance_v2.0": "v2",
-        "seedance_v2.0_std": "std",
+        "seedance_v2.0_mini": "shared",
+        "seedance_v2.0": "shared",
+        "seedance_v2.0_std": "shared",
     }
 
     def __init__(self, repository, data_dir: Path, database_path: Path):
@@ -83,23 +79,17 @@ class SettingsService:
         return values
 
     def get_daily_quotas(self) -> dict[str, int]:
-        """v0.2.9:返回 {'mini': int, 'v2': int, 'std': int}。
+        """v0.2.29:共享池 → 返回 {'shared': int}。
 
-        三桶全空(老 DB 刚升上来) → 统一用 legacy daily_quota。
-        任意一桶已写过 → 走新三桶,未写的桶用 legacy 兜底(用户碰哪个改哪个,
-        不强求一次性设完三个)。
+        优先级:explicit daily_quota_shared > legacy daily_quota > DEFAULT 50。
         """
-        legacy = int(self.get().get("daily_quota", 5))
-        mini = self.repository.get_setting("daily_quota_mini", None)
-        v2 = self.repository.get_setting("daily_quota_v2", None)
-        std = self.repository.get_setting("daily_quota_std", None)
-        if mini is None and v2 is None and std is None:
-            return {"mini": legacy, "v2": legacy, "std": legacy}
-        return {
-            "mini": int(mini) if mini is not None else legacy,
-            "v2": int(v2) if v2 is not None else legacy,
-            "std": int(std) if std is not None else legacy,
-        }
+        shared = self.repository.get_setting("daily_quota_shared", None)
+        if shared is not None:
+            return {"shared": int(shared)}
+        legacy = self.repository.get_setting("daily_quota", None)
+        if legacy is not None:
+            return {"shared": int(legacy)}
+        return {"shared": int(self.DEFAULTS["daily_quota_shared"])}
 
     def update(self, changes: dict) -> dict:
         current = self.get()
@@ -123,21 +113,21 @@ class SettingsService:
 
     @staticmethod
     def _validate(values: dict) -> None:
-        if not 1 <= int(values["max_concurrency"]) <= 10:
-            raise ValueError("并发数必须在 1 到 10 之间")
-        # v0.2.9:按模型分别校验 daily_quota。旧 daily_quota 键留作 legacy
-        # fallback 不再校验范围(老 DB 可能有越界值,迁完就让用户重新设)。
-        for key in ("daily_quota_mini", "daily_quota_v2", "daily_quota_std"):
-            if not 1 <= int(values[key]) <= 100:
-                raise ValueError(f"{key} 必须在 1 到 100 之间")
+        # v0.2.29:用户实测多机并发量大,放宽到 50;默认 1 保留(显式压住老改动)。
+        if not 1 <= int(values["max_concurrency"]) <= 50:
+            raise ValueError("并发数必须在 1 到 50 之间")
+        # v0.2.29:共享池只校验 daily_quota_shared。
+        if not 1 <= int(values["daily_quota_shared"]) <= 100:
+            raise ValueError("每日额度必须在 1 到 100 之间")
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(values["quota_reset_time"])):
             raise ValueError("额度重置时间格式无效")
-        if values["scheduler_strategy"] not in {"least_used", "round_robin"}:
+        if values["scheduler_strategy"] not in {"least_used"}:
             raise ValueError("调度策略无效")
         if values["default_model"] not in {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}:
             raise ValueError("默认模型无效")
-        if int(values["default_duration"]) not in {5, 10}:
-            raise ValueError("默认时长无效")
+        # v0.2.29:豆包接受任意整数 4..10 秒,放宽白名单。
+        if not 4 <= int(values["default_duration"]) <= 10:
+            raise ValueError("默认时长必须在 4 到 10 秒之间")
         if values["default_ratio"] not in {"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}:
             raise ValueError("默认比例无效")
         if values["log_level"] not in {"DEBUG", "INFO", "WARNING", "ERROR"}:

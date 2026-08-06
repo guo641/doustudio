@@ -12,7 +12,8 @@ from doupool.prompt_reviser import _POLICY_PATTERNS
 
 MODELS = {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}
 RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}
-DURATIONS = {5, 10}
+# v0.2.29:豆包接受任意整数 4..10 秒时长,放宽白名单(原 {5,10} 太严)。
+DURATIONS = set(range(4, 11))
 TASK_MODES = {"t2v", "i2v"}
 MAX_I2V_IMAGES = 9
 

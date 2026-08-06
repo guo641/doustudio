@@ -37,14 +37,15 @@ class NoAvailableAccount(RuntimeError):
 
 
 class _DefaultSettings:
+    # v0.2.29:共享池下 _DefaultSettings 不再分 mini/v2/std,统一 shared。
     def get(self):
         return {
-            "daily_quota_mini": 5, "daily_quota_v2": 5, "daily_quota_std": 5,
+            "daily_quota_shared": 50,
             "quota_reset_time": "00:00", "max_concurrency": 1,
         }
 
     def get_daily_quotas(self):
-        return {"mini": 5, "v2": 5, "std": 5}
+        return {"shared": 50}
 
 
 def quota_window(now: datetime, reset_value: str) -> tuple[date, datetime]:
@@ -94,6 +95,10 @@ class VideoTaskService:
         # _global_semaphore(max_concurrency,默认 1)。
         self._global_semaphore: asyncio.Semaphore | None = None
         self._semaphore_limit = 0
+        # v0.2.29:独立重置 cron —— 即使没有 task 在跑,到 quota_reset_time
+        # 也能跨日清桶(原 _run_inner 里 reset_daily_quotas 只在迭代时触发)。
+        self._reset_cron_task: asyncio.Task[None] | None = None
+        self._reset_cron_stop = asyncio.Event()
 
     def start(
         self,
@@ -227,6 +232,52 @@ class VideoTaskService:
         cancellation = threading.Event()
         self._cancellations[task_id] = cancellation
         self._tasks[task_id] = asyncio.create_task(self._run(task_id, cancellation))
+
+    def start_reset_cron(self) -> None:
+        """v0.2.29:启动独立重置 cron,到 quota_reset_time 跨日清桶。
+
+        必须在 running event loop 里调(FastAPI lifespan / main.py)。多次调用幂等。
+        """
+        if self._reset_cron_task is not None and not self._reset_cron_task.done():
+            return
+        self._reset_cron_stop.clear()
+        self._reset_cron_task = asyncio.create_task(self._reset_cron_loop())
+
+    async def _reset_cron_loop(self) -> None:
+        """v0.2.29:每 60s tick 一次,到 quota_reset_time 触发 reset_daily_quotas。
+
+        `_run_inner` 里的 reset_daily_quotas 保留作双保险 —— 但 cron 是兜底,
+        防止「没任务在跑 + 跨日」时清桶逻辑没被触发,导致账号永久卡死。
+        """
+        try:
+            while not self._reset_cron_stop.is_set():
+                try:
+                    settings = self.settings_service.get()
+                    reset_value = settings.get("quota_reset_time", "00:00") or "00:00"
+                    business_date, next_reset = quota_window(
+                        datetime.now(SHANGHAI), reset_value
+                    )
+                    now = datetime.now(SHANGHAI).replace(tzinfo=None)
+                    if now >= next_reset:
+                        # 到了(或刚过)重置点 → 清桶
+                        self.repository.reset_daily_quotas(business_date)
+                        self.logger.info(
+                            "reset_loop tick 命中,清桶 business_date=%s",
+                            business_date,
+                            extra={"event": "reset_loop_tick", "business_date": str(business_date)},
+                        )
+                except Exception as exc:
+                    self.logger.warning(
+                        "reset_loop tick 异常(非致命): %s", exc,
+                        extra={"event": "reset_loop_error"},
+                    )
+                # 用 wait_for + 1min tick,shutdown 时 stop event 唤醒即可退出。
+                try:
+                    await asyncio.wait_for(self._reset_cron_stop.wait(), timeout=60)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
 
     def _schedule_callback(self, task_id: str) -> None:
         """v0.2.9:任务到 terminal 状态后异步派发 callback。
@@ -633,7 +684,8 @@ class VideoTaskService:
                 if stats["enabled_total"] == 0:
                     msg = "暂无账号,请先在账号面板添加账号"
                 elif stats["bucket_full"] >= stats["enabled_total"]:
-                    msg = f"全部账号今日 {task.model} 额度已用完,明早 00:00 自动恢复"
+                    # v0.2.29:共享池下不再按 model 拆 quota,改成"共享额度"提示。
+                    msg = "全部账号今日共享额度已用完,等到下一个额度重置时间会自动恢复"
                 else:
                     msg = "等待可用账号"
                 self.repository.update_video_task(task_id, status="queued", error_message=msg)
@@ -945,6 +997,16 @@ class VideoTaskService:
             )
 
     async def shutdown(self) -> None:
+        # v0.2.29:先停 reset_cron —— 否则 _reset_cron_loop 在 stop.wait() 等不到
+        # 时,下面的 cancel() 会直接打断 asyncio.wait_for 抛 CancelledError。
+        self._reset_cron_stop.set()
+        if self._reset_cron_task is not None:
+            self._reset_cron_task.cancel()
+            try:
+                await self._reset_cron_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._reset_cron_task = None
         for cancellation in self._cancellations.values():
             cancellation.set()
         if self._tasks:

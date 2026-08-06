@@ -19,7 +19,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from doupool.db.models import Account, LoginAttempt
+from doupool.db.models import Account, LoginAttempt, utcnow
 from doupool.login.browser_sessions import (
     BrowserAlreadyOpen,
     BrowserSession,
@@ -29,7 +29,7 @@ from doupool.login.service import LoginAlreadyRunning
 from doupool.logging.setup import set_log_level
 from doupool.updater import check_for_update
 from doupool.video.browser import TokenBundleUnavailable, extract_webmssdk_tokens
-from doupool.video.service import NoAvailableAccount
+from doupool.video.service import NoAvailableAccount, quota_window
 
 
 class ImageAttachmentBody(BaseModel):
@@ -79,11 +79,15 @@ def _extract_bearer(authorization: str | None) -> str | None:
 
 
 def _account_dict(account: Account, daily_quotas: dict[str, int] | None = None) -> dict:
-    """v0.2.9:返回按 seedance 模型分桶的当日额度。旧 video_quota_used /
-    video_quota_total 字段保留,alias 到 mini 桶,前端老代码 / 缓存兜底用。
-    daily_quotas 缺省时(老 API 调用方)用 mini 默认 5。
+    """v0.2.29:共享额度池 —— 主字段 video_quota_used_shared/total_shared。
+
+    旧字段 video_quota_used_mini/v2/std 保留(只读,镜像到 shared 让老前端
+    缓存兜底);video_quota_used legacy alias 到 shared。
+    daily_quotas 缺省时(老 API 调用方)用 shared 默认 50。
     """
-    quotas = daily_quotas or {"mini": 5, "v2": 5, "std": 5}
+    quotas = daily_quotas or {"shared": 50}
+    shared_used = account.video_quota_used_shared or 0
+    shared_total = int(quotas["shared"])
     return {
         "id": account.id,
         "display_name": account.display_name,
@@ -91,22 +95,25 @@ def _account_dict(account: Account, daily_quotas: dict[str, int] | None = None) 
         "status": account.status,
         "enabled": account.enabled,
         "last_verified_at": account.last_verified_at.isoformat() if account.last_verified_at else None,
-        # 老字段:alias 到 mini 桶,前端缓存 / 老测试兜底
-        "video_quota_used": account.video_quota_used_mini,
-        "video_quota_total": quotas["mini"],
-        # v0.2.9 新三桶
-        "video_quota_used_mini": account.video_quota_used_mini,
-        "video_quota_total_mini": quotas["mini"],
-        "video_quota_used_v2": account.video_quota_used_v2,
-        "video_quota_total_v2": quotas["v2"],
-        "video_quota_used_std": account.video_quota_used_std,
-        "video_quota_total_std": quotas["std"],
+        # v0.2.29 共享池主字段
+        "video_quota_used_shared": shared_used,
+        "video_quota_total_shared": shared_total,
+        # 老字段 alias 到 shared,前端缓存 / 老测试兜底
+        "video_quota_used": shared_used,
+        "video_quota_total": shared_total,
+        # v0.2.9 旧三桶保留(只读,镜像到 shared)。前端 v0.2.29 起不再读这些。
+        "video_quota_used_mini": shared_used,
+        "video_quota_total_mini": shared_total,
+        "video_quota_used_v2": shared_used,
+        "video_quota_total_v2": shared_total,
+        "video_quota_used_std": shared_used,
+        "video_quota_total_std": shared_total,
         "video_quota_date": account.video_quota_date.isoformat() if account.video_quota_date else None,
         "video_limited_until": account.video_limited_until.isoformat() if account.video_limited_until else None,
     }
 
 
-def _video_task_dict(task, daily_quota: int = 5) -> dict:
+def _video_task_dict(task, daily_quota: int = 50) -> dict:
     account = task.account if task.account_id else None
     image_count = 0
     if getattr(task, "image_paths", None):
@@ -114,13 +121,16 @@ def _video_task_dict(task, daily_quota: int = 5) -> dict:
             image_count = len(json.loads(task.image_paths))
         except (TypeError, json.JSONDecodeError):
             image_count = 0
+    # v0.2.29:共享池下 quota_used/total 直接读 shared 桶(老 video_quota_used
+    # legacy alias 已被 _account_dict 重定向,前端读 task.quota_used 也是 shared)。
+    quota_used = account.video_quota_used_shared if account else None
     return {
         "id": task.id,
         "group_id": task.group_id,
         "group_index": task.group_index,
         "account_id": account.id if account else None,
         "account_name": account.display_name if account else None,
-        "quota_used": account.video_quota_used if account else None,
+        "quota_used": quota_used,
         "quota_total": daily_quota if account else None,
         "prompt": task.prompt,
         "original_prompt": task.original_prompt or task.prompt,
@@ -157,8 +167,25 @@ def create_app(
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app):
+        # v0.2.29:启动时一次性把旧 mini/v2/std 累加进 shared 桶(幂等)。
+        try:
+            migrated = repository.migrate_legacy_quota_buckets()
+            if migrated:
+                logging.getLogger("doupool.api").info(
+                    "v0.2.29:已迁移 %d 个账号的旧额度到共享池", migrated,
+                    extra={"event": "quota_migration", "migrated": migrated},
+                )
+        except Exception as exc:
+            logging.getLogger("doupool.api").warning(
+                "v0.2.29:quota 迁移失败(非致命,继续): %s", exc,
+                extra={"event": "quota_migration_failed"},
+            )
         if video_service is not None and hasattr(video_service, "resume_queued"):
             await video_service.resume_queued()
+        # v0.2.29:启动独立重置 cron —— 到 quota_reset_time 跨日清桶,
+        # 不依赖任务在跑。
+        if video_service is not None and hasattr(video_service, "start_reset_cron"):
+            video_service.start_reset_cron()
         yield
         # v0.2.20:app 退出时关掉所有「📂 打开浏览器」留下的窗口,避免
         # Chromium 进程游离在系统里。
@@ -210,7 +237,7 @@ def create_app(
         authorization: str | None = Header(default=None),
     ):
         authorize(x_doupool_token, authorization)
-        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
+        quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
         return [_account_dict(item, quotas) for item in repository.list_accounts()]
 
     @app.post("/api/accounts/login-attempts", status_code=202)
@@ -273,7 +300,7 @@ def create_app(
             account.enabled = body.enabled
             account.status = "active" if account.enabled else "disabled"
             account.save()
-        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
+        quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
         return _account_dict(account, quotas)
 
     @app.delete("/api/accounts/{account_id}", status_code=204)
@@ -291,6 +318,50 @@ def create_app(
         profile_dir = Path(account.profile_dir)
         account.delete_instance(recursive=True)
         shutil.rmtree(profile_dir, ignore_errors=True)
+
+    # v0.2.29:手动重置额度端点 —— 兜底,防止软件卡住时无解。
+    # 单账号 + 一键全部。两个端点都返回 reset_count + reset_at。
+    @app.post("/api/accounts/{account_id}/reset-quota")
+    def reset_account_quota_endpoint(
+        account_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.29:清单个账号的 shared 桶 + limited_until + video_quota_date。
+
+        账号不存在返 404,清成功返 {reset_count:1, reset_at}。幂等。
+        """
+        authorize(x_doupool_token, authorization)
+        # 用 quota_window 算出业务日,跟 reset_daily_quotas 口径一致(避免
+        # quota_reset_time > now 时业务日跨天的 corner case)。
+        reset_value = settings_service.get().get("quota_reset_time", "00:00") if settings_service else "00:00"
+        business_date, _ = quota_window(utcnow(), reset_value)
+        ok = repository.reset_account_quota(account_id, business_date)
+        if not ok:
+            raise HTTPException(status_code=404, detail="account not found")
+        return {
+            "reset_count": 1,
+            "reset_at": utcnow().isoformat(),
+            "account_id": account_id,
+        }
+
+    @app.post("/api/accounts/reset-all-quota")
+    def reset_all_quota_endpoint(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.29:一键清所有 enabled 账号的 shared 桶 + limited_until。
+
+        disabled 账号不动(用户显式关掉的不要自动清)。
+        """
+        authorize(x_doupool_token, authorization)
+        reset_value = settings_service.get().get("quota_reset_time", "00:00") if settings_service else "00:00"
+        business_date, _ = quota_window(utcnow(), reset_value)
+        reset_count = repository.reset_all_quotas(business_date)
+        return {
+            "reset_count": reset_count,
+            "reset_at": utcnow().isoformat(),
+        }
 
     @app.get("/api/logs")
     def logs(
@@ -358,8 +429,8 @@ def create_app(
         authorization: str | None = Header(default=None),
     ):
         authorize(x_doupool_token, authorization)
-        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
-        return [_video_task_dict(task, quotas["mini"]) for task in repository.list_video_tasks()]
+        quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
+        return [_video_task_dict(task, quotas["shared"]) for task in repository.list_video_tasks()]
 
     @app.get("/api/video-task-groups")
     def video_task_groups(
@@ -379,8 +450,8 @@ def create_app(
     ):
         """返回某 group 下所有任务,按 group_index 排序"""
         authorize(x_doupool_token, authorization)
-        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
-        return [_video_task_dict(t, quotas["mini"]) for t in repository.list_tasks_by_group(group_id)]
+        quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
+        return [_video_task_dict(t, quotas["shared"]) for t in repository.list_tasks_by_group(group_id)]
 
     @app.post("/api/video-tasks", status_code=202)
     async def create_video_task(
@@ -403,8 +474,8 @@ def create_app(
             task = video_service.start(**payload)
         except (ValueError, NoAvailableAccount) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
-        return _video_task_dict(task, quotas["mini"])
+        quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
+        return _video_task_dict(task, quotas["shared"])
 
     @app.post("/api/requests/{task_id}/retry-result", status_code=202)
     async def retry_result(
@@ -440,8 +511,8 @@ def create_app(
             raise HTTPException(status_code=409, detail=msg) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
-        return _video_task_dict(task, quotas["mini"])
+        quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
+        return _video_task_dict(task, quotas["shared"])
 
     @app.post("/api/results/{task_id}/refresh-url")
     async def refresh_result_url(
@@ -485,8 +556,8 @@ def create_app(
                 status_code=409,
                 detail="刷新下载链接超时,远端尚未生成完成",
             )
-        quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
-        return _video_task_dict(task, quotas["mini"])
+        quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
+        return _video_task_dict(task, quotas["shared"])
 
     @app.post("/api/results/group-download")
     async def group_download(

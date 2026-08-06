@@ -58,6 +58,9 @@ class Account(BaseModel):
     video_quota_used_mini = IntegerField(default=0)
     video_quota_used_v2 = IntegerField(default=0)
     video_quota_used_std = IntegerField(default=0)
+    # v0.2.29:豆包官方按账号每日总配额,不区分模型 → 共享池。
+    # 旧 mini/v2/std 三列保留只读(历史可查),扣退/选择/限流全部走 shared。
+    video_quota_used_shared = IntegerField(default=0)
     created_at = DateTimeField(default=utcnow)
     updated_at = DateTimeField(default=utcnow)
 

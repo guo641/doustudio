@@ -2,6 +2,58 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.29 - 2026-08-06
+
+### 修复
+
+- **额度模型从按模型分桶改为账号共享池**
+  豆包官方对单账号每日总配额是共享池(模型不分桶),
+  v0.2.9 起的 `mini/v2/std` 三桶扣退与实际不符 —— 用户看到
+  「mini 用完 std 还有」的虚假余量。
+  - 数据迁移:启动 lifespan 钩子里一次性把
+    `shared = sum(mini + v2 + std)` 写入新列 `video_quota_used_shared`,
+    幂等(共享池 = 0 且老桶合计 > 0 才迁)。老三桶保留只读,
+    供历史数据查询。
+  - 扣退/选择/限流清零全部走共享池。共享池扣退内部用 SQL `GREATEST(field - by, 0)`,
+    不会出现负值。
+  - `_video_task_dict` 之前硬编码 `quotas["mini"]` 取 quota_total,
+    std/v2 任务显示的「总额度」错。修复后统一用 `quotas["shared"]`。
+  - 进度条 UI 改成单行 `已用/总额`,AccountTable 不再展示 mini/fast
+    双堆叠行(老前端不会立刻崩,后端仍 mirror 老字段 = shared 值)。
+
+- **SettingsPage 移除 round_robin 死链 + daily_quota 字段统一**
+  - 「调度策略」下拉只剩 `least_used`(老 `round_robin` 自 v0.2.9 后
+    没有实现,显示但提交后被拒)。
+  - 「每日额度」单输入框绑 `daily_quota_shared`,旧 `daily_quota`
+    三字段(`mini/v2/std`)从 UI 隐去。
+
+### 放宽
+
+- **max_concurrency 上限 10 → 50**
+  用户实测多机并发需求,默认 1 保留。SettingsService 校验改为
+  `1 <= x <= 50`,SettingsPage 输入框 `:max="50"`。
+
+- **视频时长白名单 {5,10} → 任意整数 4..10 秒**
+  豆包支持任意整数 4..10 秒(原 `{5,10}` 太严),
+  任务表单改 `<input type="number" :min="4" :max="10">`,
+  protocol.py 校验改 `set(range(4, 11))`。
+
+### 新增
+
+- **单账号 / 一键全部重置额度**
+  软件有跨日重置 + 限流到期自动清,但用户需要一个手动按钮兜底,
+  避免软件卡住时无解。
+  - 后端:`POST /api/accounts/{id}/reset-quota` 清单账号 shared + 清
+    `video_limited_until`;`POST /api/accounts/reset-all-quota`
+    遍历所有 enabled 账号统一清,disabled 账号不动。
+  - 前端:AccountTable 每行加「🔄 重置」按钮,顶部加「一键重置全部」,
+    两次确认 dialog。UI 重置成功后 emit refresh 触发父级刷新。
+
+- **独立重置 cron(双保险)**
+  原 `reset_daily_quotas` 只在 worker 主循环跑,worker 不在时不会跨日清。
+  现在 `VideoService.start()` 启动一个独立 asyncio task,每 60s tick 一次,
+  到 `quota_reset_time` 触发清桶(主循环已有调用保留作双保险)。
+
 ## v0.2.28 - 2026-08-06
 
 ### 修复

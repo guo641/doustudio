@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue';
-import { UsersRound, Plus, RefreshCw, Trash2, Globe2, Globe } from '@lucide/vue';
+import { UsersRound, Plus, RefreshCw, Trash2, Globe2, Globe, RotateCcw } from '@lucide/vue';
 import { DpBadge, DpButton, DpEmpty, DpPanel, DpSwitch, DpTable } from '@/ui';
 import {
   getWebMSSDKTokens,
@@ -8,6 +8,8 @@ import {
   openAccountBrowser,
   closeAccountBrowser,
   getAccountBrowserStatus,
+  resetAccountQuota,
+  resetAllQuotas,
   type WebMSSDKTokensResponse,
 } from '@/api';
 
@@ -18,22 +20,12 @@ type Account = {
   status: string;
   enabled: boolean;
   last_verified_at?: string;
-  // v0.2.9:按 seedance 模型拆三桶。老 video_quota_used / video_quota_total
-  // 仍保留(API alias 到 mini 桶),用于老缓存 / 单桶视图兜底。
-  video_quota_used?: number;
-  video_quota_total?: number;
-  video_quota_used_mini?: number;
-  video_quota_total_mini?: number;
-  video_quota_used_std?: number;
-  video_quota_total_std?: number;
+  // v0.2.29:豆包官方按账号每日总配额(共享池,不区分模型)。
+  // 老 mini/std 字段后端 alias 到 shared 兜底,前端不再读。
+  video_quota_used_shared?: number;
+  video_quota_total_shared?: number;
   video_limited_until?: string;
 };
-
-type Bucket = 'mini' | 'std';
-const BUCKETS: { key: Bucket; label: string }[] = [
-  { key: 'mini', label: 'mini' },
-  { key: 'std', label: 'fast' },
-];
 
 const props = defineProps<{ accounts: Account[]; loading?: boolean; busy?: boolean }>();
 const emit = defineEmits<{
@@ -61,6 +53,12 @@ const browserError = ref<Record<string, string>>({});
 // 才知道用户什么时候自己关了窗口。每 3 秒轮一次,只对正在打开的账号轮。
 let browserPollTimer: number | null = null;
 
+// v0.2.29:重置额度按钮 loading + 错误提示。
+// 行级按钮靠 accountId 索引;顶部「一键全部」按钮用 resetAllBusy 单值。
+const resetBusy = ref<Record<string, boolean>>({});
+const resetAllBusy = ref(false);
+const resetError = ref<string>('');
+
 function remove(account: Account) {
   if (confirm(`确定删除账号“${account.display_name}”及其本地会话吗？`)) {
     emit('delete', account.id);
@@ -71,33 +69,59 @@ function initial(name: string) {
   return (name || '?').trim().charAt(0).toUpperCase();
 }
 
-function bucketUsed(account: Account, bucket: Bucket): number {
-  const field = `video_quota_used_${bucket}` as const;
-  const value = account[field];
-  if (typeof value === 'number') return value;
-  // 兜底:老 API / 旧数据只用 video_quota_used。统一展示在 mini 桶。
-  return bucket === 'mini' ? (account.video_quota_used ?? 0) : 0;
+// v0.2.29:单桶视图 —— 共享池。后端不再返 mini/std 拆分,直接用 shared 字段。
+// 兜底:老 DB / 老缓存可能没这两个字段,默认 0 / 50。
+function sharedUsed(account: Account): number {
+  return account.video_quota_used_shared ?? 0;
+}
+function sharedTotal(account: Account): number {
+  return account.video_quota_total_shared ?? 50;
+}
+function sharedRatio(account: Account): number {
+  const total = sharedTotal(account);
+  return total > 0 ? Math.min(1, sharedUsed(account) / total) : 0;
+}
+function sharedWidth(account: Account): number {
+  return Math.round(sharedRatio(account) * 100);
+}
+function sharedExhausted(account: Account): boolean {
+  return sharedRatio(account) >= 1;
 }
 
-function bucketTotal(account: Account, bucket: Bucket): number {
-  const field = `video_quota_total_${bucket}` as const;
-  const value = account[field];
-  if (typeof value === 'number') return value;
-  return bucket === 'mini' ? (account.video_quota_total ?? 5) : 5;
+// v0.2.29:重置额度 —— 跨日 cron 卡住时的兜底按钮。
+// 单账号:行级按钮 + confirm;一键全部:顶部按钮 + confirm(避免误触)。
+async function resetOne(account: Account) {
+  const ok = confirm(
+    `确定重置账号「${account.display_name}」的今日共享额度?\n(豆包限流未自动解除时使用,操作不可撤销)`,
+  );
+  if (!ok) return;
+  resetBusy.value[account.id] = true;
+  resetError.value = '';
+  try {
+    await resetAccountQuota(account.id);
+    emit('refresh');
+  } catch (err) {
+    resetError.value = err instanceof Error ? err.message : '重置失败';
+  } finally {
+    resetBusy.value[account.id] = false;
+  }
 }
 
-function bucketRatio(account: Account, bucket: Bucket): number {
-  const used = bucketUsed(account, bucket);
-  const total = bucketTotal(account, bucket);
-  return total > 0 ? Math.min(1, used / total) : 0;
-}
-
-function bucketWidth(account: Account, bucket: Bucket): number {
-  return Math.round(bucketRatio(account, bucket) * 100);
-}
-
-function anyBucketExhausted(account: Account): boolean {
-  return BUCKETS.some((b) => bucketRatio(account, b.key) >= 1);
+async function resetAll() {
+  const ok = confirm(
+    `确定一键重置全部账号的今日共享额度?\n(豆包限流未自动解除时使用,操作不可撤销)`,
+  );
+  if (!ok) return;
+  resetAllBusy.value = true;
+  resetError.value = '';
+  try {
+    await resetAllQuotas();
+    emit('refresh');
+  } catch (err) {
+    resetError.value = err instanceof Error ? err.message : '一键重置失败';
+  } finally {
+    resetAllBusy.value = false;
+  }
 }
 
 function formatRecovery(value?: string) {
@@ -261,18 +285,30 @@ watch(
         <RefreshCw :size="15" :stroke-width="2.25" />
         刷新额度
       </DpButton>
+      <!-- v0.2.29:一键全部重置额度 —— 跨日 cron 卡住时的兜底按钮。
+           confirm 二次确认防误触。 -->
+      <DpButton
+        :disabled="resetAllBusy || !accounts.length"
+        :aria-label="'一键重置全部账号的今日额度'"
+        @click="resetAll"
+      >
+        <RotateCcw :size="15" :stroke-width="2.25" />
+        {{ resetAllBusy ? '重置中…' : '重置全部额度' }}
+      </DpButton>
       <DpButton variant="solid" :disabled="busy" @click="$emit('add')">
         <Plus :size="15" :stroke-width="2.25" />
         {{ busy ? '等待登录…' : '＋ 添加账号' }}
       </DpButton>
     </template>
 
+    <small v-if="resetError" class="reset-banner">{{ resetError }}</small>
+
     <DpTable min-width="980px">
       <thead>
         <tr>
           <th style="width: 22%">账号</th>
           <th style="width: 11%">状态</th>
-          <th style="width: 22%">今日额度(mini / fast)</th>
+          <th style="width: 22%">今日共享额度</th>
           <th style="width: 14%">限额恢复</th>
           <th style="width: 13%">Token</th>
           <th style="width: 9%">参与调度</th>
@@ -311,31 +347,26 @@ watch(
           </td>
           <td>
             <div class="quota-stack">
-              <div
-                v-for="bucket in BUCKETS"
-                :key="bucket.key"
-                class="quota-row"
-                :class="{ limited: account.video_limited_until }"
-              >
-                <span class="quota-label">{{ bucket.label }}</span>
+              <div class="quota-row" :class="{ limited: account.video_limited_until }">
+                <span class="quota-label">共享</span>
                 <span class="quota-text">
-                  {{ bucketUsed(account, bucket.key) }}/{{ bucketTotal(account, bucket.key) }}
+                  {{ sharedUsed(account) }}/{{ sharedTotal(account) }}
                 </span>
                 <div
                   class="quota-bar"
                   :class="{
-                    exhausted: bucketRatio(account, bucket.key) >= 1,
+                    exhausted: sharedExhausted(account),
                     limited: account.video_limited_until,
                   }"
                 >
                   <div
                     class="quota-bar-fill"
-                    :style="{ width: bucketWidth(account, bucket.key) + '%' }"
+                    :style="{ width: sharedWidth(account) + '%' }"
                   />
                 </div>
               </div>
-              <small v-if="anyBucketExhausted(account) && !account.video_limited_until" class="quota-hint">
-                至少一个模型额度已用完
+              <small v-if="sharedExhausted(account) && !account.video_limited_until" class="quota-hint">
+                今日额度已用完(等跨日重置或点行末「重置」)
               </small>
             </div>
           </td>
@@ -402,6 +433,16 @@ watch(
               >
                 <RefreshCw :size="12" :class="{ spinning: refreshing[account.id] }" />
                 {{ refreshing[account.id] ? '刷新中…' : '🔄 刷新 token' }}
+              </DpButton>
+              <!-- v0.2.29:行级重置额度 —— 跨日 cron 卡住时的兜底按钮。 -->
+              <DpButton
+                size="sm"
+                :disabled="!!resetBusy[account.id]"
+                :aria-label="`重置 ${account.display_name} 的今日额度`"
+                @click="resetOne(account)"
+              >
+                <RotateCcw :size="12" />
+                {{ resetBusy[account.id] ? '重置中…' : '重置' }}
               </DpButton>
               <DpButton
                 size="sm"
@@ -573,5 +614,16 @@ watch(
 
 @keyframes token-spin {
   to { transform: rotate(360deg); }
+}
+
+/* v0.2.29:重置额度失败 / 顶部 banner —— 复用 token-hint 的红色字体,顶部加一点间距。 */
+.reset-banner {
+  display: block;
+  margin: 0 0 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--danger-bg, rgba(220, 38, 38, 0.08));
+  color: var(--danger-text);
+  font-size: 12px;
 }
 </style>

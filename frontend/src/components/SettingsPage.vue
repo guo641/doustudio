@@ -6,7 +6,8 @@ import { DpButton, DpCard, DpEmpty, DpField, DpInput, DpSelect } from '@/ui';
 
 type Settings = {
   max_concurrency: number;
-  daily_quota: number;
+  // v0.2.29:共享额度池 —— 单值,所有模型共用同一 bucket。
+  daily_quota_shared: number;
   quota_reset_time: string;
   scheduler_strategy: string;
   default_model: string;
@@ -103,12 +104,14 @@ async function onCheckUpdate() {
     <DpCard title="调度" description="控制账号池的并发与额度策略">
       <div class="fields">
         <DpField label="全局并发数">
-          <DpInput v-model.number="settings.max_concurrency" type="number" :min="1" :max="10" />
+          <!-- v0.2.29:上限从 10 提到 50(用户实测多账号多机并发需求)。默认 1 保留。 -->
+          <DpInput v-model.number="settings.max_concurrency" type="number" :min="1" :max="50" />
         </DpField>
-        <DpField label="每日额度" for-id="setting-daily-quota">
+        <DpField label="每日额度" for-id="setting-daily-quota-shared">
+          <!-- v0.2.29:共享池下只用 daily_quota_shared 一个字段,旧 daily_quota 不再展示。 -->
           <DpInput
-            id="setting-daily-quota"
-            v-model.number="settings.daily_quota"
+            id="setting-daily-quota-shared"
+            v-model.number="settings.daily_quota_shared"
             type="number"
             :min="1"
             :max="100"
@@ -117,12 +120,9 @@ async function onCheckUpdate() {
         <DpField label="额度重置时间">
           <DpInput v-model="settings.quota_reset_time" type="time" />
         </DpField>
-        <DpField label="调度策略">
-          <DpSelect v-model="settings.scheduler_strategy">
-            <option value="least_used">最少使用优先</option>
-            <option value="round_robin">轮询</option>
-          </DpSelect>
-        </DpField>
+        <!-- v0.2.29:调度策略只剩 least_used(round_robin 是 v0.2.9 死链,代码里
+             保留分支但 UI 不再展示 —— 用户选不到就不会触发未跑通的路径)。 -->
+        <input v-model="settings.scheduler_strategy" type="hidden" />
         <!-- v0.2.23:默认改为 2,拒绝类常见改写一次就过;想完全关闭显式设 0 -->
         <DpField label="豆包拒绝改写重试" for-id="setting-max-reject-retries">
           <DpInput
@@ -179,11 +179,16 @@ async function onCheckUpdate() {
             <option value="seedance_v2.0_std">Seedance Fast</option>
           </DpSelect>
         </DpField>
-        <DpField label="默认时长">
-          <DpSelect v-model.number="settings.default_duration">
-            <option :value="5">5 秒</option>
-            <option :value="10">10 秒</option>
-          </DpSelect>
+        <DpField label="默认时长" for-id="setting-default-duration">
+          <!-- v0.2.29:豆包接受任意整数 4..10 秒,改 number input 代替原白名单 select。 -->
+          <DpInput
+            id="setting-default-duration"
+            v-model.number="settings.default_duration"
+            type="number"
+            :min="4"
+            :max="10"
+            :step="1"
+          />
         </DpField>
         <DpField label="默认比例">
           <DpSelect v-model="settings.default_ratio">

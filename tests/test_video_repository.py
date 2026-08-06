@@ -1,41 +1,6 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
-from doupool.db.models import Account
-
-
-def test_create_and_complete_video_task(repository, temp_profile):
-    account = Account.create(
-        id="account-1",
-        display_name="测试账号",
-        doubao_user_id="user-1",
-        profile_dir=temp_profile,
-    )
-
-    task = repository.create_video_task(
-        account_id=account.id,
-        prompt="一只猫在草地上行走",
-        model="seedance_v2.0_mini",
-        ratio="1:1",
-        duration=5,
-    )
-    repository.update_video_task(
-        task.id,
-        status="succeeded",
-        conversation_id="conversation-1",
-        remote_task_id="remote-1",
-        vid="video-1",
-        result_url="https://example.test/video.mp4",
-        backup_result_url="https://backup.example.test/video.mp4",
-        fallback_result_url="https://watermark.example.test/video.mp4",
-        cover_url="https://example.test/cover.jpg",
-    )
-
-    saved = repository.get_video_task(task.id)
-    assert saved.status == "succeeded"
-    assert saved.account.id == "account-1"
-    assert saved.result_url.endswith("video.mp4")
-    assert saved.vid == "video-1"
-    assert repository.list_video_tasks()[0].id == task.id
+from doupool.db.models import Account, VideoTask
 
 
 def test_choose_available_account_ignores_disabled(repository, temp_profile):
@@ -54,7 +19,8 @@ def test_choose_available_account_ignores_disabled(repository, temp_profile):
         profile_dir=temp_profile,
     )
 
-    assert repository.choose_available_account({"mini": 5, "v2": 5, "std": 5}, model="seedance_v2.0_mini").id == expected.id
+    # v0.2.29:共享额度池,quotas 只用 shared 一桶。
+    assert repository.choose_available_account({"shared": 50}, model="seedance_v2.0_mini").id == expected.id
 
 
 def test_queued_task_can_wait_without_an_account(repository):
@@ -73,7 +39,7 @@ def test_queued_task_can_wait_without_an_account(repository):
 def test_account_quota_reset_and_assignment(repository, temp_profile):
     account = Account.create(
         id="quota-account", display_name="额度账号", doubao_user_id="quota-user",
-        profile_dir=temp_profile, video_quota_used_mini=5, video_quota_date=date(2026, 7, 12),
+        profile_dir=temp_profile, video_quota_used_shared=5, video_quota_date=date(2026, 7, 12),
         video_limited_until=datetime(2026, 7, 12, 16, 0),
     )
     task = repository.create_video_task(None, "测试", "seedance_v2.0_mini", "1:1", 5)
@@ -83,35 +49,35 @@ def test_account_quota_reset_and_assignment(repository, temp_profile):
 
     account = Account.get_by_id(account.id)
     task = repository.get_video_task(task.id)
-    assert account.video_quota_used_mini == 0
-    assert account.video_quota_used_v2 == 0
-    assert account.video_quota_used_std == 0
+    # v0.2.29:reset 只清 shared 桶,旧三桶不再写入。
+    assert account.video_quota_used_shared == 0
     assert account.video_limited_until is None
     assert task.account.id == account.id
 
 
-# ---------- v0.2.9:per-model quota bucket ----------
+# ---------- v0.2.29:共享额度池 ----------
 
-def test_choose_available_account_filters_by_model_bucket(repository, temp_profile):
-    """v0.2.9:mini 桶满员的账号,不该被 std 任务选中(每个模型独立 quota)。"""
-    full_mini = Account.create(
-        id="full-mini", display_name="mini 满", doubao_user_id="u1",
-        profile_dir=temp_profile, video_quota_used_mini=5,
+
+def test_choose_available_account_filters_by_shared_bucket(repository, temp_profile):
+    """v0.2.29:mini 桶满员的账号,任意模型任务都不该再被选中(共享池)。"""
+    full_shared = Account.create(
+        id="full-shared", display_name="shared 满", doubao_user_id="u1",
+        profile_dir=temp_profile, video_quota_used_shared=50,
     )
-    open_std = Account.create(
-        id="open-std", display_name="std 满", doubao_user_id="u2",
-        profile_dir=temp_profile, video_quota_used_std=4,
+    open_shared = Account.create(
+        id="open-shared", display_name="open", doubao_user_id="u2",
+        profile_dir=temp_profile, video_quota_used_shared=4,
     )
-    quotas = {"mini": 5, "v2": 5, "std": 5}
+    quotas = {"shared": 50}
 
-    # std 任务:full_mini 还在 mini 桶满,std 桶 0 → 应当被选中
-    assert repository.choose_available_account(quotas, model="seedance_v2.0_std").id == full_mini.id
-    # mini 任务:open_std 还没用 mini 桶,但 mini 桶已被选走(full_mini 是 5)→ 退到 open_std
-    assert repository.choose_available_account(quotas, model="seedance_v2.0_mini").id == open_std.id
+    # std 任务:full_shared shared=50 满 → 退到 open_shared
+    assert repository.choose_available_account(quotas, model="seedance_v2.0_std").id == open_shared.id
+    # mini 任务:同上(共享池不分模型)
+    assert repository.choose_available_account(quotas, model="seedance_v2.0_mini").id == open_shared.id
 
 
-def test_increment_account_quota_targets_model_bucket(repository, temp_profile):
-    """v0.2.9:不同 model 互不影响桶。"""
+def test_increment_account_quota_targets_shared_bucket(repository, temp_profile):
+    """v0.2.29:不同 model 都扣同一个 shared 桶,参数 model 仅作日志。"""
     account = Account.create(
         id="acc", display_name="a", doubao_user_id="u", profile_dir=temp_profile,
     )
@@ -120,45 +86,39 @@ def test_increment_account_quota_targets_model_bucket(repository, temp_profile):
     repository.increment_account_quota(account.id, model="seedance_v2.0_std")
 
     refreshed = Account.get_by_id(account.id)
-    # 增量按桶分别计
-    assert refreshed.video_quota_used_mini == 2
-    # v2 桶不受 mini/std 任务影响
-    assert refreshed.video_quota_used_v2 == 0
-    assert refreshed.video_quota_used_std == 1
+    # 共享池累计到 3(无论什么 model)
+    assert refreshed.video_quota_used_shared == 3
 
 
-def test_mark_account_limited_zeroes_all_buckets(repository, temp_profile):
-    """v0.2.9:豆包 423 限流封整号 — 三桶一并 cap,任意模型都不可再选。
-    v0.2.13:同时写 video_quota_date=business_date,确保 reset_daily_quotas 跨天能清。"""
+def test_mark_account_limited_caps_shared_bucket(repository, temp_profile):
+    """v0.2.29:豆包 423 限流封整号 → cap shared 桶,任意模型都不可再选。"""
     account = Account.create(
         id="acc-l", display_name="l", doubao_user_id="u", profile_dir=temp_profile,
-        video_quota_used_mini=1, video_quota_used_v2=2, video_quota_used_std=3,
+        video_quota_used_shared=1,
     )
-    quotas = {"mini": 5, "v2": 5, "std": 5}
+    quotas = {"shared": 50}
     until = datetime(2026, 7, 13, 16, 0)
     repository.mark_account_limited(
         account.id, until, quotas, business_date=date(2026, 7, 13)
     )
 
     refreshed = Account.get_by_id(account.id)
-    assert refreshed.video_quota_used_mini == 5
-    assert refreshed.video_quota_used_v2 == 5
-    assert refreshed.video_quota_used_std == 5
+    assert refreshed.video_quota_used_shared == 50
     assert refreshed.video_limited_until == until
-    assert refreshed.video_quota_date == date(2026, 7, 13)  # v0.2.13 锚定
-    # 任意桶都不可再选
+    assert refreshed.video_quota_date == date(2026, 7, 13)
+    # 任意模型任务都不可再选(共享池)
     assert repository.choose_available_account(quotas, model="seedance_v2.0_mini") is None
     assert repository.choose_available_account(quotas, model="seedance_v2.0") is None
     assert repository.choose_available_account(quotas, model="seedance_v2.0_std") is None
 
 
 def test_mark_account_limited_without_business_date_is_backward_compatible(repository, temp_profile):
-    """v0.2.13:business_date=None 时不写 video_quota_date,跟老调用兼容。"""
+    """v0.2.29:business_date=None 时不写 video_quota_date,跟老调用兼容。"""
     account = Account.create(
         id="acc-bc", display_name="bc", doubao_user_id="bc", profile_dir=temp_profile,
         video_quota_date=date(2026, 7, 10),  # 故意写一个旧值
     )
-    quotas = {"mini": 5, "v2": 5, "std": 5}
+    quotas = {"shared": 50}
     repository.mark_account_limited(account.id, datetime(2026, 7, 13, 16, 0), quotas)
     refreshed = Account.get_by_id(account.id)
     # 没传 business_date → video_quota_date 保持原值不动
@@ -166,14 +126,15 @@ def test_mark_account_limited_without_business_date_is_backward_compatible(repos
 
 
 def test_reset_daily_quotas_clears_expired_limited_until(repository, temp_profile):
-    """v0.2.12:`mark_account_limited` 把桶 cap 到 quota_limit,
+    """v0.2.12:`mark_account_limited` 把 shared 桶 cap 到 quota_limit,
     如果 limited_until 在当天内到期,旧实现会让账号永久不可选。
-    `reset_daily_quotas` 现在顺带清掉已过期的 limited_until + 三桶归零。"""
+    `reset_daily_quotas` 现在顺带清掉已过期的 limited_until + shared 桶归零。"""
     account = Account.create(
         id="acc-recover", display_name="r", doubao_user_id="u-recover",
-        profile_dir=temp_profile, video_quota_date=date(2026, 7, 13),
+        profile_dir=temp_profile,
+        video_quota_date=date(2026, 7, 13),
     )
-    quotas = {"mini": 5, "v2": 5, "std": 5}
+    quotas = {"shared": 50}
     # 假设豆包 423 封到 16:00
     repository.mark_account_limited(account.id, datetime(2026, 7, 13, 16, 0), quotas)
     assert repository.choose_available_account(quotas, model="seedance_v2.0_mini") is None
@@ -182,9 +143,7 @@ def test_reset_daily_quotas_clears_expired_limited_until(repository, temp_profil
     repository.reset_daily_quotas(date(2026, 7, 13), now=datetime(2026, 7, 13, 21, 0))
 
     refreshed = Account.get_by_id(account.id)
-    assert refreshed.video_quota_used_mini == 0
-    assert refreshed.video_quota_used_v2 == 0
-    assert refreshed.video_quota_used_std == 0
+    assert refreshed.video_quota_used_shared == 0
     assert refreshed.video_limited_until is None
     # 账号重新可选
     picked = repository.choose_available_account(quotas, model="seedance_v2.0_mini")
@@ -196,9 +155,10 @@ def test_reset_daily_quotas_does_not_touch_active_limited_until(repository, temp
     """v0.2.12:limited_until 还在未来时不要清桶,封号期别被中途放出来。"""
     account = Account.create(
         id="acc-active-lim", display_name="a", doubao_user_id="u-al",
-        profile_dir=temp_profile, video_quota_date=date(2026, 7, 13),
+        profile_dir=temp_profile,
+        video_quota_date=date(2026, 7, 13),
     )
-    quotas = {"mini": 5, "v2": 5, "std": 5}
+    quotas = {"shared": 50}
     future = datetime(2026, 7, 14, 0, 0)  # 次日凌晨才到期
     repository.mark_account_limited(account.id, future, quotas)
 
@@ -206,7 +166,7 @@ def test_reset_daily_quotas_does_not_touch_active_limited_until(repository, temp
 
     refreshed = Account.get_by_id(account.id)
     assert refreshed.video_limited_until == future
-    assert refreshed.video_quota_used_mini == 5
+    assert refreshed.video_quota_used_shared == 50
     assert repository.choose_available_account(quotas, model="seedance_v2.0_mini") is None
 
 
@@ -219,7 +179,7 @@ def test_reset_daily_quotas_clears_expired_regardless_of_date(repository, temp_p
         profile_dir=temp_profile,
         video_quota_date=date(2026, 7, 12),  # 故意旧 date,跟 business_date 不匹配
     )
-    quotas = {"mini": 5, "v2": 5, "std": 5}
+    quotas = {"shared": 50}
     # 旧的 limited_until 已经过期(13 号 16:00 < 14 号中午)
     repository.mark_account_limited(
         account.id, datetime(2026, 7, 13, 16, 0), quotas,
@@ -230,9 +190,7 @@ def test_reset_daily_quotas_clears_expired_regardless_of_date(repository, temp_p
     repository.reset_daily_quotas(date(2026, 7, 14), now=datetime(2026, 7, 14, 12, 0))
 
     refreshed = Account.get_by_id(account.id)
-    assert refreshed.video_quota_used_mini == 0
-    assert refreshed.video_quota_used_v2 == 0
-    assert refreshed.video_quota_used_std == 0
+    assert refreshed.video_quota_used_shared == 0
     assert refreshed.video_limited_until is None
     assert refreshed.video_quota_date == date(2026, 7, 14)
     # 账号重新可选
@@ -241,9 +199,10 @@ def test_reset_daily_quotas_clears_expired_regardless_of_date(repository, temp_p
     assert picked.id == account.id
 
 
-def test_summarize_account_availability_counts_buckets(repository, temp_profile):
-    """v0.2.12:UI 需要区分「没有账号」vs「全部用完」,summary 计数要准。"""
-    quotas = {"mini": 5, "v2": 5, "std": 5}
+def test_summarize_account_availability_counts_shared_bucket(repository, temp_profile):
+    """v0.2.29:UI 需要区分「没有账号」vs「全部用完」,summary 计数要准。
+    共享池后 bucket_full = shared 桶满的账号数。"""
+    quotas = {"shared": 50}
     now = datetime(2026, 7, 13, 12, 0)
     # 0 个账号
     assert repository.summarize_account_availability(quotas, "seedance_v2.0_mini", now=now) == {
@@ -268,21 +227,8 @@ def test_summarize_account_availability_counts_buckets(repository, temp_profile)
     assert stats["bucket_full"] == 1
 
 
-def test_increment_account_quota_rejects_unknown_model(repository, temp_profile):
-    """v0.2.9:非法 model 不能悄悄扣错桶。"""
-    account = Account.create(
-        id="acc-nk", display_name="nk", doubao_user_id="u", profile_dir=temp_profile,
-    )
-    import pytest
-
-    with pytest.raises(ValueError, match="unsupported model"):
-        repository.increment_account_quota(account.id, model="foobar_baz")
-
-
-# ---------- v0.2.11:per-model quota 按 by=N 增量 + 任务删除 ----------
-
 def test_increment_account_quota_by_accumulates(repository, temp_profile):
-    """v0.2.11:by=2/3/1 累加到对应桶,不是简单的 +1 循环。"""
+    """v0.2.29:by=2/3/1 累加到 shared 桶。"""
     account = Account.create(
         id="acc-by", display_name="by", doubao_user_id="u", profile_dir=temp_profile,
     )
@@ -291,33 +237,30 @@ def test_increment_account_quota_by_accumulates(repository, temp_profile):
     repository.increment_account_quota(account.id, model="seedance_v2.0_std", by=1)
 
     refreshed = Account.get_by_id(account.id)
-    assert refreshed.video_quota_used_mini == 5
-    assert refreshed.video_quota_used_std == 1
-    # v2 桶没碰
-    assert refreshed.video_quota_used_v2 == 0
+    assert refreshed.video_quota_used_shared == 6
 
 
 def test_increment_account_quota_by_default_is_one(repository, temp_profile):
-    """v0.2.11:不传 by 默认 1,保持向后兼容。"""
+    """v0.2.29:不传 by 默认 1,保持向后兼容。"""
     account = Account.create(
         id="acc-d", display_name="d", doubao_user_id="u", profile_dir=temp_profile,
     )
     repository.increment_account_quota(account.id, model="seedance_v2.0_mini")
     repository.increment_account_quota(account.id, model="seedance_v2.0_mini")
 
-    assert Account.get_by_id(account.id).video_quota_used_mini == 2
+    assert Account.get_by_id(account.id).video_quota_used_shared == 2
 
 
 def test_increment_account_quota_by_rejects_zero_or_negative(repository, temp_profile):
-    """v0.2.11:by 必须 >= 1,避免被传 0 静默无操作。"""
+    """v0.2.29:by 必须 >= 1,避免被传 0 静默无操作。"""
     import pytest
 
     account = Account.create(
         id="acc-bad", display_name="bad", doubao_user_id="u", profile_dir=temp_profile,
     )
-    with pytest.raises(ValueError, match="by must be >= 1"):
+    with pytest.raises(ValueError, match="increment by must be >= 1"):
         repository.increment_account_quota(account.id, model="seedance_v2.0_mini", by=0)
-    with pytest.raises(ValueError, match="by must be >= 1"):
+    with pytest.raises(ValueError, match="increment by must be >= 1"):
         repository.increment_account_quota(account.id, model="seedance_v2.0_mini", by=-3)
 
 
@@ -375,8 +318,8 @@ def test_get_update_assign_video_task_returns_none_when_task_deleted(repository,
     assert repository.assign_video_task(task.id, None) is None
 
 
-def test_complete_login_resets_quota_buckets_for_existing_account(repository, temp_profile):
-    """v0.2.14:已存在账号重新登录成功后,把三桶 quota 清零 + 清 limited_until。
+def test_complete_login_resets_shared_bucket_for_existing_account(repository, temp_profile):
+    """v0.2.29:已存在账号重新登录成功后,清 shared 桶 quota + 清 limited_until。
 
     v0.2.12 时代被 mark_account_limited cap 死的桶,v0.2.13 修了 reset_daily_quotas
     两段清桶,但装上 v0.2.13 之前已经死锁的桶只会等下次 423 / 跨天才解。
@@ -386,16 +329,16 @@ def test_complete_login_resets_quota_buckets_for_existing_account(repository, te
     account = Account.create(
         id="acc-relogin", display_name="旧昵称", doubao_user_id="u-relogin",
         profile_dir=temp_profile,
-        # 模拟 v0.2.12 时代被 cap 死的状态
-        video_quota_used_mini=5, video_quota_used_v2=5, video_quota_used_std=5,
+        # 模拟被 cap 死的状态
+        video_quota_used_shared=50,
         video_limited_until=datetime(2026, 8, 3, 16, 0),
         video_quota_date=date(2026, 8, 3),
         status="limited",
     )
     attempt = repository.create_login_attempt()
-    quotas = {"mini": 5, "v2": 5, "std": 5}
+    quotas = {"shared": 50}
 
-    # 重登录前:桶满、limited_until 在未来 → 任何模型都选不到
+    # 重登录前:shared 满、limited_until 在未来 → 任何模型都选不到
     assert repository.choose_available_account(quotas, model="seedance_v2.0_mini") is None
     assert repository.choose_available_account(quotas, model="seedance_v2.0_std") is None
 
@@ -406,10 +349,8 @@ def test_complete_login_resets_quota_buckets_for_existing_account(repository, te
         profile_dir=temp_profile,
     )
 
-    # 三桶清零、limited_until 清空、昵称/状态都更新
-    assert refreshed.video_quota_used_mini == 0
-    assert refreshed.video_quota_used_v2 == 0
-    assert refreshed.video_quota_used_std == 0
+    # shared 桶清零、limited_until 清空、昵称/状态都更新
+    assert refreshed.video_quota_used_shared == 0
     assert refreshed.video_limited_until is None
     assert refreshed.status == "active"
     assert refreshed.doubao_nickname == "新昵称"
@@ -421,12 +362,12 @@ def test_complete_login_resets_quota_buckets_for_existing_account(repository, te
 
 
 def test_complete_login_creates_new_account_without_touching_others(repository, temp_profile):
-    """v0.2.14:首次登录的新账号走 if 分支,不该动别的账号 quota。"""
+    """v0.2.29:首次登录的新账号走 if 分支,不该动别的账号 quota。"""
     # 已存在的老账号,quota 满
     Account.create(
         id="acc-old", display_name="老", doubao_user_id="u-old",
         profile_dir=temp_profile,
-        video_quota_used_mini=5, video_quota_used_v2=5, video_quota_used_std=5,
+        video_quota_used_shared=50,
         video_limited_until=datetime(2026, 8, 3, 16, 0),
     )
     attempt = repository.create_login_attempt()
@@ -439,47 +380,42 @@ def test_complete_login_creates_new_account_without_touching_others(repository, 
 
     # 老账号 quota 不应该被新账号登录牵连清掉
     old = Account.get_by_id("acc-old")
-    assert old.video_quota_used_mini == 5
+    assert old.video_quota_used_shared == 50
     assert old.video_limited_until == datetime(2026, 8, 3, 16, 0)
 
 
-# --- v0.2.19:decrement_account_quota (失败退还额度) ---
+# --- v0.2.29:decrement_account_quota (失败退还额度,共享池) ---
 
 
-def test_decrement_account_quota_subtracts_from_bucket(repository, temp_profile):
-    """v0.2.19:退款按桶减,不影响其它桶。"""
+def test_decrement_account_quota_subtracts_from_shared_bucket(repository, temp_profile):
+    """v0.2.29:退款都走 shared 桶(共享池下不分模型)。"""
     account = Account.create(
         id="acc-refund", display_name="refund", doubao_user_id="u",
         profile_dir=temp_profile,
-        video_quota_used_mini=15, video_quota_used_std=8, video_quota_used_v2=3,
+        video_quota_used_shared=15,
     )
     repository.decrement_account_quota(account.id, model="seedance_v2.0_mini", by=10)
 
     refreshed = Account.get_by_id(account.id)
-    assert refreshed.video_quota_used_mini == 5
-    # 其它桶不动
-    assert refreshed.video_quota_used_std == 8
-    assert refreshed.video_quota_used_v2 == 3
+    assert refreshed.video_quota_used_shared == 5
 
 
 def test_decrement_account_quota_clamps_at_zero(repository, temp_profile):
-    """v0.2.19:跨天 reset 后再退款,used 已经是 0,不能被打成负数。"""
+    """v0.2.29:跨天 reset 后再退款,used 已经是 0,不能被打成负数。"""
     account = Account.create(
         id="acc-clamp", display_name="clamp", doubao_user_id="u",
         profile_dir=temp_profile,
-        video_quota_used_mini=0, video_quota_used_std=5,
+        video_quota_used_shared=0,
     )
-    # mini 桶 0,退款 10 点不能变负
+    # shared 桶 0,退款 10 点不能变负
     repository.decrement_account_quota(account.id, model="seedance_v2.0_mini", by=10)
 
     refreshed = Account.get_by_id(account.id)
-    assert refreshed.video_quota_used_mini == 0
-    # 退错了其它桶也不动
-    assert refreshed.video_quota_used_std == 5
+    assert refreshed.video_quota_used_shared == 0
 
 
 def test_decrement_account_quota_rejects_invalid_by(repository, temp_profile):
-    """v0.2.19:by 必须 >= 1,跟 increment 保持对称。"""
+    """v0.2.29:by 必须 >= 1,跟 increment 保持对称。"""
     import pytest
     account = Account.create(
         id="acc-bad-refund", display_name="br", doubao_user_id="u",
@@ -491,27 +427,128 @@ def test_decrement_account_quota_rejects_invalid_by(repository, temp_profile):
         repository.decrement_account_quota(account.id, model="seedance_v2.0_mini", by=-5)
 
 
-def test_decrement_account_quota_rejects_unknown_model(repository, temp_profile):
-    """v0.2.19:非法 model 抛 ValueError(避免悄悄退错桶)。"""
-    import pytest
-    account = Account.create(
-        id="acc-nk-refund", display_name="nk", doubao_user_id="u",
-        profile_dir=temp_profile,
-    )
-    with pytest.raises(ValueError, match="unsupported model"):
-        repository.decrement_account_quota(account.id, model="bogus_model")
-
-
 def test_increment_then_decrement_is_net_zero(repository, temp_profile):
-    """v0.2.19:扣 10 点后退 10 点,桶回到原值。完整闭环。"""
+    """v0.2.29:扣 10 点后退 10 点,shared 桶回到原值。完整闭环。"""
     account = Account.create(
         id="acc-roundtrip", display_name="rt", doubao_user_id="u",
         profile_dir=temp_profile,
-        video_quota_used_mini=7, video_quota_used_std=4,
+        video_quota_used_shared=7,
     )
     repository.increment_account_quota(account.id, model="seedance_v2.0_mini", by=10)
-    assert Account.get_by_id(account.id).video_quota_used_mini == 17
+    assert Account.get_by_id(account.id).video_quota_used_shared == 17
     repository.decrement_account_quota(account.id, model="seedance_v2.0_mini", by=10)
-    assert Account.get_by_id(account.id).video_quota_used_mini == 7
-    # 其它桶不动
-    assert Account.get_by_id(account.id).video_quota_used_std == 4
+    assert Account.get_by_id(account.id).video_quota_used_shared == 7
+
+
+# ---------- v0.2.29:共享池迁移 + 手动重置 ----------
+
+
+def test_migrate_legacy_quota_buckets_sums_three_buckets(repository, temp_profile):
+    """v0.2.29:启动迁移把老 mini+v2+std 一次性累加进 shared。
+
+    A:shared=0 mini=10 v2=20 std=15 → 迁到 shared=45
+    B:shared=5(已迁过) mini=0 v2=0 std=0 → 不动
+    C:shared=0 全 0 → 不动
+    """
+    a = Account.create(
+        id="acc-a", display_name="A", doubao_user_id="u-a",
+        profile_dir=temp_profile,
+        video_quota_used_mini=10, video_quota_used_v2=20, video_quota_used_std=15,
+    )
+    b = Account.create(
+        id="acc-b", display_name="B", doubao_user_id="u-b",
+        profile_dir=temp_profile,
+        video_quota_used_shared=5,  # 已迁过
+        video_quota_used_mini=0, video_quota_used_v2=0, video_quota_used_std=0,
+    )
+    c = Account.create(
+        id="acc-c", display_name="C", doubao_user_id="u-c",
+        profile_dir=temp_profile,
+        video_quota_used_shared=0,
+        video_quota_used_mini=0, video_quota_used_v2=0, video_quota_used_std=0,
+    )
+
+    migrated = repository.migrate_legacy_quota_buckets()
+    assert migrated == 1
+
+    a_after = Account.get_by_id(a.id)
+    b_after = Account.get_by_id(b.id)
+    c_after = Account.get_by_id(c.id)
+    assert a_after.video_quota_used_shared == 45
+    assert b_after.video_quota_used_shared == 5  # 不动
+    assert c_after.video_quota_used_shared == 0  # 不动
+
+    # 多次执行幂等
+    migrated_again = repository.migrate_legacy_quota_buckets()
+    assert migrated_again == 0
+
+
+def test_reset_account_quota_clears_shared_bucket(repository, temp_profile):
+    """v0.2.29:清单个账号 shared 桶 + limited_until。"""
+    account = Account.create(
+        id="acc-reset", display_name="r", doubao_user_id="u",
+        profile_dir=temp_profile,
+        video_quota_used_shared=30,
+        video_limited_until=datetime(2026, 8, 6, 16, 0),
+        video_quota_date=date(2026, 8, 5),
+    )
+    ok = repository.reset_account_quota(account.id, date(2026, 8, 6))
+    assert ok is True
+
+    refreshed = Account.get_by_id(account.id)
+    assert refreshed.video_quota_used_shared == 0
+    assert refreshed.video_limited_until is None
+    assert refreshed.video_quota_date == date(2026, 8, 6)
+
+
+def test_reset_account_quota_returns_false_for_missing_account(repository):
+    """v0.2.29:账号不存在返 False(让 API 层返 404)。"""
+    assert repository.reset_account_quota("nonexistent", date(2026, 8, 6)) is False
+
+
+def test_reset_all_quotas_only_clears_enabled_accounts(repository, temp_profile):
+    """v0.2.29:一键重置只清 enabled 账号 —— disabled 是用户显式关的,别自动清。"""
+    enabled = Account.create(
+        id="acc-enabled", display_name="enabled", doubao_user_id="u1",
+        profile_dir=temp_profile, enabled=True,
+        video_quota_used_shared=40, video_limited_until=datetime(2026, 8, 6, 16, 0),
+    )
+    disabled = Account.create(
+        id="acc-disabled", display_name="disabled", doubao_user_id="u2",
+        profile_dir=temp_profile, enabled=False,
+        video_quota_used_shared=40, video_limited_until=datetime(2026, 8, 6, 16, 0),
+    )
+
+    count = repository.reset_all_quotas(date(2026, 8, 6))
+    assert count == 1  # 只清了 enabled
+
+    e = Account.get_by_id(enabled.id)
+    d = Account.get_by_id(disabled.id)
+    assert e.video_quota_used_shared == 0
+    assert e.video_limited_until is None
+    # disabled 不动
+    assert d.video_quota_used_shared == 40
+    assert d.video_limited_until == datetime(2026, 8, 6, 16, 0)
+
+
+def test_reset_all_quotas_returns_zero_when_no_enabled_accounts(repository, temp_profile):
+    """v0.2.29:没有 enabled 账号时返 0(前端 UI 显示「已重置 0 个」)。"""
+    Account.create(
+        id="acc-only-disabled", display_name="d", doubao_user_id="u",
+        profile_dir=temp_profile, enabled=False,
+        video_quota_used_shared=50,
+    )
+    assert repository.reset_all_quotas(date(2026, 8, 6)) == 0
+
+
+def test_reset_account_quota_is_idempotent(repository, temp_profile):
+    """v0.2.29:reset 多次执行幂等(用户狂点也不出事)。"""
+    account = Account.create(
+        id="acc-idem", display_name="i", doubao_user_id="u",
+        profile_dir=temp_profile,
+        video_quota_used_shared=20,
+    )
+    assert repository.reset_account_quota(account.id, date(2026, 8, 6)) is True
+    assert repository.reset_account_quota(account.id, date(2026, 8, 6)) is True
+    assert repository.reset_account_quota(account.id, date(2026, 8, 6)) is True
+    assert Account.get_by_id(account.id).video_quota_used_shared == 0

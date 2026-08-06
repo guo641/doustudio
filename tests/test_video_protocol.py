@@ -507,3 +507,32 @@ def test_parse_sse_ack_response_text_truncated_at_2000():
         parse_sse_ack(padded)
     assert len(excinfo.value.response_text) <= 2000
     assert "无法生成" in excinfo.value.response_text
+
+
+# ---------- v0.2.29:时长白名单放宽到任意整数 4..10 秒 ----------
+
+
+@pytest.mark.parametrize("duration", [4, 5, 6, 7, 8, 9, 10])
+def test_build_completion_payload_accepts_arbitrary_duration_4_to_10(duration):
+    """v0.2.29:豆包接受任意整数 4..10 秒(原白名单 {5, 10} 太严,用户实测 6/7/8/9 都能生成)。"""
+    payload = build_completion_payload(
+        prompt="测试",
+        model="seedance_v2.0_mini",
+        ratio="1:1",
+        duration=duration,
+        fingerprint="fp",
+    )
+    assert json.loads(payload["chat_ability"]["ability_param"])["duration"] == duration
+
+
+@pytest.mark.parametrize("duration", [0, 3, 11, 15, 30])
+def test_build_completion_payload_rejects_duration_outside_4_to_10(duration):
+    """v0.2.29:<4 或 >10 秒必须拒绝 —— 豆包不会处理,趁早 fail-fast。"""
+    with pytest.raises(ValueError, match="duration"):
+        build_completion_payload(
+            prompt="测试",
+            model="seedance_v2.0_mini",
+            ratio="1:1",
+            duration=duration,
+            fingerprint="fp",
+        )

@@ -10,21 +10,14 @@ from peewee import JOIN, SqliteDatabase
 from .models import Account, AppLog, AppSetting, LoginAttempt, VideoTask, utcnow
 
 
-# v0.2.9:seedance 模型 → quota 列名后缀。Account 列名 video_quota_used_<suffix>
-# 必须和这里一致。校验非法 model 时 raise ValueError。
-MODEL_QUOTA_FIELD: dict[str, str] = {
-    "seedance_v2.0_mini": "video_quota_used_mini",
-    "seedance_v2.0": "video_quota_used_v2",
-    "seedance_v2.0_std": "video_quota_used_std",
-}
+# v0.2.29:豆包官方按账号每日总配额,不区分模型 → 共享池。
+# 扣退/选择/限流全部走这一个字段,旧 mini/v2/std 三列保留只读(历史可查)。
+SHARED_QUOTA_FIELD = "video_quota_used_shared"
 
 
-def _quota_field(model: str) -> str:
-    """模型名 → Account quota 列名。非法 model 抛 ValueError。"""
-    try:
-        return MODEL_QUOTA_FIELD[model]
-    except KeyError as exc:
-        raise ValueError(f"unsupported model for quota: {model}") from exc
+def _shared_quota_field() -> str:
+    """v0.2.29:共享池下所有 model 路由到同一列,签名里 `model` 参数仅作日志可观测。"""
+    return SHARED_QUOTA_FIELD
 
 
 class AccountRepository:
@@ -83,15 +76,8 @@ class AccountRepository:
                 account.status = "active"
                 account.last_verified_at = now
                 account.last_error = None
-                # v0.2.14:重新登录成功时重置 quota 桶。
-                # v0.2.12 时代的账号被 mark_account_limited cap 到 quota_limit,
-                # 即便 v0.2.13 的 reset_daily_quotas 修了跨天+同天到期两段清桶,
-                # 用户已经死锁的桶也只会等下次 423 / 跨天才解 —— 而登录是最稳的
-                # 恢复点,反正账号刚扫完码就能用。把 3 个桶清零、清 limited_until,
-                # 让重新登录过的账号立刻可调度。
-                account.video_quota_used_mini = 0
-                account.video_quota_used_v2 = 0
-                account.video_quota_used_std = 0
+                # v0.2.29:共享池下重置只清 shared 桶 + limited_until。
+                account.video_quota_used_shared = 0
                 account.video_limited_until = None
                 account.updated_at = now
                 account.save()
@@ -131,14 +117,12 @@ class AccountRepository:
         now: datetime | None = None,
         strategy: str = "least_used",
     ) -> Account | None:
-        """v0.2.9:按 model 桶过滤 quota。返回该桶还有额度的最早账号。
+        """v0.2.29:共享额度池 —— 所有 model 走同一 quota 列,bucket 选 'shared'。
 
-        daily_quotas: SettingsService.get_daily_quotas() 返回的 {'mini': int, ...}
-        model: 任务模型(seedance_v2.0_mini / seedance_v2.0 / seedance_v2.0_std)
+        签名保留 `model` / `strategy` 是为了上层日志/可观测性,不影响扣哪个桶。
         """
-        field_name = _quota_field(model)
-        bucket = field_name.removeprefix("video_quota_used_")
-        quota_limit = int(daily_quotas[bucket])
+        field_name = _shared_quota_field()
+        quota_limit = int(daily_quotas["shared"])
         field = getattr(Account, field_name)
         now = now or utcnow()
         query = (
@@ -162,14 +146,9 @@ class AccountRepository:
         model: str,
         now: datetime | None = None,
     ) -> dict[str, int]:
-        """v0.2.12:给前端清晰的等待原因 —— 「没有账号」vs 「全部用完」。
-
-        不直接返回 Account,只统计数字。choose_available_account 返 None
-        时,前端拿这两个数字决定提示文案。
-        """
-        field_name = _quota_field(model)
-        bucket = field_name.removeprefix("video_quota_used_")
-        quota_limit = int(daily_quotas[bucket])
+        """v0.2.29:共享池下 bucket='shared',统计 enabled_total / bucket_full。"""
+        field_name = _shared_quota_field()
+        quota_limit = int(daily_quotas["shared"])
         field = getattr(Account, field_name)
         now = now or utcnow()
         enabled_total = (
@@ -193,33 +172,21 @@ class AccountRepository:
         return {"enabled_total": enabled_total, "bucket_full": bucket_full}
 
     def reset_daily_quotas(self, business_date: date, now: datetime | None = None) -> None:
-        """三桶一起 reset(日切不区分模型,豆包对所有模型额度统一重置)。
+        """v0.2.29:共享池 reset —— 只清 shared 桶;旧 mini/v2/std 不再写入。
 
-        v0.2.12 顺带清 limited_until 已过期但桶被 cap 死的账号:
-        `mark_account_limited` 会把三桶 cap 到 quota_limit,直到 `reset_daily_quotas`
-        在跨天时才清。如果 limited_until 落在当天内(豆包 423 短时封号),
-        旧实现会让账号永久不可选 —— 因为 `< quota_limit` 永远是 False。
-        现在即使还没跨天,只要 limited_until <= now,就把桶清回 0 + 撤掉
-        limited_until,让账号恢复可用。
+        日切条件保留(业务日变化时清零 + 写 date);同时清 limited_until
+        已过期但桶被 cap 死的账号。
         """
         now = now or utcnow()
         (Account.update(
-            video_quota_used_mini=0,
-            video_quota_used_v2=0,
-            video_quota_used_std=0,
+            video_quota_used_shared=0,
             video_quota_date=business_date,
             video_limited_until=None,
          )
          .where((Account.video_quota_date.is_null(True)) | (Account.video_quota_date != business_date))
          .execute())
-        # v0.2.12:同一天内 limited_until 已到期 → 桶已 cap 死,清桶让账号恢复。
-        # v0.2.13:去掉 date == business_date 限制 —— 任何 limited_until <= now
-        # 都清桶,跟第一段(日切)互不依赖更安全。mark_account_limited 现在会
-        # 同步写 video_quota_date,跨天时第一段也会命中,两段协同不会重复写。
         (Account.update(
-            video_quota_used_mini=0,
-            video_quota_used_v2=0,
-            video_quota_used_std=0,
+            video_quota_used_shared=0,
             video_limited_until=None,
             updated_at=now,
          )
@@ -236,18 +203,10 @@ class AccountRepository:
         daily_quotas: dict[str, int],
         business_date: date | None = None,
     ) -> None:
-        # v0.2.9:豆包 423 限流封整号(不区分模型),三桶一并 cap 到各自 quota,
-        # 配合 choose_available_account 的 < 比较,该账号任何模型都不可再选。
-        # v0.2.13:同步把 video_quota_date 写成业务日,确保 reset_daily_quotas
-        # 跨天时第一段(日期不匹配)一定能命中,把桶清回 0。否则如果调用方传
-        # 的 limited_until 是「当天未来某点」(quota_window 在 reset_time > now
-        # 时的产物),且用户在设置面板改了 quota_reset_time,新 next_reset 已经
-        # 跳到次日,但旧的 limited_until 还指向当天未来时间,跨天/同日两段都
-        # 不会清桶,账号就 cap 死选不到了。
+        # v0.2.29:共享池下只 cap shared 一桶;配合 choose_available_account 的
+        # < 比较,该账号任何 model 都不可再选。
         update_kwargs: dict = dict(
-            video_quota_used_mini=daily_quotas["mini"],
-            video_quota_used_v2=daily_quotas["v2"],
-            video_quota_used_std=daily_quotas["std"],
+            video_quota_used_shared=daily_quotas["shared"],
             video_limited_until=limited_until,
             updated_at=utcnow(),
         )
@@ -259,12 +218,13 @@ class AccountRepository:
     def increment_account_quota(
         self, account_id: str, model: str, *, by: int = 1
     ) -> None:
-        """v0.2.9:按 model 桶扣。
-        v0.2.11:加 by 参数,默认 1 保持向后兼容;非法 by(<1)抛 ValueError。
-        非法 model 也抛 ValueError(避免悄悄扣错桶)。"""
+        """v0.2.29:共享池扣 —— 所有 model 扣同一个 shared 桶。
+
+        `model` 参数保留仅为日志可观测,不影响扣哪个桶;非法 by(<1)仍抛 ValueError。
+        """
         if by < 1:
             raise ValueError(f"increment by must be >= 1, got {by}")
-        field_name = _quota_field(model)
+        field_name = _shared_quota_field()
         field = getattr(Account, field_name)
         (Account.update(**{field_name: field + by}, updated_at=utcnow())
          .where(Account.id == account_id).execute())
@@ -272,19 +232,13 @@ class AccountRepository:
     def decrement_account_quota(
         self, account_id: str, model: str, *, by: int = 1
     ) -> None:
-        """v0.2.19:失败退还额度 —— 配合 service 里的网络/prompt 违规退款路径。
+        """v0.2.29:共享池退 —— 同 increment,但走 max(0, used - by)。
 
-        与 increment_account_quota 对称:非法 by(<1)抛 ValueError;非法 model
-        也抛 ValueError;桶下界 0(`max(0, used - by)`),避免跨天 reset 后
-        退款把 used 打成负数。
-
-        注:这里的「退款」只覆盖 service 主动判定为失败的情况 —— 豆包真实
-        是否计费只能等用户第二天看官方账户为准。我们这边只是把桶里
-        多记的 quota 减回来,让用户感觉「提了被拒的任务不会扣我额度」。
+        桶下界 0,避免跨天 reset 后退款把 used 打成负数。
         """
         if by < 1:
             raise ValueError(f"decrement by must be >= 1, got {by}")
-        field_name = _quota_field(model)
+        field_name = _shared_quota_field()
         field = getattr(Account, field_name)
         # 用 SQL 表达式 max(field - by, 0):peewee 没有直接的 GREATEST,
         # 但 SQLite/MySQL/Postgres 都支持 GREATEST。用 Case 实现兼容性更好。
@@ -296,6 +250,63 @@ class AccountRepository:
         )
         (Account.update(**{field_name: new_value}, updated_at=utcnow())
          .where(Account.id == account_id).execute())
+
+    # ---------- v0.2.29:共享池迁移 + 手动重置 ----------
+
+    def migrate_legacy_quota_buckets(self, now: datetime | None = None) -> int:
+        """把历史 mini+v2+std 一次性累加进 shared 桶。
+
+        触发条件:`video_quota_used_shared == 0 且 sum(mini+v2+std) > 0`。
+        已迁过的账号(shared>0 或 sum==0)不动,多次执行安全。
+        返回迁移过的账号数。
+        """
+        now = now or utcnow()
+        migrated = 0
+        with self.database.atomic():
+            for account in Account.select():
+                if account.video_quota_used_shared > 0:
+                    continue
+                legacy_total = (
+                    (account.video_quota_used_mini or 0)
+                    + (account.video_quota_used_v2 or 0)
+                    + (account.video_quota_used_std or 0)
+                )
+                if legacy_total <= 0:
+                    continue
+                Account.update(
+                    video_quota_used_shared=legacy_total,
+                    updated_at=now,
+                ).where(Account.id == account.id).execute()
+                migrated += 1
+        return migrated
+
+    def reset_account_quota(self, account_id: str, business_date: date, now: datetime | None = None) -> bool:
+        """v0.2.29:清单个账号的 shared 桶 + 清 limited_until。
+
+        账号不存在返回 False,清成功返回 True。幂等。
+        """
+        now = now or utcnow()
+        query = Account.update(
+            video_quota_used_shared=0,
+            video_quota_date=business_date,
+            video_limited_until=None,
+            updated_at=now,
+        ).where(Account.id == account_id)
+        updated = query.execute()
+        return updated > 0
+
+    def reset_all_quotas(self, business_date: date, now: datetime | None = None) -> int:
+        """v0.2.29:一键清所有 enabled 账号的 shared 桶 + limited_until。
+
+        返回被清的账号数。disabled 账号不动(用户显式关掉的不要自动清)。
+        """
+        now = now or utcnow()
+        return Account.update(
+            video_quota_used_shared=0,
+            video_quota_date=business_date,
+            video_limited_until=None,
+            updated_at=now,
+        ).where(Account.enabled == True).execute()  # noqa: E712
 
     def create_video_task(
         self,

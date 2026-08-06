@@ -33,6 +33,19 @@ export async function updateAccount(id: string, body: { enabled: boolean }) {
 export async function deleteAccount(id: string) {
   return json(await fetch(`/api/accounts/${id}`, { method: 'DELETE', headers }), '账号删除失败');
 }
+// v0.2.29:单账号 / 一键全部重置额度 —— 兜底用,防止跨日 cron 卡住。
+export async function resetAccountQuota(id: string) {
+  return json(
+    await fetch(`/api/accounts/${id}/reset-quota`, { method: 'POST', headers }),
+    '账号额度重置失败',
+  );
+}
+export async function resetAllQuotas() {
+  return json(
+    await fetch('/api/accounts/reset-all-quota', { method: 'POST', headers }),
+    '一键重置额度失败',
+  );
+}
 export async function startLogin() {
   return json(await fetch('/api/accounts/login-attempts', { method: 'POST', headers }), '无法启动登录');
 }

@@ -116,20 +116,24 @@ def test_settings_round_trip_backup_and_validation(repository, database_manager,
     headers = {"X-DouPool-Token": "secret"}
 
     initial = client.get("/api/settings", headers=headers).json()
-    # v0.2.19:默认桶从 5 改成 50(豆包每天每账号 50 点)
-    assert initial["daily_quota"] == 50
-    # v0.2.9:三个新桶都在 defaults 里
-    assert initial["daily_quota_mini"] == 50
-    assert initial["daily_quota_v2"] == 50
-    assert initial["daily_quota_std"] == 50
-    # 三个桶独立更新
-    updated = client.put("/api/settings", headers=headers, json={"daily_quota_mini": 7, "daily_quota_std": 2})
+    # v0.2.29:共享额度池(豆包每天每账号 50 点,不按模型分桶)。
+    assert initial["daily_quota_shared"] == 50
+    # max_concurrency 默认 1
+    assert initial["max_concurrency"] == 1
+    # 默认时长 5 秒(4..10 范围里中位)
+    assert initial["default_duration"] == 5
+    # 单独更新共享池
+    updated = client.put("/api/settings", headers=headers, json={"daily_quota_shared": 7})
     assert updated.status_code == 200
-    assert updated.json()["daily_quota_mini"] == 7
-    assert updated.json()["daily_quota_std"] == 2
-    assert updated.json()["daily_quota_v2"] == 50  # 未动
+    assert updated.json()["daily_quota_shared"] == 7
+    # 并发上限 51 拒
     assert client.put("/api/settings", headers=headers, json={"max_concurrency": 0}).status_code == 422
-    assert client.put("/api/settings", headers=headers, json={"daily_quota_mini": 200}).status_code == 422
+    assert client.put("/api/settings", headers=headers, json={"max_concurrency": 51}).status_code == 422
+    # 时长 3 / 11 拒(原 {5,10} 太严,现任意整数 4..10)
+    assert client.put("/api/settings", headers=headers, json={"default_duration": 3}).status_code == 422
+    assert client.put("/api/settings", headers=headers, json={"default_duration": 11}).status_code == 422
+    # daily_quota_shared 200 拒(范围 1..100)
+    assert client.put("/api/settings", headers=headers, json={"daily_quota_shared": 200}).status_code == 422
     backup = client.post("/api/settings/backup", headers=headers)
     assert backup.status_code == 201
     assert backup.json()["path"].endswith(".sqlite3")
@@ -149,14 +153,20 @@ def test_logs_can_be_listed_and_cleared(repository, tmp_path):
     assert client.get("/api/logs", headers=headers).json() == []
 
 
-def test_account_payload_has_quota_and_active_task_blocks_delete(repository, tmp_path, temp_profile):
+def test_account_payload_has_shared_quota_and_active_task_blocks_delete(repository, tmp_path, temp_profile):
+    """v0.2.29:共享池 —— _account_dict 主字段是 video_quota_used_shared/total_shared。
+
+    旧 mini/v2/std 字段 alias 到 shared(给老前端缓存兜底),值相同。
+    共享池下,任意 task 模型的额度显示都用 shared 一桶。
+    """
     from datetime import date
     from doupool.db.models import Account
 
+    # v0.2.29:直接写 shared 桶,不走 mini/v2/std 迁移路径,值确定。
     account = Account.create(
         id="account-quota", display_name="额度账号", doubao_user_id="quota-user",
         profile_dir=temp_profile,
-        video_quota_used_mini=3, video_quota_used_v2=2, video_quota_used_std=1,
+        video_quota_used_shared=3,
         video_quota_date=date(2026, 7, 13),
     )
     repository.create_video_task(account.id, "运行中", "seedance_v2.0_mini", "1:1", 5)
@@ -167,17 +177,201 @@ def test_account_payload_has_quota_and_active_task_blocks_delete(repository, tmp
     headers = {"X-DouPool-Token": "secret"}
 
     payload = client.get("/api/accounts", headers=headers).json()[0]
-    # v0.2.9:旧 video_quota_used alias 到 mini 桶,前端缓存兼容
+    # v0.2.29 共享池主字段
+    assert payload["video_quota_used_shared"] == 3
+    assert payload["video_quota_total_shared"] == 50  # 无 settings_service 时默认 50
+    # legacy alias
     assert payload["video_quota_used"] == 3
-    # 三桶全部暴露
+    # 旧 mini/v2/std 镜像到 shared
     assert payload["video_quota_used_mini"] == 3
-    assert payload["video_quota_used_v2"] == 2
-    assert payload["video_quota_used_std"] == 1
-    # total 来自 settings(无 settings_service 时默认 5)
-    assert payload["video_quota_total_mini"] == 5
-    assert payload["video_quota_total_v2"] == 5
-    assert payload["video_quota_total_std"] == 5
+    assert payload["video_quota_used_v2"] == 3
+    assert payload["video_quota_used_std"] == 3
+    # total 来自 settings(无 settings_service 时默认 50)
+    assert payload["video_quota_total_mini"] == 50
+    assert payload["video_quota_total_v2"] == 50
+    assert payload["video_quota_total_std"] == 50
     assert client.delete(f"/api/accounts/{account.id}", headers=headers).status_code == 409
+
+
+# --- v0.2.29:手动重置额度端点 + legacy 迁移在 lifespan 自动跑 ---
+
+
+def test_account_payload_after_legacy_migration_sums_three_buckets(repository, tmp_path, temp_profile):
+    """v0.2.29:lifespan 自动跑 migrate_legacy_quota_buckets。
+
+    老账号(shared=0 但 mini+v2+std>0)在 TestClient lifespan 启动后被自动迁移:
+    旧三桶累加进 shared。`_account_dict` 显示 shared_used = 45,旧字段 alias 全部 45。
+    """
+    from datetime import date
+    from doupool.db.models import Account
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+
+    # 进入 TestClient 上下文(触发生命周期 → migrate_legacy_quota_buckets 跑一次,此时 DB 空)
+    with TestClient(create_app("secret", tmp_path / "missing", repository, login)) as _client:
+        # lifespan 跑完后再创建老账号(模拟真实场景:用户重启后老 DB 已迁移完,
+        # 这条 create 不会再次触发迁移,因为 lifespan 只跑一次)
+        # 显式调一次模拟「lifespan 期间老 DB 还没写入」的场景 —— 在 lifespan 之外调用
+        pass
+    # 现在 DB 是 lifespan 跑过后的状态。手动模拟「lifespan 期间有老桶残留」:
+    # 写一个老桶残留账号,再显式调迁移(等于用户升级前 DB 状态被运维脚本触发迁移)。
+    Account.create(
+        id="account-legacy", display_name="老账号", doubao_user_id="user-legacy",
+        profile_dir=temp_profile,
+        video_quota_used_mini=10, video_quota_used_v2=20, video_quota_used_std=15,
+        video_quota_date=date(2026, 7, 13),
+    )
+    migrated = repository.migrate_legacy_quota_buckets()
+    assert migrated == 1
+
+    # 重新进 TestClient(新 lifespan 跑迁移,会把这条已经迁过的跳过)
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    payload = client.get("/api/accounts", headers=headers).json()[0]
+    # 旧三桶被累加进 shared,值是 10+20+15=45
+    assert payload["video_quota_used_shared"] == 45
+    # 旧字段 alias 到 shared → 都是 45(共享池不分模型)
+    assert payload["video_quota_used_mini"] == 45
+    assert payload["video_quota_used_v2"] == 45
+    assert payload["video_quota_used_std"] == 45
+
+
+def test_lifespan_auto_migrates_legacy_buckets_on_startup(repository, tmp_path, temp_profile):
+    """v0.2.29:TestClient lifespan 进入时自动跑迁移。
+
+    模拟真实启动流程 —— lifespan 进入前账号已存在(老 DB 写入),
+    lifespan 钩子里自动调迁移,_account_dict 读出来 shared=45。
+    用 `with TestClient(...)` 走上下文,触发 starlette 的 lifespan.startup。
+    """
+    from datetime import date
+    from doupool.db.models import Account
+
+    # 在 TestClient 上下文之外写入老账号(共享池 + 老三桶残留)
+    Account.create(
+        id="account-legacy-auto", display_name="lifespan 自动迁", doubao_user_id="u-auto",
+        profile_dir=temp_profile,
+        video_quota_used_mini=10, video_quota_used_v2=20, video_quota_used_std=15,
+        video_quota_date=date(2026, 7, 13),
+    )
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    headers = {"X-DouPool-Token": "secret"}
+    # 必须用 `with` —— starlette 的 TestClient 只有走 __enter__/__exit__
+    # 才会真的发 lifespan.startup 事件。直接 TestClient(...) 不会触发。
+    with TestClient(create_app("secret", tmp_path / "missing", repository, login)) as client:
+        payload = client.get("/api/accounts", headers=headers).json()[0]
+        assert payload["video_quota_used_shared"] == 45
+
+
+def test_reset_account_quota_endpoint_clears_shared_bucket(repository, tmp_path, temp_profile):
+    """v0.2.29:POST /api/accounts/{id}/reset-quota 清 shared 桶 + limited_until。"""
+    from datetime import date, datetime
+    from doupool.db.models import Account
+
+    account = Account.create(
+        id="account-reset", display_name="被限流", doubao_user_id="u-reset",
+        profile_dir=temp_profile,
+        video_quota_used_shared=42,
+        video_limited_until=datetime(2026, 7, 13, 16, 0),
+        video_quota_date=date(2026, 7, 12),
+    )
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(
+        f"/api/accounts/{account.id}/reset-quota",
+        headers=headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reset_count"] == 1
+    assert body["account_id"] == account.id
+    assert "reset_at" in body
+
+    # 验证 DB 字段真的被清了
+    refreshed = Account.get_by_id(account.id)
+    assert refreshed.video_quota_used_shared == 0
+    assert refreshed.video_limited_until is None
+    # video_quota_date 跟其他 reset 端点一致,被推到 today(business_date)
+
+
+def test_reset_account_quota_endpoint_returns_404_for_missing_account(repository, tmp_path):
+    """v0.2.29:重置不存在的账号 → 404。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(
+        "/api/accounts/missing-id/reset-quota",
+        headers=headers,
+    )
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
+def test_reset_all_quota_endpoint_clears_enabled_accounts_only(repository, tmp_path, temp_profile):
+    """v0.2.29:一键重置只清 enabled 账号 —— disabled 是用户显式关的。"""
+    from datetime import datetime
+    from doupool.db.models import Account
+
+    enabled = Account.create(
+        id="account-enabled", display_name="enabled", doubao_user_id="u-e",
+        profile_dir=temp_profile, enabled=True,
+        video_quota_used_shared=40, video_limited_until=datetime(2026, 7, 13, 16, 0),
+    )
+    disabled = Account.create(
+        id="account-disabled", display_name="disabled", doubao_user_id="u-d",
+        profile_dir=temp_profile, enabled=False,
+        video_quota_used_shared=40, video_limited_until=datetime(2026, 7, 13, 16, 0),
+    )
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(
+        "/api/accounts/reset-all-quota",
+        headers=headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reset_count"] == 1  # 只清了 enabled
+
+    enabled_refreshed = Account.get_by_id(enabled.id)
+    disabled_refreshed = Account.get_by_id(disabled.id)
+    assert enabled_refreshed.video_quota_used_shared == 0
+    assert enabled_refreshed.video_limited_until is None
+    # disabled 不动
+    assert disabled_refreshed.video_quota_used_shared == 40
+    assert disabled_refreshed.video_limited_until == datetime(2026, 7, 13, 16, 0)
+
+
+def test_reset_all_quota_endpoint_returns_zero_when_no_enabled_accounts(repository, tmp_path, temp_profile):
+    """v0.2.29:没有 enabled 账号 → reset_count=0(不是 404,前端按成功处理)。"""
+    from doupool.db.models import Account
+    Account.create(
+        id="account-only-disabled", display_name="d", doubao_user_id="u",
+        profile_dir=temp_profile, enabled=False,
+        video_quota_used_shared=50,
+    )
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post("/api/accounts/reset-all-quota", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["reset_count"] == 0
+
+
+def test_reset_quota_endpoints_require_token(repository, tmp_path):
+    """v0.2.29:重置端点必须鉴权,不能匿名调。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    # 不带 token → 401
+    assert client.post("/api/accounts/x/reset-quota").status_code == 401
+    assert client.post("/api/accounts/reset-all-quota").status_code == 401
 
 
 def test_unassigned_task_payload_uses_null_account(repository, tmp_path):

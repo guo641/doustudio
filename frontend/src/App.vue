@@ -24,6 +24,7 @@ import {
   DpButton,
   DpDialog,
   DpField,
+  DpInput,
   DpSelect,
   DpTextarea,
   DpToast,
@@ -37,8 +38,9 @@ type Account = {
   status: string;
   enabled: boolean;
   last_verified_at?: string;
-  video_quota_used?: number;
-  video_quota_total?: number;
+  // v0.2.29:共享额度池(豆包按账号每日总配额,不区分模型)。
+  video_quota_used_shared?: number;
+  video_quota_total_shared?: number;
   video_limited_until?: string;
 };
 type VideoTask = {
@@ -605,10 +607,15 @@ onBeforeUnmount(() => {
             </DpSelect>
           </DpField>
           <DpField label="时长" for-id="video-duration">
-            <DpSelect id="video-duration" v-model.number="duration">
-              <option :value="5">5 秒</option>
-              <option :value="10">10 秒</option>
-            </DpSelect>
+            <!-- v0.2.29:豆包接受任意整数 4..10 秒时长,改 number input 代替原白名单 select。 -->
+            <DpInput
+              id="video-duration"
+              v-model.number="duration"
+              type="number"
+              :min="4"
+              :max="10"
+              :step="1"
+            />
           </DpField>
           <DpField label="比例" for-id="video-ratio">
             <DpSelect id="video-ratio" v-model="ratio">
