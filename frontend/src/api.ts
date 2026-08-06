@@ -81,10 +81,16 @@ export async function listVideoTasks(): Promise<Array<{
   result_url?: string;
   backup_result_url?: string;
   fallback_result_url?: string;
+  // v0.2.28:zhuceka 处理后的无水印视频;存在时优先给用户下载。
+  clean_video_url?: string;
+  clean_error?: string;
   cover_url?: string;
   error?: string;
   quota_used?: number;
   quota_total?: number;
+  // v0.2.28:批量任务被后端打成同一 group_id,结果页按组折叠展示。
+  group_id?: string;
+  group_index?: number;
   created_at: string;
 }>> {
   return json(await fetch('/api/video-tasks', { headers }), '任务加载失败');
@@ -218,6 +224,24 @@ export async function refreshResultUrl(taskId: string): Promise<{
   return json(
     await fetch(`/api/results/${taskId}/refresh-url`, { method: 'POST', headers }),
     '刷新下载链接失败',
+  );
+}
+
+// v0.2.28 Q2:结果页点「保存到下载目录」时调用,后端把 group_id 下所有
+// succeeded 任务视频流式写到 settings.download_dir/<batch_folder>/,
+// 返回落盘路径 + 文件数。同步等待(N 通常 3-5,每个 5-30s),后端设了
+// 30s/视频 超时,整组最坏 ~150s;前端按钮要 disable + 显示进度。
+export async function groupDownload(groupId: string): Promise<{
+  saved_dir: string;
+  file_count: number;
+}> {
+  return json(
+    await fetch('/api/results/group-download', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ group_id: groupId }),
+    }),
+    '保存批量视频失败',
   );
 }
 

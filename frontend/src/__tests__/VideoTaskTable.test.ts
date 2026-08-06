@@ -25,7 +25,9 @@ it('renders and filters the video task table', async () => {
   expect(screen.queryByRole('columnheader', { name: '模型参数' })).toBeNull();
   // v0.2.11:std 改名为 Seedance Fast
   expect(screen.getByText('Seedance Fast · 5s · 16:9')).toBeTruthy();
-  expect(screen.getByRole('link', { name: /下载/ })).toBeTruthy();
+  // v0.2.28:DownloadButton 渲染为 <button>,不是 <a>;「预览」链接保持 <a> 不变。
+  expect(screen.getByRole('button', { name: /下载/ })).toBeTruthy();
+  expect(screen.getByRole('link', { name: /预览/ })).toBeTruthy();
 
   await fireEvent.update(screen.getByLabelText('搜索任务'), '橘猫');
   expect(screen.queryByRole('cell', { name: '莲韵' })).toBeNull();

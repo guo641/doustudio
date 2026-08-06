@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { Clapperboard, RotateCcw, ExternalLink, Download, Trash2 } from '@lucide/vue';
-import { DpBadge, DpButton, DpEmpty, DpLink, DpPanel, DpSearchInput, DpSelect, DpTable, DpTag } from '@/ui';
+import { DpBadge, DpButton, DpDownloadButton, DpEmpty, DpLink, DpPanel, DpSearchInput, DpSelect, DpTable, DpTag } from '@/ui';
 
 type VideoTaskRow = {
   id: string;
@@ -34,6 +34,9 @@ defineEmits<{
   retry: [task: VideoTaskRow];
   // v0.2.11:删除任务(running 状态服务端会 409,这里按钮直接不显示)
   delete: [task: VideoTaskRow];
+  // v0.2.28:DownloadButton 三层 fallback 全失败时冒泡到 App.vue → onResultDownloadFailed
+  // → /api/results/:id/refresh-url 重解析签名 URL(与 ResultsTable 共用兜底链路)。
+  'download-failed': [taskId: string];
 }>();
 
 // v0.2.11:running 状态按钮不显示,与后端 is_task_deletable 保持一致
@@ -164,20 +167,28 @@ function paramsText(task: VideoTaskRow) {
                   <ExternalLink :size="12" />
                   无水印
                 </DpLink>
-                <DpLink :href="task.clean_video_url" download>
+                <DpDownloadButton
+                  :href="task.clean_video_url"
+                  :filename="`doubao-${task.id}-clean.mp4`"
+                  @download-failed="() => $emit('download-failed', task.id)"
+                >
                   <Download :size="12" />
                   下载
-                </DpLink>
+                </DpDownloadButton>
               </template>
               <template v-else-if="task.result_url">
                 <DpLink :href="task.result_url" external>
                   <ExternalLink :size="12" />
                   预览
                 </DpLink>
-                <DpLink :href="task.result_url" download>
+                <DpDownloadButton
+                  :href="task.result_url"
+                  :filename="`doubao-${task.id}.mp4`"
+                  @download-failed="() => $emit('download-failed', task.id)"
+                >
                   <Download :size="12" />
                   下载
-                </DpLink>
+                </DpDownloadButton>
               </template>
               <span v-if="task.clean_error" class="clean-error" :title="task.clean_error">
                 去水印失败

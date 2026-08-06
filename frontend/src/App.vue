@@ -54,10 +54,18 @@ type VideoTask = {
   result_url?: string;
   backup_result_url?: string;
   fallback_result_url?: string;
+  // v0.2.28:结果页用,zhuceka 处理后的无水印视频;存在时优先于 result_url 给用户下载。
+  clean_video_url?: string;
+  clean_error?: string;
   cover_url?: string;
   error?: string;
   quota_used?: number;
   quota_total?: number;
+  // v0.2.28:批量任务(单 prompt「第一段/第二段」分隔,或传 prompts: list[str])
+  // 会被后端打成同一 group_id。结果页按 group_id 折叠展示,组内点「下载全部」
+  // /「保存到下载目录」自动建独立文件夹。
+  group_id?: string;
+  group_index?: number;
   created_at: string;
 };
 
@@ -528,7 +536,7 @@ onBeforeUnmount(() => {
               ＋ 添加任务
             </DpButton>
           </div>
-          <VideoTaskTable :tasks="tasks" @retry="retryVideoTask" @delete="onDeleteVideoTask" />
+          <VideoTaskTable :tasks="tasks" @retry="retryVideoTask" @delete="onDeleteVideoTask" @download-failed="onResultDownloadFailed" />
         </template>
 
         <ResultsTable v-else-if="page === 'results'" :tasks="results" @download-failed="onResultDownloadFailed" />

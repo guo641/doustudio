@@ -8,8 +8,10 @@ import shutil
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
+import httpx
 from playwright.sync_api import sync_playwright
 
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -53,6 +55,12 @@ class CreateVideoTaskBody(BaseModel):
 class UpdateAccountBody(BaseModel):
     """PATCH /api/accounts/{id} body. 用 Pydantic 校验避免 bool('false') 等都被当成 True。"""
     enabled: bool | None = None
+
+
+class GroupDownloadBody(BaseModel):
+    """v0.2.28 Q2:把 group_id 下所有 succeeded 任务视频流式下载到本地
+    settings.download_dir/<batch_folder>/。"""
+    group_id: str = Field(min_length=1)
 
 
 def _extract_bearer(authorization: str | None) -> str | None:
@@ -479,6 +487,128 @@ def create_app(
             )
         quotas = settings_service.get_daily_quotas() if settings_service else {"mini": 5, "v2": 5, "std": 5}
         return _video_task_dict(task, quotas["mini"])
+
+    @app.post("/api/results/group-download")
+    async def group_download(
+        body: GroupDownloadBody,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.28 Q2:把 group_id 下所有 succeeded 任务的视频流式下载到
+        settings.download_dir/<batch_folder>/。前端在结果页点「保存到下载
+        目录」按钮时调用,完成后 alert 提示用户打开文件夹。
+
+        优先级:clean_video_url(无水印) > result_url(原画)。文件命名
+        doubao-<task_id>[-clean].mp4,重名追加 -2 / -3 ...。
+
+        状态码:
+          - 200:{saved_dir, file_count} —— 即使 file_count=0 也成功
+          - 404:group_id 不存在
+          - 409:某个视频的签名 URL 已过期(401/403) → 提示用户先点
+            「刷新下载链接」
+          - 500:磁盘满 / 权限不足 / 下载目录不存在 → 引导用户去设置改
+            download_dir
+          - 503:video_service 未启动 或 settings_service 缺失
+        """
+        authorize(x_doupool_token, authorization)
+        if video_service is None:
+            raise HTTPException(status_code=503, detail="视频服务未启动")
+        if settings_service is None:
+            raise HTTPException(status_code=503, detail="设置服务未启动")
+
+        download_dir = Path(settings_service.get()["download_dir"]).expanduser()
+        # 兜底 mkdir:settings.update 时已建,但若用户在系统层删了目录,
+        # 这次保存前补建 —— 友好降级。
+        try:
+            download_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"下载目录 {download_dir} 无法创建: {exc}",
+            ) from exc
+
+        tasks = repository.list_tasks_by_group(body.group_id)
+        if not tasks:
+            raise HTTPException(status_code=404, detail=f"group_id {body.group_id} 不存在")
+
+        # batch_folder:{group_id 前 8 位}_{HHMMSS},同秒重名追加 -2 / -3 ...
+        timestamp = datetime.now().strftime("%H%M%S")
+        base_folder = f"{body.group_id[:8]}_{timestamp}"
+        batch_folder = download_dir / base_folder
+        n = 2
+        while batch_folder.exists():
+            batch_folder = download_dir / f"{base_folder}-{n}"
+            n += 1
+        try:
+            batch_folder.mkdir(parents=False, exist_ok=False)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"无法创建批次文件夹 {batch_folder}: {exc}",
+            ) from exc
+
+        saved_count = 0
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=True,
+            ) as client:
+                for task in tasks:
+                    url = task.clean_video_url or task.result_url
+                    if not url:
+                        continue
+                    # clean 标记优先于重名后缀:clean_video 始终命名为 -clean.mp4
+                    stem = (
+                        f"doubao-{task.id}-clean"
+                        if task.clean_video_url
+                        else f"doubao-{task.id}"
+                    )
+                    target = batch_folder / f"{stem}.mp4"
+                    suffix_n = 2
+                    while target.exists():
+                        target = batch_folder / f"{stem}-{suffix_n}.mp4"
+                        suffix_n += 1
+                    try:
+                        async with client.stream("GET", url) as resp:
+                            if resp.status_code in (401, 403):
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail=f"任务 {task.id} 签名链接已过期,请先在结果页点刷新",
+                                )
+                            resp.raise_for_status()
+                            with target.open("wb") as f:
+                                async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                                    f.write(chunk)
+                    except HTTPException:
+                        # 签名过期这种业务错误直接往上抛
+                        raise
+                    except OSError as exc:
+                        err_no = getattr(exc, "errno", None)
+                        if err_no == 28:  # ENOSPC
+                            raise HTTPException(
+                                status_code=500,
+                                detail="本地磁盘空间不足,无法保存视频",
+                            ) from exc
+                        if err_no == 13:  # EACCES
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"下载目录无写权限,请在设置中更换路径: {download_dir}",
+                            ) from exc
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"写文件失败 {target}: {exc}",
+                        ) from exc
+                    except httpx.HTTPError as exc:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"下载任务 {task.id} 视频失败: {exc}",
+                        ) from exc
+                    saved_count += 1
+        except HTTPException:
+            # 出错时把已落盘的部分文件夹留着给用户手动取 —— 比直接清掉友好。
+            raise
+
+        return {"saved_dir": str(batch_folder), "file_count": saved_count}
 
     @app.delete("/api/requests/{task_id}", status_code=204)
     def delete_video_task(

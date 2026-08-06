@@ -17,6 +17,8 @@ const api = vi.hoisted(() => ({
     available: true, hint: 'mock', ms_token_preview: '', web_id: 'wb', web_id_signature: '',
     device_id: 'dev', tea_uuid: 'tu', pc_version: '3.27.4', fetched_at: 0, age_seconds: 0,
   }),
+  // v0.2.28:Q2 批量下载 —— ResultsTable 点「保存到下载目录」时调。
+  groupDownload: vi.fn().mockResolvedValue({ saved_dir: '/tmp/downloads/abcdef12_143022', file_count: 3 }),
 }));
 vi.mock('../api', () => api);
 
@@ -44,6 +46,39 @@ it('shows successful results and download actions', async () => {
   // 这里只验证 button 存在;实际下载路径由 DownloadButton 自身保证。
   const downloadBtn = await screen.findByRole('button', { name: /下载视频|下载无水印/ });
   expect(downloadBtn).toBeTruthy();
+});
+
+// v0.2.28 Q2:有 group_id 的批量任务在结果页折叠为组,提供「下载全部」
+// 和「保存到下载目录」两个按钮;无 group_id 的老任务保持扁平展示。
+it('groups batched tasks with collapsible sections and per-group download buttons', async () => {
+  vi.stubGlobal('alert', vi.fn());
+  const tasks = [
+    // 同一组(3 段 prompt 一次提交),按 group_index 升序排
+    { id:'t1', prompt:'第一段', model:'seedance_v2.0_mini', ratio:'1:1', duration:5, status:'succeeded',
+      result_url:'https://example.test/v1.mp4', group_id:'abcdef12-group', group_index:1, created_at:'2026-07-13T12:00:00' },
+    { id:'t2', prompt:'第二段', model:'seedance_v2.0_mini', ratio:'1:1', duration:5, status:'succeeded',
+      result_url:'https://example.test/v2.mp4', group_id:'abcdef12-group', group_index:2, created_at:'2026-07-13T12:01:00' },
+    { id:'t3', prompt:'第三段', model:'seedance_v2.0_mini', ratio:'1:1', duration:5, status:'succeeded',
+      result_url:'https://example.test/v3.mp4', group_id:'abcdef12-group', group_index:3, created_at:'2026-07-13T12:02:00' },
+    // 老任务,无 group_id,保持扁平
+    { id:'t0', prompt:'老任务', model:'seedance_v2.0_mini', ratio:'1:1', duration:5, status:'succeeded',
+      result_url:'https://example.test/v0.mp4', created_at:'2026-07-13T11:00:00' },
+  ];
+  render(ResultsTable, { props: { tasks } });
+  // 组头存在(group_id 前 8 位 + 任务数)
+  expect(screen.getByText(/组 #abcdef12 · 3 个视频/)).toBeTruthy();
+  // 两个组级按钮都在
+  expect(screen.getByRole('button', { name: '下载全部' })).toBeTruthy();
+  expect(screen.getByRole('button', { name: '保存到下载目录' })).toBeTruthy();
+  // 4 个任务描述都渲染(组内 3 + 扁平 1)
+  expect(screen.getByText('第一段')).toBeTruthy();
+  expect(screen.getByText('第二段')).toBeTruthy();
+  expect(screen.getByText('第三段')).toBeTruthy();
+  expect(screen.getByText('老任务')).toBeTruthy();
+  // 点「保存到下载目录」调 groupDownload,并 alert 出 saved_dir
+  await fireEvent.click(screen.getByRole('button', { name: '保存到下载目录' }));
+  await waitFor(() => expect(api.groupDownload).toHaveBeenCalledWith('abcdef12-group'));
+  expect(window.alert).toHaveBeenCalledWith(expect.stringContaining('/tmp/downloads/abcdef12_143022'));
 });
 
 it('filters and clears logs', async () => {

@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from pathlib import Path
 
 from doupool.api.app import create_app
 from doupool.login.service import LoginService
@@ -1024,3 +1025,158 @@ def test_refresh_url_endpoint_non_succeeded_returns_409(repository, tmp_path):
     response = client.post(f"/api/results/{task.id}/refresh-url", headers=headers)
     assert response.status_code == 409
     assert "仅 succeeded" in response.json()["detail"]
+
+
+# ---------- v0.2.28 Q2:批量任务按组下载到独立文件夹 ----------
+# 三个用例覆盖:
+#  1) 正常路径 —— 3 条 succeeded 任务,httpx 流式落盘,文件名 doubao-<id>.mp4
+#  2) 过期签名 —— httpx 返回 403 → 409 提示用户先点刷新
+#  3) 空组 —— group_id 不存在 → 404
+
+class _FakeChunkedResponse:
+    """模拟 httpx 流式响应:status_code + aiter_bytes"""
+    def __init__(self, status_code: int, payload: bytes):
+        self.status_code = status_code
+        self._payload = payload
+        self.headers = {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"http {self.status_code}")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        # 单 chunk 一次吐完
+        yield self._payload
+
+
+class _FakeStreamClient:
+    """模拟 httpx.AsyncClient.stream('GET', url)"""
+    def __init__(self, response_map: dict[str, _FakeChunkedResponse]):
+        self._response_map = response_map
+        self.calls: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def stream(self, method: str, url: str):
+        self.calls.append(url)
+        # 取最后一次路径段做 key(测试里 url = https://example.test/v1.mp4)
+        # 简化:完整 url 当 key
+        if url not in self._response_map:
+            raise RuntimeError(f"unexpected url {url}")
+        # 返回一个异步 ctx manager
+        resp = self._response_map[url]
+        return resp
+
+
+def _seed_grouped_tasks(repository, group_id: str, count: int = 3):
+    """在指定 group_id 下建 count 条 succeeded 任务,result_url 用
+    https://example.test/v1.mp4 ... v{count}.mp4。"""
+    urls = {f"https://example.test/v{i}.mp4": _FakeChunkedResponse(200, f"video-{i}".encode()) for i in range(1, count + 1)}
+    task_ids = []
+    for i in range(1, count + 1):
+        task = repository.create_video_task(
+            None, f"段{i}", "seedance_v2.0_mini", "1:1", 5,
+        )
+        # 后端逻辑里 group_id 是建任务时外部传入的(批量提交时由 service 设),
+        # repository 没有 update_group 工具,直接走 SQL 模拟:
+        from doupool.db.models import VideoTask
+        VideoTask.update(group_id=group_id, group_index=i).where(VideoTask.id == task.id).execute()
+        repository.update_video_task(task.id, status="succeeded", result_url=f"https://example.test/v{i}.mp4")
+        task_ids.append(task.id)
+    return task_ids, urls
+
+
+def test_group_download_streams_all_videos(repository, tmp_path, database_manager, monkeypatch):
+    """正常路径:3 条 succeeded 任务,httpx 流式落盘 settings.download_dir/<batch_folder>/。"""
+    settings = SettingsService(repository, tmp_path, database_manager.path)
+    settings.update({"download_dir": str(tmp_path / "downloads")})
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=FakeVideoService(repository),
+        settings_service=settings,
+    ))
+    headers = {"X-DouPool-Token": "secret"}
+
+    group_id = "abcdef12-3456-7890-abcd-ef1234567890"
+    task_ids, urls = _seed_grouped_tasks(repository, group_id, count=3)
+
+    fake = _FakeStreamClient(urls)
+    monkeypatch.setattr("doupool.api.app.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    response = client.post("/api/results/group-download", headers=headers, json={"group_id": group_id})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["file_count"] == 3
+    saved_dir = Path(body["saved_dir"])
+    assert saved_dir.exists()
+    assert saved_dir.name.startswith("abcdef12_")  # {group_id 前 8 位}_{HHMMSS}
+    # 3 个 mp4 文件都存在,内容字节数对应
+    for i, tid in enumerate(task_ids, 1):
+        fp = saved_dir / f"doubao-{tid}.mp4"
+        assert fp.exists(), fp
+        assert fp.read_bytes() == f"video-{i}".encode()
+    # httpx.stream GET 调用 3 次(每条任务一次)
+    assert len(fake.calls) == 3
+
+
+def test_group_download_handles_expired_signature(repository, tmp_path, database_manager, monkeypatch):
+    """httpx 返回 403 → 端点返 409,提示用户先刷新下载链接。"""
+    settings = SettingsService(repository, tmp_path, database_manager.path)
+    settings.update({"download_dir": str(tmp_path / "downloads")})
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=FakeVideoService(repository),
+        settings_service=settings,
+    ))
+    headers = {"X-DouPool-Token": "secret"}
+
+    group_id = "expired-group-1"
+    _seed_grouped_tasks(repository, group_id, count=1)
+    # 把签名 URL 改成会触发 403 的占位
+    from doupool.db.models import VideoTask
+    VideoTask.update(result_url="https://example.test/expired.mp4").where(VideoTask.group_id == group_id).execute()
+
+    fake = _FakeStreamClient({
+        "https://example.test/expired.mp4": _FakeChunkedResponse(403, b""),
+    })
+    monkeypatch.setattr("doupool.api.app.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    response = client.post("/api/results/group-download", headers=headers, json={"group_id": group_id})
+    assert response.status_code == 409
+    assert "签名链接已过期" in response.json()["detail"]
+
+
+def test_group_download_empty_group_returns_404(repository, tmp_path, database_manager):
+    """group_id 不存在 → 404。"""
+    settings = SettingsService(repository, tmp_path, database_manager.path)
+    settings.update({"download_dir": str(tmp_path / "downloads")})
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=FakeVideoService(repository),
+        settings_service=settings,
+    ))
+
+    response = client.post(
+        "/api/results/group-download",
+        headers={"X-DouPool-Token": "secret"},
+        json={"group_id": "non-existent-group"},
+    )
+    assert response.status_code == 404
+    assert "non-existent-group" in response.json()["detail"]

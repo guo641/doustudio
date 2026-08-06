@@ -2,6 +2,44 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.28 - 2026-08-06
+
+### 修复
+
+- **视频任务页下载按钮 ERR_INVALID_RESPONSE**
+  用户反馈:在「视频任务」页(succeeded 状态)点下载报 `ERR_INVALID_RESPONSE`,
+  但同样的任务在「生成结果」页下载正常。
+  - 根因:`VideoTaskTable.vue` 用裸 `<a download href=cdnUrl>` 触发下载。
+    WebView2 在跨域签名 CDN URL 上对 `<a download>` 静默降级或直接拒绝;
+    「生成结果」页早已改用 `DownloadButton.vue` 的三层 fallback(
+    `fetch cors → fetch no-cors → window.open`)+ 失败时由 App.vue 兜底
+    调用 `/api/results/:id/refresh-url` 重解析签名 URL,所以一直正常。
+  - 修复:把「视频任务」页 2 处 `<DpLink :download>` 替换为
+    `<DpDownloadButton>`(同 ResultsTable),并把 `@download-failed` 透传到
+    App.vue 复用 `onResultDownloadFailed` + `refreshedResultIds` 防刷机制。
+  - 收益:两个页面下载路径完全一致;签名 URL 过期时不再静默失败,
+    toast「链接已过期,正在重新获取」+ 自动重解析。
+
+### 新增
+
+- **生成结果页按组折叠批量任务**
+  用户反馈:一次性提交多段 prompt(单 prompt 用「第一段」「第二段」分隔,
+  或传 `prompts: list[str]`)会被后端自动打成同一 `group_id`,但结果页
+  完全扁平展示,点下载后视频混在一起。
+  - 新增:ResultsTable 按 `group_id` 聚合,有组的折叠展示组头
+    「组 #XXXXXXXX · N 个视频」,无组的(老任务)保持扁平。
+  - 新增:组级双按钮:
+    - **「下载全部」**(前端方案):循环调用三层 fallback + 350ms 间隔,
+      filename 拼 `${group_id[:8]}_HHMMSS/doubao-${id}.mp4` 让浏览器下载
+      管理器自动建子文件夹(WebView2/Edge 桌面版 Chromium 实测支持)。
+    - **「保存到下载目录」**(后端方案):新加 `POST /api/results/group-download`
+      端点,后端用 httpx.AsyncClient.stream 把整组视频流式写到
+      `settings.download_dir/<group_id[:8]>_HHMMSS/`,完成后 alert 提示
+      落盘路径。错误码:404 group_id 不存在 / 409 签名过期 / 500 磁盘满
+      或权限不足 / 502 网络错误。
+  - 优先用 `clean_video_url`(无水印),fallback 到 `result_url`(原画),
+    与单条下载语义一致。
+
 ## v0.2.27 - 2026-08-06
 
 ### 修复
