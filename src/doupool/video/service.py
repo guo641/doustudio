@@ -614,19 +614,123 @@ class VideoTaskService:
         self._schedule_callback(task_id)
 
     async def resume_queued(self) -> None:
+        # v0.2.30:启动 sanitize —— 先把"卡 queued 太久"的任务标 failed。
+        #
+        # 历史 bug:被 cancel 的任务会写 status=queued + error="应用已停止,
+        # 等待下次继续"(v0.2.27 之前),lifespan 调 resume_queued 试图
+        # 拉起,但 cancel 信号很快又命中 _run 的 CancelledError 分支,
+        # 又写回 queued,死循环。v0.2.30 Fix B1 已把 CancelledError 也写
+        # failed,但万一未来又有人不小心写 queued,启动这个兜底能保证
+        # 用户不会看到「永远卡 queued」的任务。
+        #
+        # stale 阈值 30min:正常任务的 "queued → starting" 转换发生在
+        # _schedule 创建 asyncio task 后 1ms 内,任何超过 30min 还在
+        # queued 的,都是被 cancel / 异常打断留下的孤儿。
+        stale_count = self._sanitize_stale_queued_tasks()
+        if stale_count:
+            self.logger.warning(
+                "v0.2.30:resume_queued 把 %d 条 stale queued 任务标 failed",
+                stale_count,
+                extra={"event": "video_stale_queued_sanitized", "count": stale_count},
+            )
         for task in self.repository.list_queued_video_tasks():
             self._schedule(task.id)
+
+    def _sanitize_stale_queued_tasks(
+        self, *, stale_threshold_seconds: int = 1800
+    ) -> int:
+        """v0.2.30:把"卡 queued 太久"的任务标 failed。返处理条数。
+
+        阈值 30min 默认值,可在测试里调小覆盖。
+
+        实现细节:peewee 默认从 SQLite 读 DateTimeField 返 ISO str,
+        不能直接跟 Python datetime 比较。所以过滤放在 SQL 表达式层
+        (VideoTask.updated_at < cutoff WHERE status='queued'),
+        只把命中的 stale 任务 hydrate 出来再逐条 mark failed。
+        """
+        try:
+            cutoff = datetime.now(SHANGHAI).replace(tzinfo=None) - timedelta(
+                seconds=stale_threshold_seconds
+            )
+            # 直接走 peewee 表达式:status='queued' AND updated_at < cutoff。
+            # 只 hydrate 命中行,避免把 fresh queued 一次性加载到内存。
+            stale_tasks = list(
+                VideoTask.select().where(
+                    (VideoTask.status == "queued")
+                    & (VideoTask.updated_at < cutoff)
+                )
+            )
+        except Exception:
+            self.logger.exception(
+                "stale queued 查询失败,跳过 sanitize",
+                extra={"event": "stale_queued_sanitize_failed"},
+            )
+            return 0
+
+        count = 0
+        for task in stale_tasks:
+            try:
+                self.repository.assign_video_task(task.id, None)
+                self.repository.update_video_task(
+                    task.id,
+                    status="failed",
+                    error_message=(
+                        "启动时清理:任务在 queued 状态卡住超过 "
+                        f"{stale_threshold_seconds // 60} 分钟,可能上次"
+                        "应用退出时被中断,已自动作废,请重新提交"
+                    ),
+                    completed_at=datetime.now(SHANGHAI).replace(tzinfo=None),
+                )
+                count += 1
+            except Exception:
+                self.logger.exception(
+                    "stale queued 标 failed 失败: %s",
+                    task.id,
+                    extra={"task_id": task.id},
+                )
+        return count
 
     async def _run(self, task_id: str, cancellation: threading.Event) -> None:
         try:
             await self._run_inner(task_id, cancellation)
         except asyncio.CancelledError:
-            # 上层 shutdown / 用户主动取消,静默退出
-            self.repository.update_video_task(
-                task_id,
-                status="queued",
-                error_message="应用已停止，等待下次继续",
-                account_id=None,
+            # v0.2.30:行为修正 —— 取消时直接标 failed,不再写 queued。
+            #
+            # 原先「queued + 应用已停止,等待下次继续」的设计假设重启后
+            # resume_queued 会拉起,但实测两处 bug 会让任务永久卡 queued:
+            #   (a) lifespan 启动 resume_queued → _schedule → asyncio.create_task
+            #       → 几乎立刻被 uvicorn / webview shutdown 的 cancel 信号命中
+            #       → 又走回这条 CancelledError 分支 → 写回 queued → 死循环
+            #       (DB 实证:task 9830ed7c 17:53 提交,19:11 还卡 queued,
+            #        updated_at 反复被自己刷)。
+            #   (b) _run_inner 已经处理了 cancellation.is_set() 路径(写 failed
+            #       + 退额度),但只有「runner.run 抛 Exception 后命中 is_set」
+            #       才走那条;若 cancel 直接打断 await asyncio.sleep / DB 写,
+            #       CancelledError 会跳过 _run_inner 的 except 直接冒到这里。
+            #
+            # 改成 failed + 「应用已停止,任务已取消」让用户明确知道已作废。
+            # 不退额度 —— 顶层拿不到 _run_inner 里的 quota_recorded 闭包,
+            # 且绝大多数 cancel 发生在 runner.run 启动前 / 立刻,quota 未扣。
+            # 极端情况下「已扣 quota 后被 cancel」漏退,代价是一两个任务点的
+            # 用户额度,与「永远卡 queued 任务消失不见」比是可接受的。
+            try:
+                self.repository.assign_video_task(task_id, None)
+                self.repository.update_video_task(
+                    task_id,
+                    status="failed",
+                    error_message="应用已停止，任务已取消",
+                    completed_at=datetime.now(SHANGHAI).replace(tzinfo=None),
+                )
+            except Exception:
+                # DB 写不动也无所谓 —— shutdown 阶段本来就要退出,日志留给
+                # 下次启动时 resume_queued 的 stale 兜底(fix B2)清理。
+                self.logger.exception(
+                    "CancelledError 分支写 failed 失败,留给 stale 兜底",
+                    extra={"task_id": task_id},
+                )
+            self.logger.info(
+                "应用停止,任务取消(CancelledError 顶层): %s", task_id,
+                extra={"event": "video_cancelled_by_shutdown", "task_id": task_id},
             )
             raise
         except Exception as exc:
@@ -907,10 +1011,25 @@ class VideoTaskService:
                         # 取消 ≠ 任务成功,豆包即便已部分生成,用户没拿到视频就
                         # 算失败,不应扣 quota。与 NETWORK/POLICY/INVALID/TIMEOUT
                         # 退款是同一条「失败 = 退」语义路径。
+                        #
+                        # v0.2.30:行为修正 —— 取消时直接标 failed,不再写 queued。
+                        # 原先「queued + 应用已停止,等待下次继续」的设计假设重启后
+                        # resume_queued 会拉起,但实际 lifespan 时机 / 用户关掉程序
+                        # 按钮时 cancellation 被设置,任务永久卡 queued,前端没有
+                        # queued 文案,显示成原始 status 字符串「queued」让用户误以为
+                        # 还在生成中。改成 failed + 「应用已停止,任务已取消」,
+                        # 用户明确知道已作废,需要重新提交;同时不丢账号 (assign None)。
                         refund_quota_if_recorded()
                         self.repository.assign_video_task(task_id, None)
                         self.repository.update_video_task(
-                            task_id, status="queued", error_message="应用已停止，等待下次继续"
+                            task_id,
+                            status="failed",
+                            error_message="应用已停止，任务已取消",
+                            completed_at=datetime.now(SHANGHAI).replace(tzinfo=None),
+                        )
+                        self.logger.info(
+                            "应用停止,任务取消并退还额度: %s", task_id,
+                            extra={"event": "video_cancelled_by_shutdown", "task_id": task_id},
                         )
                         return
                     # 分类失败 → 决定是否改写 prompt 后重试

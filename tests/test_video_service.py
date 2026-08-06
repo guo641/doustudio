@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+from datetime import datetime
 
 import pytest
 
@@ -21,12 +23,15 @@ class SuccessfulVideoRunner:
 class StaticSettings:
     def get(self):
         return {
-            "daily_quota_mini": 50, "daily_quota_v2": 50, "daily_quota_std": 50,
+            # v0.2.29:共享池下 daily_quota_mini/v2/std 已废弃,只保留
+            # daily_quota_shared + 兼容 fallback daily_quota。
+            "daily_quota": 50,
             "quota_reset_time": "00:00", "max_concurrency": 1,
         }
 
     def get_daily_quotas(self):
-        return {"mini": 50, "v2": 50, "std": 50}
+        # v0.2.29:repository 期望单一 shared 桶。
+        return {"shared": 50}
 
 
 @pytest.mark.asyncio
@@ -44,7 +49,7 @@ async def test_service_runs_and_persists_video_result(repository, temp_profile):
     assert saved.conversation_id == "conversation-1"
     assert saved.remote_task_id == "remote-1"
     # mini 1 点/秒,5 秒任务扣 5 点(对齐豆包真实扣费)
-    assert Account.get_by_id("account-1").video_quota_used_mini == 5
+    assert Account.get_by_id("account-1").video_quota_used_shared == 5
 
 
 @pytest.mark.asyncio
@@ -125,7 +130,7 @@ async def test_service_cools_limited_account_and_fails_over(repository, tmp_path
     saved = repository.get_video_task(task.id)
     assert saved.status == "succeeded"
     assert saved.account.id == "account-2"
-    assert Account.get_by_id("account-1").video_quota_used_mini == 50
+    assert Account.get_by_id("account-1").video_quota_used_shared == 50
     assert Account.get_by_id("account-1").video_limited_until is not None
 
 
@@ -171,7 +176,7 @@ async def test_service_does_not_cap_buckets_on_shark_admin_risk_control(reposito
     assert "风控" in (saved.error_message or "")
     # 桶没动
     acc = Account.get_by_id("acc-risk")
-    assert acc.video_quota_used_mini == 0
+    assert acc.video_quota_used_shared == 0
     assert acc.video_limited_until is None
     assert acc.status == "active"
 
@@ -214,7 +219,7 @@ async def test_service_does_not_cap_buckets_on_token_bundle_unavailable(reposito
     assert "刷新 token" in (saved.error_message or "")
     # 桶没动,账号继续 active
     acc = Account.get_by_id("acc-tok")
-    assert acc.video_quota_used_mini == 0
+    assert acc.video_quota_used_shared == 0
     assert acc.video_limited_until is None
     assert acc.status == "active"
 
@@ -378,7 +383,7 @@ async def test_retry_result_refreshes_succeeded_task_without_charging_quota(
         id="acc-r", display_name="acc", doubao_user_id="u", profile_dir=temp_profile
     )
     account = Account.get_by_id("acc-r")
-    account.video_quota_used_mini = 2  # 假装此前已扣过两次
+    account.video_quota_used_shared = 2  # 假装此前已扣过两次
     account.save()
 
     task = repository.create_video_task("acc-r", "测试", "seedance_v2.0_mini", "1:1", 5)
@@ -404,7 +409,7 @@ async def test_retry_result_refreshes_succeeded_task_without_charging_quota(
     assert saved.result_url == "https://new.example/video.mp4"
     assert saved.cover_url == "https://new.example/cover.jpg"
     # 关键:不扣额度
-    assert Account.get_by_id("acc-r").video_quota_used_mini == 2
+    assert Account.get_by_id("acc-r").video_quota_used_shared == 2
     assert runner.calls and runner.calls[0]["conversation_id"] == "conversation-r"
     assert runner.calls[0]["profile_dir"] == temp_profile
 
@@ -496,10 +501,10 @@ async def test_retry_result_rejects_concurrent_call(repository, temp_profile):
     service._retry_tasks[task.id].cancel()
 
 
-# ---------- v0.2.9 per-model quota 隔离 ----------
+# ---------- v0.2.29 共享额度池:cost() 仍按 model 算,但全累加到 shared ----------
 
 class MiniOnlyLimitedRunner:
-    """v0.2.9:模型互不影响 — 跑 std 任务时,mini 桶满的账号应该仍可被选中。"""
+    """v0.2.29:cost() 按 model 算点数,但所有 model 的 cost 都累加到 shared 桶。"""
     def __init__(self):
         self.calls = []
 
@@ -513,31 +518,37 @@ class MiniOnlyLimitedRunner:
 
 
 @pytest.mark.asyncio
-async def test_quota_per_model_isolation_in_repository(repository, temp_profile, tmp_path):
-    """v0.2.9:不同 model 的 quota 独立计数 — repo 层硬契约。"""
-    quotas = {"mini": 2, "v2": 2, "std": 2}
-    # 账号 A:mini 桶用完,v2/std 桶全空
+async def test_repository_chooses_account_by_shared_quota(repository, tmp_path):
+    """v0.2.29:账号之间按 shared 桶余额比较(least_used)。
+
+    v0.2.9 的 test_quota_per_model_isolation 在共享池改造后已无意义,
+    这里替换成 shared 桶版本:不同 model 不再影响账号选择。
+    """
+    quotas = {"shared": 10}
+    # 账号 A:shared 用 8(剩 2)
     Account.create(
         id="a", display_name="A", doubao_user_id="ua",
-        profile_dir=str(tmp_path / "a"), video_quota_used_mini=2,
+        profile_dir=str(tmp_path / "a"), video_quota_used_shared=8,
     )
-    # 账号 B:所有桶都空
+    # 账号 B:shared 用 1(剩 9)
     Account.create(
         id="b", display_name="B", doubao_user_id="ub",
-        profile_dir=str(tmp_path / "b"),
+        profile_dir=str(tmp_path / "b"), video_quota_used_shared=1,
     )
-
-    # std 任务:账号 A 的 std 桶是 0 → 应优先被选
-    picked_std = repository.choose_available_account(quotas, model="seedance_v2.0_std")
-    assert picked_std.id == "a"
-    # mini 任务:账号 A 的 mini 桶已满 → 退到 B
+    # 不管 model,least_used 都选 B(余额最多)
     picked_mini = repository.choose_available_account(quotas, model="seedance_v2.0_mini")
     assert picked_mini.id == "b"
+    picked_std = repository.choose_available_account(quotas, model="seedance_v2.0_std")
+    assert picked_std.id == "b"
 
 
 @pytest.mark.asyncio
-async def test_service_charges_correct_bucket_per_model(repository, temp_profile):
-    """v0.2.9:不同 model 的任务只扣对应桶,不串号。"""
+async def test_service_charges_shared_bucket_per_model_cost(repository, temp_profile):
+    """v0.2.29:不同 model 任务的 cost 不同,但都累加到 shared 桶。
+
+    mini 5s → 5 点,std 5s → 8 点(ceil(7.5))。两个任务完成后 shared 应该
+    = 5 + 8 = 13。旧 mini/v2/std 三桶不再写入,保持 0。
+    """
     Account.create(
         id="acc-iso", display_name="iso", doubao_user_id="u-iso", profile_dir=temp_profile
     )
@@ -555,12 +566,13 @@ async def test_service_charges_correct_bucket_per_model(repository, temp_profile
     await asyncio.wait_for(service._tasks[task_std.id], timeout=2)
 
     account = Account.get_by_id("acc-iso")
-    # 对齐豆包真实扣费:mini 5s → 5 点,std 5s → 8 点(ceil(7.5))
-    assert account.video_quota_used_mini == 5
-    assert account.video_quota_used_std == 8
-    # v2 桶没碰
+    # shared 桶累加两个任务的 cost(5 + 8 = 13)
+    assert account.video_quota_used_shared == 13
+    # v0.2.29:旧 mini/v2/std 三桶不再写入,保持 0
+    assert account.video_quota_used_mini == 0
+    assert account.video_quota_used_std == 0
     assert account.video_quota_used_v2 == 0
-    # runner 真的按 model 跑
+    # runner 真的按 model 跑(cost 仍按 model 算,只是扣哪个桶统一了)
     assert runner.calls == ["seedance_v2.0_mini", "seedance_v2.0_std"]
 
 
@@ -653,10 +665,7 @@ async def test_concurrent_tasks_on_same_account_share_browser_context(repository
         def get(self):
             data = super().get()
             data["max_concurrency"] = 3
-            data["daily_quota_mini"] = 50
             return data
-        def get_daily_quotas(self):
-            return {"mini": 50, "v2": 50, "std": 50}
 
     settings = HighConcurrencySettings()
     service = VideoTaskService(repository, runner, settings, account_poll_interval=0.01)
@@ -708,10 +717,7 @@ async def test_concurrent_tasks_do_not_serialise_per_account(repository, tmp_pat
         def get(self):
             data = super().get()
             data["max_concurrency"] = 3
-            data["daily_quota_mini"] = 50
             return data
-        def get_daily_quotas(self):
-            return {"mini": 50, "v2": 50, "std": 50}
 
     settings = HighConcurrencySettings()
     service = VideoTaskService(repository, runner, settings, account_poll_interval=0.01)
@@ -802,14 +808,14 @@ async def test_service_refunds_quota_on_refundable_failures(
     acc = Account.get_by_id("acc-refund")
     if should_refund:
         # 扣了 5 点,失败后退还 5 点 → 净 0
-        assert acc.video_quota_used_mini == 0, (
-            f"{failure_kind} 应该退款,但 mini 桶 = {acc.video_quota_used_mini}"
+        assert acc.video_quota_used_shared == 0, (
+            f"{failure_kind} 应该退款,但 shared 桶 = {acc.video_quota_used_shared}"
         )
     else:
         # generation_failed 不退。revise_prompt 路径会跑 max_attempts=2 次重试,
         # 每次扣 5 点(5s × 1.0/s),所以累计 15 点不退。
-        assert acc.video_quota_used_mini == 15, (
-            f"{failure_kind} 不该退款,但 mini 桶 = {acc.video_quota_used_mini}"
+        assert acc.video_quota_used_shared == 15, (
+            f"{failure_kind} 不该退款,但 shared 桶 = {acc.video_quota_used_shared}"
         )
 
 
@@ -843,7 +849,7 @@ async def test_service_refunds_quota_on_each_retry_attempt(repository, temp_prof
     assert runner.calls == 3
     acc = Account.get_by_id("acc-retry-refund")
     # 扣 3 次 5 点,退 3 次 5 点 → 净 0
-    assert acc.video_quota_used_mini == 0
+    assert acc.video_quota_used_shared == 0
 
 
 class FailBeforeGeneratingRunner:
@@ -869,7 +875,7 @@ async def test_service_refund_noop_when_quota_was_not_charged(repository, temp_p
 
     acc = Account.get_by_id("acc-noref")
     # 桶没扣(没到 generating),decrement noop 后也是 0
-    assert acc.video_quota_used_mini == 0
+    assert acc.video_quota_used_shared == 0
 
 
 # ---------- v0.2.21:内容审核拒绝识别 + 立即失败 + 退还额度 ----------
@@ -918,7 +924,7 @@ async def test_service_marks_failed_and_refunds_on_content_rejected(repository, 
     assert "无法返回该内容" in (saved.error_message or "")
     # 2. 桶被「扣→退」,最终是 0(不是 5)
     acc = Account.get_by_id("acc-rej")
-    assert acc.video_quota_used_mini == 0
+    assert acc.video_quota_used_shared == 0
     assert acc.video_limited_until is None
     assert acc.status == "active"
     # 3. 拒绝只调一次 runner(没改写 prompt 重试)
@@ -1006,20 +1012,21 @@ class ReviseMockRunner:
 
 
 class ReviseSettings:
-    """v0.2.22 Q1:StaticSettings 子类,允许测试覆盖 max_reject_retries。"""
+    """v0.2.22 Q1:StaticSettings 子类,允许测试覆盖 max_reject_retries。
+    v0.2.29 共享池改造后用 daily_quota + get_daily_quotas 返 {"shared": ...}。
+    """
 
     def __init__(self, max_reject_retries: int = 0):
         self._max = max_reject_retries
 
     def get(self):
         return {
-            "daily_quota_mini": 50, "daily_quota_v2": 50, "daily_quota_std": 50,
-            "quota_reset_time": "00:00", "max_concurrency": 1,
+            "daily_quota": 50, "quota_reset_time": "00:00", "max_concurrency": 1,
             "max_reject_retries": self._max,
         }
 
     def get_daily_quotas(self):
-        return {"mini": 50, "v2": 50, "std": 50}
+        return {"shared": 50}
 
 
 @pytest.mark.asyncio
@@ -1053,7 +1060,7 @@ async def test_content_rejected_revise_when_enabled_uses_two_attempts(repository
     assert runner.prompts_seen[2] != runner.prompts_seen[1]
     # 5. 扣款只 1 次(quota_recorded 闸门):5 点 mini
     acc = Account.get_by_id("acc-rev1")
-    assert acc.video_quota_used_mini == 5
+    assert acc.video_quota_used_shared == 5
     # 6. task.prompt 仍是原文(revise 只改传输中的 prompt_to_send,DB 不写)
     assert saved.prompt == "习近平出场"
 
@@ -1084,7 +1091,7 @@ async def test_content_rejected_revise_exhausts_after_max_attempts(repository, t
     assert runner.internal_attempts == 3
     # 3. 退还额度(0,扣 5 退 5)
     acc = Account.get_by_id("acc-rev2")
-    assert acc.video_quota_used_mini == 0
+    assert acc.video_quota_used_shared == 0
     # 4. error_message 含「豆包拒绝」
     assert "豆包拒绝" in (saved.error_message or "")
 
@@ -1114,7 +1121,7 @@ async def test_content_rejected_revise_disabled_keeps_v0_2_21_behavior(repositor
     assert saved.status == "failed"
     assert runner.prompts_seen == ["违规再试"]
     # 退款后为 0
-    assert Account.get_by_id("acc-rev3").video_quota_used_mini == 0
+    assert Account.get_by_id("acc-rev3").video_quota_used_shared == 0
 
 
 # ---------- v0.2.22 Q4:同步 refresh-url 端点 ----------
@@ -1130,7 +1137,7 @@ async def test_refresh_url_returns_fresh_signed_url(repository, temp_profile):
         id="acc-rfu", display_name="acc", doubao_user_id="u", profile_dir=temp_profile
     )
     account = Account.get_by_id("acc-rfu")
-    account.video_quota_used_mini = 8  # 假装此前已扣过若干次
+    account.video_quota_used_shared = 8  # 假装此前已扣过若干次
     account.save()
 
     task = repository.create_video_task("acc-rfu", "x", "seedance_v2.0_mini", "1:1", 5)
@@ -1167,7 +1174,7 @@ async def test_refresh_url_returns_fresh_signed_url(repository, temp_profile):
     # 4. error_message 清空
     assert not saved.error_message
     # 5. 关键:不扣额度
-    assert Account.get_by_id("acc-rfu").video_quota_used_mini == 8
+    assert Account.get_by_id("acc-rfu").video_quota_used_shared == 8
 
 
 @pytest.mark.asyncio
@@ -1200,8 +1207,11 @@ async def test_refresh_url_rejects_missing_task(repository):
 
 class CancellingRunner:
     """v0.2.27 测试用:runner 进入 generating 后主动 set cancel event,然后
-    抛异常 —— 模拟「用户在生成中途点了停止」。这会走 service.py:853-863 的
-    `if cancellation.is_set()` 分支,期望:退还 quota + 任务回 queued。
+    抛异常 —— 模拟「用户在生成中途点了停止」。这会走 service.py:_run_inner
+    的 `if cancellation.is_set()` 分支。
+
+    v0.2.30:取消时直接标 failed,不再写 queued。期望:退还 quota +
+    任务标 failed + 文案「应用已停止，任务已取消」。
 
     runner 自己抛异常而不是返回成功,是为了让 service 进 except 分支(cancellation
     检查在 except 块里)。
@@ -1223,6 +1233,9 @@ async def test_service_refunds_quota_on_user_cancel(repository, temp_profile):
     之前 v0.2.19-v0.2.26 的逻辑是「cancel = 不退,因为豆包已经在跑」,但这
     对用户不公平 —— 用户没拿到视频 = 失败,不应扣 quota。这次统一改成
     「失败 = 退」。
+
+    v0.2.30:取消时任务标 failed(不再写 queued + 等下次继续),文案
+    「应用已停止，任务已取消」,quota 净 0。
     """
     Account.create(
         id="acc-cancel", display_name="cancel", doubao_user_id="u-cancel",
@@ -1236,12 +1249,16 @@ async def test_service_refunds_quota_on_user_cancel(repository, temp_profile):
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
-    # 取消后任务回 queued,等下次继续
-    assert saved.status == "queued", f"取消后应为 queued,实际 {saved.status}"
+    # v0.2.30:取消后任务标 failed,不再写 queued(避免 resume 死循环)
+    assert saved.status == "failed", f"取消后应为 failed,实际 {saved.status}"
+    assert "应用已停止" in (saved.error_message or ""), (
+        f"取消文案应明确,实际: {saved.error_message}"
+    )
+    assert saved.completed_at is not None, "failed 状态应写 completed_at"
     # 关键:quota 净 0(扣 5 退 5)
     acc = Account.get_by_id("acc-cancel")
-    assert acc.video_quota_used_mini == 0, (
-        f"取消应退款,但 mini 桶 = {acc.video_quota_used_mini}"
+    assert acc.video_quota_used_shared == 0, (
+        f"取消应退款,但 shared 桶 = {acc.video_quota_used_shared}"
     )
 
 
@@ -1266,4 +1283,162 @@ async def test_service_cancel_refund_noop_when_quota_not_charged(repository, tem
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     acc = Account.get_by_id("acc-cancel-noop")
-    assert acc.video_quota_used_mini == 0  # 从未扣过,refund 路径要安全
+    assert acc.video_quota_used_shared == 0  # 从未扣过,refund 路径要安全
+
+
+# --- v0.2.30:_run 顶层 CancelledError 也写 failed + resume_queued stale 兜底 ---
+
+
+class CancelledDuringStartupRunner:
+    """v0.2.30 测试用:runner.run 还没开始就 asyncio.CancelledError 冒泡
+    (模拟 uvicorn / webview 关闭触发的事件循环 cancel)。
+
+    期望:_run 顶层 except CancelledError 捕获,写 failed + 「应用已停止,
+    任务已取消」,不写 queued(避免 resume 死循环)。
+    """
+
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        # 模拟 await 某个阻塞操作时被 cancel —— 直接抛 CancelledError,
+        # 不经过 update("generating"),所以 quota 不会被扣。
+        raise asyncio.CancelledError()
+
+
+@pytest.mark.asyncio
+async def test_run_top_level_cancelled_error_writes_failed(repository, temp_profile):
+    """v0.2.30 bug fix:_run 顶层 except CancelledError 不再写 queued。
+
+    之前 v0.2.27 之前:cancel → status=queued + error='应用已停止,等待下次继续',
+    resume_queued 拉起 → 又被 cancel → 又写回 queued,死循环,任务永远卡
+    「生成中」。改成 failed + 明确文案。
+    """
+    Account.create(
+        id="acc-cancel-top", display_name="top cancel", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+    service = VideoTaskService(
+        repository, CancelledDuringStartupRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    task = service.start("顶层取消", "seedance_v2.0_mini", "1:1", 5)
+    # _run 顶层 except CancelledError 处理完后会 re-raise,这是预期行为
+    # (上层 shutdown 收到 cancel 信号知道自己该停了),但 pytest-asyncio
+    # 会把 re-raise 当成测试失败,所以这里 swallow 一下。
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    assert saved.status == "failed", (
+        f"顶层 CancelledError 应标 failed,实际 {saved.status}"
+    )
+    assert "应用已停止" in (saved.error_message or ""), (
+        f"文案应明确,实际: {saved.error_message}"
+    )
+    assert saved.completed_at is not None, "failed 状态应写 completed_at"
+    # 账号分配应该被解除,下次提交同 prompt 不会撞死账号
+    assert saved.account_id is None, "cancel 后应释放账号分配"
+    # quota 从未扣(quota_recorded 闸门在 update("generating")),不退也不进
+    acc = Account.get_by_id("acc-cancel-top")
+    assert acc.video_quota_used_shared == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_queued_sanitizes_stale_queued_tasks(repository, temp_profile):
+    """v0.2.30 bug fix:resume_queued 在调度前 sanitize stale queued。
+
+    场景:DB 里残留一个 status=queued 但 updated_at 是 2 小时前的任务
+    (历史上 cancel 写入的孤儿)。启动 lifespan 调 resume_queued 时,
+    这个任务被标 failed 而不是再 _schedule —— 避免无限死循环。
+    """
+    from datetime import timedelta
+    from doupool.db.models import VideoTask, SHANGHAI
+
+    Account.create(
+        id="acc-stale", display_name="stale", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+    stale = repository.create_video_task(None, "stale 任务", "seedance_v2.0_mini", "1:1", 5)
+    # 把 updated_at 拨到 2 小时前,模拟卡了很久的孤儿
+    VideoTask.update(updated_at=datetime.now(SHANGHAI) - timedelta(hours=2)).where(
+        VideoTask.id == stale.id
+    ).execute()
+
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    await service.resume_queued()
+
+    saved = repository.get_video_task(stale.id)
+    assert saved.status == "failed", (
+        f"stale queued 应被 sanitize 标 failed,实际 {saved.status}"
+    )
+    assert "启动时清理" in (saved.error_message or ""), (
+        f"文案应说明是启动时清理,实际: {saved.error_message}"
+    )
+    # 兜底只是 sanitize,不应该把 stale 任务重新 _schedule
+    # 验证:service._tasks 里没有这条 stale
+    assert stale.id not in service._tasks or service._tasks[stale.id].done(), (
+        "stale 任务不应被 _schedule 拉起"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_queued_still_schedules_fresh_queued_tasks(repository, temp_profile):
+    """v0.2.30:resume_queued 的 sanitize 只清理 stale,fresh queued 仍正常调度。
+
+    阈值 30min:刚 queued 几分钟的任务不算 stale,应被 _schedule 拉起
+    并跑完 succeeded(向后兼容,保证正常重启恢复任务)。
+    """
+    Account.create(
+        id="acc-fresh", display_name="fresh", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+    fresh = repository.create_video_task(None, "fresh queued", "seedance_v2.0_mini", "1:1", 5)
+    # updated_at 用 default utcnow(),默认是 now,远超 30min 内
+
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    await service.resume_queued()
+    await asyncio.wait_for(service._tasks[fresh.id], timeout=2)
+
+    saved = repository.get_video_task(fresh.id)
+    assert saved.status == "succeeded", (
+        f"fresh queued 应被 resume 拉起跑完 succeeded,实际 {saved.status}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_queued_skips_stale_only_keeps_fresh(repository, temp_profile):
+    """v0.2.30:DB 同时有 stale + fresh queued,resume_queued 只 sanitize stale。
+
+    混合场景:一条 stale (2h 前) + 一条 fresh (now)。期望:stale 标 failed,
+    fresh 正常 succeeded,且 fresh 不被 sanitize 影响。
+    """
+    from datetime import timedelta
+    from doupool.db.models import VideoTask, SHANGHAI
+
+    Account.create(
+        id="acc-mix", display_name="mix", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+    stale = repository.create_video_task(None, "stale", "seedance_v2.0_mini", "1:1", 5)
+    fresh = repository.create_video_task(None, "fresh", "seedance_v2.0_mini", "1:1", 5)
+    VideoTask.update(updated_at=datetime.now(SHANGHAI) - timedelta(hours=2)).where(
+        VideoTask.id == stale.id
+    ).execute()
+
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    await service.resume_queued()
+    await asyncio.wait_for(service._tasks[fresh.id], timeout=2)
+
+    assert repository.get_video_task(stale.id).status == "failed"
+    assert repository.get_video_task(fresh.id).status == "succeeded"

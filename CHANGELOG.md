@@ -2,6 +2,45 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.30 - 2026-08-06
+
+### 修复
+
+- **任务卡在「生成中」状态无法结束的 bug**
+  用户反馈:浏览器已显示「视频生成成功」并弹出下载链接,
+  但软件里的任务一直停留在「生成中」状态;软件重启后
+  仍然卡在「生成中」,**重试无法解决**(DB 层面问题,
+  不是前端缓存)。
+  - 根因:`VideoTaskService._run` 顶层 `asyncio.CancelledError`
+    处理器在应用退出 / 关闭时被 `asyncio.create_task` 抛出
+    的 cancel 命中,把任务写回 `status=queued` + error_message
+    "应用已停止,等待下次继续"。下一次启动 `resume_queued`
+    又把它拉起来跑 → 再次被关闭命中 → 再次写回 queued,
+    **死亡循环,任务永远卡 queued**(实测 DB 里
+    `updated_at` 每次启动都更新)。
+  - 修复 1:`_run` 顶层 `CancelledError` 分支改成写 `failed`
+    + `completed_at` + `error_message="应用已停止,任务已取消"`,
+    彻底退出死亡循环;真正想恢复的任务重启后会被
+    `resume_queued` 重新调度(状态是 failed 不被扫到)。
+  - 修复 2:`resume_queued` 启动时新增 `_sanitize_stale_queued_tasks`,
+    把"卡 queued 超过 30 分钟"的任务批量标 failed +
+    "启动时清理:任务在 queued 状态卡住超过 30 分钟,可能上次
+    应用退出时被中断,已自动作废,请重新提交"。覆盖修复 1
+    之前已经卡死的历史脏数据(SQL 表达式层过滤,绕开
+    peewee DateTimeField 读为 ISO str 的类型问题)。
+  - 取消路径额外补强:`test_service_refunds_quota_on_user_cancel`
+    现在还断言 `account_id is None` + `error_message` 含
+    「已取消」+ `completed_at` 已写,确保用户主动取消走的也是
+    failed 路径而不是 queued。
+
+### 行为变化
+
+- **`service.py` 取消语义重定义**:应用关闭 / lifespan shutdown /
+  asyncio task cancel 命中的任务一律写 `failed`("已取消"),
+  不会再写 `queued`。前端 UI 会显示「失败」状态,
+  配 quota 已退 + 文案明确,用户可重提交。如对历史脏数据有疑问,
+  启动日志会打印 `video_stale_queued_sanitized count=N`。
+
 ## v0.2.29 - 2026-08-06
 
 ### 修复
