@@ -117,6 +117,8 @@ export async function createVideoTask(body: {
   account_id: string | null;
   mode?: 't2v' | 'i2v';
   images?: { name: string; data_base64: string }[];
+  // v0.2.32:手动重试路径透传原 task.group_id,新任务仍归属同组。
+  group_id?: string;
 }) {
   return json(
     await fetch('/api/video-tasks', { method: 'POST', headers, body: JSON.stringify(body) }),

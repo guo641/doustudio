@@ -50,6 +50,10 @@ class CreateVideoTaskBody(BaseModel):
     # {task_id, status, result_url, ...}。必须是 http:// 或 https://,
     # 其它 scheme 静默忽略(避免 file:// / gopher://)。
     callback_url: str | None = None
+    # v0.2.32:手动重试失败任务时继承原 group_id,确保结果页按组聚合时
+    # 不会漏掉这条新任务。只在手动重试路径传,普通新建留 None 让
+    # service 端按 prompt 数量决定是否打组。
+    group_id: str | None = None
 
 
 class UpdateAccountBody(BaseModel):
@@ -468,6 +472,8 @@ def create_app(
                 {"name": item["name"], "data_base64": item["data_base64"]}
                 for item in payload.get("images") or []
             ]
+            # v0.2.32:body.group_id 是手动重试路径透传的组归属,
+            # 默认 None 表示新建任务,由 service 按 prompt 数量自决。
             # v0.2.9:callback_url 直接透传给 service,service 负责入库
             # 与异步派发;这里不做 scheme 校验(让 dispatcher 留痕 callback_status=
             # 'failed' 即可,422 拒绝会让前端拿不到任务 ID,反而难排查)。

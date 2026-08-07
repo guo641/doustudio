@@ -373,6 +373,10 @@ async function retryVideoTask(task: VideoTask) {
       account_id: null,
       mode: 't2v',
       images: [],
+      // v0.2.32:继承原 group_id,确保手动重试产生的新任务仍出现在
+      // 原组(结果页按组聚合时不再丢失)。无 group 的任务(group_id 空)
+      // 也允许,后端透传 None 即可,不影响无组任务行为。
+      group_id: task.group_id || undefined,
     });
     showToast('succeeded', '任务已重新加入队列');
     await refreshTasks();

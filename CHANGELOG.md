@@ -2,6 +2,28 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.32 - 2026-08-07
+
+### 修复
+
+- **手动重试任务脱离结果页分组** 用户反馈:批量提交 3
+  个任务并打成一组,失败那一条手动重试后,在结果页"按
+  组聚合"里看不到了 —— 任务确实跑成功了,但脱离了原组。
+  - 根因:[App.vue](frontend/src/App.vue) 的 `retryVideoTask`
+    调 `createVideoTask` 时只拷了 `prompt / model / ratio /
+    duration / mode` 五个字段,没有传 `group_id`,新任务
+    group_id 为 None,[ResultsTable](frontend/src/components/ResultsTable.vue)
+    按组折叠时这条孤零零的失败任务就找不到组了。后端
+    `CreateVideoTaskBody` / `VideoTaskService.start` 也没
+    有 group_id 入参,链路完全断掉。
+  - 修复:`CreateVideoTaskBody` 加 `group_id: str | None`,
+    `VideoTaskService.start` 加同名参数(显式传则沿用,
+    否则按 prompt 数量自决);前端 `createVideoTask` 类型
+    + `retryVideoTask` 调用都补上 `group_id: task.group_id`。
+  - 测试:[test_video_service.py](tests/test_video_service.py)
+    新增 2 个 case —— 显式传 group_id 继承、单条新建
+    不传保持 group_id=None 的回归。
+
 ## v0.2.31 - 2026-08-06
 
 ### 修复

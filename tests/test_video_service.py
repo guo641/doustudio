@@ -1442,3 +1442,54 @@ async def test_resume_queued_skips_stale_only_keeps_fresh(repository, temp_profi
 
     assert repository.get_video_task(stale.id).status == "failed"
     assert repository.get_video_task(fresh.id).status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_start_with_explicit_group_id_inherits_into_new_task(repository, temp_profile):
+    """v0.2.32:手动重试路径传 group_id → 新任务必须归属同一组。
+
+    之前 App.retryVideoTask 只拷了 prompt/model/ratio/duration/mode,
+    没传 group_id,新任务脱离原组,结果页按 group_id 聚合时丢失这条任务。
+    """
+    Account.create(
+        id="account-retry", display_name="重试用", doubao_user_id="u", profile_dir=temp_profile
+    )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    # 模拟手动重试:caller 拿到原 task.group_id 后原样透传给 service.start。
+    task = service.start(
+        "重试 prompt", "seedance_v2.0_mini", "1:1", 5,
+        group_id="grp-existing-uuid",
+    )
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    assert saved.group_id == "grp-existing-uuid", (
+        f"手动重试应继承原 group_id,实际 {saved.group_id!r}"
+    )
+    # 单 prompt + 显式 group_id → group_index 仍按 1 起算(归组约定)
+    assert saved.group_index == 1
+
+
+@pytest.mark.asyncio
+async def test_start_without_group_id_keeps_legacy_none_behavior(repository, temp_profile):
+    """v0.2.32 回归:不传 group_id 且单 prompt 时,新任务 group_id 仍为 None。
+
+    验证没误伤「单条新建任务不打组」的旧行为。
+    """
+    Account.create(
+        id="account-single", display_name="单条", doubao_user_id="u", profile_dir=temp_profile
+    )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+    task = service.start("单条 prompt", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    assert saved.group_id is None
+    assert saved.group_index == 0

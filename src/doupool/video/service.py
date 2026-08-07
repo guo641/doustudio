@@ -111,6 +111,10 @@ class VideoTaskService:
         images: list[dict] | None = None,
         prompts: list[str] | None = None,
         callback_url: str | None = None,
+        # v0.2.32:手动重试路径透传原 task 的 group_id,确保新任务仍
+        # 归属同一组(结果页按组折叠)。新建路径留 None,由下面按
+        # prompt_list 长度自动决定是否打组。
+        group_id: str | None = None,
     ):
         prompt = prompt.strip()
         mode = (mode or "t2v").strip().lower()
@@ -157,7 +161,14 @@ class VideoTaskService:
             raise ValueError("文生视频不支持图片附件")
 
         # 多个 prompt → 同一 group_id,自动归组
-        group_id = str(uuid4()) if len(prompt_list) > 1 else None
+        # v0.2.32:caller(手动重试)显式传 group_id 时优先用,沿用原组;
+        # 否则按 prompt 数量自决新建组。
+        if group_id:
+            effective_group_id: str | None = group_id
+        elif len(prompt_list) > 1:
+            effective_group_id = str(uuid4())
+        else:
+            effective_group_id = None
         first_task = None
         for index, p in enumerate(prompt_list, start=1):
             task = self.repository.create_video_task(
@@ -168,8 +179,8 @@ class VideoTaskService:
                 duration,
                 mode=mode,
                 image_paths=image_paths or None,
-                group_id=group_id,
-                group_index=index if group_id else 0,
+                group_id=effective_group_id,
+                group_index=index if effective_group_id else 0,
                 callback_url=callback_url,
             )
             self._schedule(task.id)
