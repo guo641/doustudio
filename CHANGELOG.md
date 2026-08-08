@@ -2,6 +2,82 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.33 - 2026-08-08
+
+### 新增
+
+- **并发分散 + 同组粘同账号** 多组提交 6 个任务
+  (3 + 3 = 6 prompt) 时,过去每个 prompt 都被同
+  一个账号抢走,其他账号空转;现在首条自由选账号,
+  同 `group_id` 的后续 prompt 沿用首条账号(sticky
+  —— 配合 "同账号多任务并发共享 BrowserContext"
+  让命中限流的概率从 ~50% 降到接近 0)。
+  - 实现:[repository.py](src/doupool/db/repository.py)
+    新增 `choose_and_reserve_account()` —— 把
+    `choose_available_account` + `increment_account_quota`
+    合在一次 `UPDATE ... WHERE used+by<=limit`(CAS)
+    里原子完成"选 + 扣"。`mark_account_limited`
+    封号时改为 cap `video_quota_used_shared` 桶
+    并写 `video_limited_until`,后续走 `video_quota_date`
+    写幂等避免重置回环。
+  - [service.py](src/doupool/video/service.py) 的 `start()`
+    改为:每个 prompt 先按 cost 走 CAS 预扣,
+    成功后 `create_video_task` + 记录到
+    `_pre_charged_tasks[task_id] = (acc_id, by, model)`
+    再 `_schedule`;首条成功后 `sticky_account_id`
+    固化,同组后续复用同一账号(同 `group_id`
+    才粘,跨 batch 重新选)。
+  - **预扣退还链路**:runner 失败 / 取消 / 风控
+    / TokenBundleUnavailable 任何一条出口都走
+    `refund_quota_if_recorded()` —— `recorded_cost`
+    已记录的按记录退,`recorded_cost=0` 但
+    `_pre_charged_tasks` 还有 entry 的兜底按
+    预扣值退。`_run` 顶层 `except CancelledError` /
+    `except Exception` 加 `_refund_pre_charge_if_present()`
+    作为最后兜底,in-memory map 已被 pop 时回退
+    到 DB 反推 (account_id, cost, model) 完成退款。
+  - **重启 reconciliation**:`lifespan` 启动时
+    `reconcile_orphan_pre_charges()` 扫所有
+    `status in {queued, starting, generating}` 且
+    `account_id != NULL` 的 task,按 `(model, duration)`
+    重建 `_pre_charged_tasks` —— 应对「软件崩溃 → 重启
+    → 内存失 → 桶里留下孤儿扣款」。幂等:扫到的 task
+    已从上次 reconciliation 起就一直 in-flight,本次只
+    再记录一次预扣,后续退款路径会按 pre_charged_entry
+    的 cost 退。
+
+### 修复
+
+- **`quota_window()` 时区串台 → 限流秒封秒解 bug**
+  旧实现 `now.replace(tzinfo=UTC).astimezone(SHANGHAI)`
+  假定入参为 UTC,但 `_run_inner` 实际传
+  `datetime.now(SHANGHAI)`(local),被错当 UTC 后再转
+  Shanghai → local_now 日期会 +8h 漂移到「次日」。
+  且 `next_reset` 返 UTC-naive,与 `utcnow()`(SHANGHAI-
+  naive,v0.2.16 改名)比较错位 —— `mark_account_limited`
+  写的 `video_limited_until` 在下一秒就被 `reset_daily_quotas`
+  当成「已过期封号」清零,导致同账号瞬间从「满桶」变回
+  「可用」又立刻被另一条 runner 抢走,引发测试 flaky。
+  - 修复:`quota_window` 入参 aware datetime 走
+    `.astimezone(sh_tz)`(不再 `replace(tzinfo=UTC)`),
+    返回 `next_reset` 改为 SHANGHAI-naive(与 `utcnow()`
+    同口径)。
+
+### 测试
+
+- `test_video_service.py` 新增 / 修改:
+  - `test_start_with_prompts_uses_same_account_for_group`
+    断言改成 `{t.account.id for t in group_tasks}`
+    单值集合(同组粘同账号)。
+  - `test_service_refund_noop_when_quota_was_not_charged` /
+    `test_service_cancel_refund_noop_when_quota_not_charged`
+    / `test_run_top_level_cancelled_error_writes_failed`
+    全部更新断言 + docstring 为 v0.2.33 语义(预扣
+    路径任何失败出口都必须退,终态 0)。
+- 未涉及:`test_task_groups.py` 8 个失败 +
+  `test_login_browser.py` 2 个失败为本会话之前
+  已存在,与 v0.2.33 无关。
+
 ## v0.2.32 - 2026-08-07
 
 ### 修复

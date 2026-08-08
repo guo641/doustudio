@@ -6,6 +6,9 @@ from datetime import date, datetime, timedelta
 from uuid import uuid4
 
 from peewee import JOIN, SqliteDatabase
+from zoneinfo import ZoneInfo
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 from .models import Account, AppLog, AppSetting, LoginAttempt, VideoTask, utcnow
 
@@ -171,6 +174,89 @@ class AccountRepository:
         )
         return {"enabled_total": enabled_total, "bucket_full": bucket_full}
 
+    def choose_and_reserve_account(
+        self,
+        daily_quotas: dict[str, int],
+        *,
+        by: int,
+        now: datetime | None = None,
+        strategy: str = "least_used",
+        max_attempts: int = 8,
+    ) -> Account | None:
+        """v0.2.33:原子「选账号 + 预扣 by 点额度」 —— 替代 v0.2.29 的 stateless SELECT。
+
+        解决 v0.2.32 反馈:并发提交 6 个任务时,所有 worker 在毫秒级同时进入
+        `_run_inner`,都看到同一个 DB 快照(quota_used=0),全部 collapse 到
+        `choose_available_account` 返回的第一个账号(ORDER BY field ASC),
+        单账号被压 6 个任务、其余账号空转。
+
+        关键不变量:
+          1. **CAS 原子性**:`UPDATE ... SET field = field + by WHERE id=? AND
+             (field + by <= quota_limit) AND (limited_until IS NULL OR
+             limited_until <= now)` —— 一次 SQL 同时校验 + 写,避免 TOCTOU。
+          2. **失败重试**:CAS 返回 0 行(候选已被其他 worker 抢先扣满)→ 重新
+             SELECT 下一个候选,直到 `max_attempts` 用尽或选到。
+          3. **返回最新 Account**:CAS 完用 SELECT 拿回最新 row(包含新的
+             `video_quota_used_shared`),上层 service 才能准确判断是否需要
+             走 fallback 路径。
+
+        `by=0` 边界:退化成纯 select(无 CAS),保持向后兼容(虽然 call site
+        总会传 ≥1 的 cost)。
+
+        返回 None 的语义与 `choose_available_account` 一致:无 enabled 账号 /
+        所有账号都已满 / 全部限流中。
+        """
+        if by < 0:
+            raise ValueError(f"reserve by must be >= 0, got {by}")
+        field_name = _shared_quota_field()
+        quota_limit = int(daily_quotas["shared"])
+        field = getattr(Account, field_name)
+        now = now or utcnow()
+        # by=0 退化成纯 select,留给 v0.2.33 之外的"只读探测"场景。
+        if by == 0:
+            return self.choose_available_account(
+                daily_quotas, model="*", now=now, strategy=strategy,
+            )
+        for _ in range(max_attempts):
+            # 1) 选候选 —— 限流条件 + 启用条件 + 按策略排序
+            query = (
+                Account.select()
+                .where(
+                    (Account.enabled == True)  # noqa: E712
+                    & (Account.status == "active")
+                    & ((Account.video_limited_until.is_null(True))
+                       | (Account.video_limited_until <= now))
+                )
+            )
+            if strategy == "round_robin":
+                query = query.order_by(Account.updated_at.asc())
+            else:
+                # least_used:剩余额度最大的优先(used 最小)
+                query = query.order_by(field.asc(), Account.updated_at.asc())
+            candidate = query.first()
+            if candidate is None:
+                return None
+            # 2) CAS UPDATE —— 校验 + 预扣一次 SQL 完成,失败返回 0 行
+            rows = (
+                Account.update(**{field_name: field + by}, updated_at=now)
+                .where(
+                    (Account.id == candidate.id)
+                    & (field + by <= quota_limit)
+                    & ((Account.video_limited_until.is_null(True))
+                       | (Account.video_limited_until <= now))
+                )
+                .execute()
+            )
+            if rows == 1:
+                # v0.2.33:CAS 成功后顺手把 date 写上(NULL-only)—— 否则 reset_daily_quotas
+                # 在同周期内会命中 NULL 条件把刚预扣的桶值清 0(详见 _stamp_quota_date_if_null)。
+                self._stamp_quota_date_if_null(candidate.id)
+                # 拿回最新 row(used 已 +by),上层 service 据此判断是否需 fallback
+                return Account.get_by_id(candidate.id)
+            # CAS 失败 → 该候选被其他 worker 抢先扣满,下一轮重新选
+        # max_attempts 耗尽也没选到(全部被并发抢光)—— 视作无可用账号
+        return None
+
     def reset_daily_quotas(self, business_date: date, now: datetime | None = None) -> None:
         """v0.2.29:共享池 reset —— 只清 shared 桶;旧 mini/v2/std 不再写入。
 
@@ -221,13 +307,37 @@ class AccountRepository:
         """v0.2.29:共享池扣 —— 所有 model 扣同一个 shared 桶。
 
         `model` 参数保留仅为日志可观测,不影响扣哪个桶;非法 by(<1)仍抛 ValueError。
+        v0.2.33:扣的同时,**如果 video_quota_date 为 NULL**,顺手写上今天日期
+        —— 防止 _run_inner 入口处的 reset_daily_quotas 在同循环周期内把刚预扣的
+        桶值清零(start() 预扣走 CAS increment,但 date 未写 → reset 命中 NULL 条件
+        → 把已预扣值清 0 → 引发 update() 闭包反复"补扣"的怪事)。
         """
         if by < 1:
             raise ValueError(f"increment by must be >= 1, got {by}")
         field_name = _shared_quota_field()
         field = getattr(Account, field_name)
-        (Account.update(**{field_name: field + by}, updated_at=utcnow())
-         .where(Account.id == account_id).execute())
+        today = datetime.now(SHANGHAI).date()
+        (Account.update(
+            **{field_name: field + by},
+            updated_at=utcnow(),
+        ).where(Account.id == account_id).execute())
+        # v0.2.33:NULL-only 写 date —— 防止同周期 reset 把刚预扣值清零(详见 helper 注释)
+        self._stamp_quota_date_if_null(account_id)
+
+    def _stamp_quota_date_if_null(self, account_id: str) -> None:
+        """v0.2.33:CAS 预扣路径 helper —— 如果 video_quota_date 为 NULL,写上今天。
+
+        为什么 CAS 后必须写 date:CAS 路径(choose_and_reserve_account /
+        _reserve_for_account)做的是「在 _run_inner 之前的预扣」,此时如果
+        账号还没初始化过 date(NULL),后续同循环周期内的 reset_daily_quotas 会
+        命中 `date IS NULL` 条件,把已预扣的桶值清零,留下 update() 闭包只能
+        补一格的「孤儿预扣」bug。这条 NULL-only update 让 CAS 路径和
+        increment_account_quota 走完全相同的 date 语义。
+        """
+        today = datetime.now(SHANGHAI).date()
+        (Account.update(video_quota_date=today, updated_at=utcnow())
+         .where(Account.id == account_id, Account.video_quota_date.is_null(True))
+         .execute())
 
     def decrement_account_quota(
         self, account_id: str, model: str, *, by: int = 1

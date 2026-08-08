@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from doupool.db.models import Account, VideoTask
+from doupool.db.models import Account, VideoTask, utcnow
 from doupool.db.repository import AccountRepository
 from doupool.prompt_reviser import FailureKind, classify_failure, revise_prompt
 from doupool.prompt_parser import split_by_segment_markers
@@ -49,16 +49,37 @@ class _DefaultSettings:
 
 
 def quota_window(now: datetime, reset_value: str) -> tuple[date, datetime]:
-    local_now = now.replace(tzinfo=UTC).astimezone(ZoneInfo("Asia/Shanghai"))
+    """v0.2.33:正确处理入参时区 + 输出与 utcnow()/reset 比较口径一致。
+
+    修复链:
+    1. 入参时区:之前 `now.replace(tzinfo=UTC).astimezone(SHANGHAI)` 假定入参
+       必为 UTC,但 `_run_inner` 实际传 `datetime.now(SHANGHAI)`(local),被错当
+       UTC 后再转 Shanghai → local_now 的日期会+8h 漂移到「次日」。
+    2. 返回 next_reset 时区:之前 `.astimezone(UTC).replace(tzinfo=None)` 输出
+       UTC-naive,但 `reset_daily_quotas` 的 2nd UPDATE 比较 `lu <= utcnow()`
+       时,`utcnow()` 实际返的是 SHANGHAI-naive(v0.2.16 改名 / 统一本地时间),
+       与 UTC-naive 的 lu 比较 = 错位比较,可能让 mark_account_limited 写的
+       cap 在下一秒就被 reset 当成「已过期的封号」清零。
+       v0.2.33 改返 SHANGHAI-naive,与 utcnow() 口径一致。
+    """
+    sh_tz = ZoneInfo("Asia/Shanghai")
+    if now.tzinfo is None:
+        # 旧调用方传 naive datetime —— 假定是 UTC(向后兼容)
+        local_now = now.replace(tzinfo=UTC).astimezone(sh_tz)
+    else:
+        # 新调用方传 aware datetime —— 正确 astimezone 即可
+        local_now = now.astimezone(sh_tz)
     hour, minute = map(int, reset_value.split(":"))
-    reset = datetime.combine(local_now.date(), time(hour, minute), ZoneInfo("Asia/Shanghai"))
+    reset = datetime.combine(local_now.date(), time(hour, minute), sh_tz)
     if local_now < reset:
         business_date = local_now.date() - timedelta(days=1)
         next_reset = reset
     else:
         business_date = local_now.date()
         next_reset = reset + timedelta(days=1)
-    return business_date, next_reset.astimezone(UTC).replace(tzinfo=None)
+    # v0.2.33:返 SHANGHAI-naive,与 utcnow()(也是 SHANGHAI-naive)同口径。
+    # mark_account_limited 写 DB 时也是这个值 → reset 比较时不会错位。
+    return business_date, next_reset.replace(tzinfo=None)
 
 
 _DATA_URL_RE = re.compile(r"^data:(image/[\w.+-]+);base64,(.+)$", re.I | re.S)
@@ -99,6 +120,17 @@ class VideoTaskService:
         # 也能跨日清桶(原 _run_inner 里 reset_daily_quotas 只在迭代时触发)。
         self._reset_cron_task: asyncio.Task[None] | None = None
         self._reset_cron_stop = asyncio.Event()
+        # v0.2.33:start() 路径预扣登记表 —— task_id -> (account_id, cost, model)。
+        # _run_inner 的 update() 闭包见到此条目即跳过 increment(避免双重扣);
+        # 失败路径退额度走 _refund_pre_charge(task_id) 撤销 start 时的预扣。
+        # 进程重启后内存丢失,但 `_run_inner` 重启后会重新 select_account +
+        # 自然走 update() 闭包内的 increment(因为 start() 已成功扣过,
+        # 重启后 update() 又会再扣一次 → 重复扣)。这里靠 update() 闭包的
+        # 「首次进入 generating 才扣」闸门没法识别「曾被预扣」—— 因此
+        # resume_queued 的 task 必须先被识别为"内存已失的预扣 task",才能
+        # 让 _run_inner 不重复扣。下面 reconcile_pre_charged_after_restart
+        # 在 DB 侧持久化标志位,resume_queued 检测后清零预扣。
+        self._pre_charged_tasks: dict[str, tuple[str, int, str]] = {}
 
     def start(
         self,
@@ -170,23 +202,152 @@ class VideoTaskService:
         else:
             effective_group_id = None
         first_task = None
-        for index, p in enumerate(prompt_list, start=1):
-            task = self.repository.create_video_task(
-                account_id,
-                p,
-                model,
-                ratio,
-                duration,
-                mode=mode,
-                image_paths=image_paths or None,
-                group_id=effective_group_id,
-                group_index=index if effective_group_id else 0,
-                callback_url=callback_url,
+        # v0.2.33:同组粘同账号 —— 同 group_id 的后续 prompt 沿用首 task 的
+        # 账号(只对首 task 重新选),但每个 task 仍要单独走 CAS 预扣(总扣减 =
+        # sum(cost),不会因为粘同账号而少扣)。
+        sticky_account_id: str | None = None
+        # v0.2.33:start() 路径失败累积 —— 任意一条预扣失败时,把已成功的
+        # 预扣回退掉,不让用户看到"任务列表出现但实际没账号"的孤儿。
+        pre_charged_to_refund: list[tuple[str, int, str]] = []
+        try:
+            for index, p in enumerate(prompt_list, start=1):
+                # caller 显式指定 account_id(API 单点指定)→ 强制走该账号,
+                # 不走 sticky 也不走 select_available。否则按 sticky 选。
+                if account_id:
+                    target_account_id = account_id
+                elif sticky_account_id is not None:
+                    target_account_id = sticky_account_id
+                else:
+                    target_account_id = None
+
+                # v0.2.33:预扣 —— 按 cost 选账号并原子扣额度。
+                # 首发(无 target_account_id):无账号可选时回落地到「不绑账号」,
+                # 任务保持 queued,等 _run_inner / resume_queued 之后重选;
+                # 不在此处抛错 —— 沿用 v0.2.9 起「提交即排队,无可用账号不报错」语义。
+                # 显式指定 / sticky 复用(target_account_id 非 None):预扣失败
+                # 立即抛 NoAvailableAccount —— 用户已锁定该账号,失败 = 不能做。
+                cost = quota_cost(model, duration)
+                if target_account_id is not None:
+                    # 显式指定 / sticky 复用:对单一账号做 CAS 预扣,失败立即感知
+                    reserved = self._reserve_for_account(
+                        target_account_id, by=cost, daily_quotas=self.settings_service.get_daily_quotas(),
+                    )
+                else:
+                    # 首 task / 跨 batch 自由选择:走原子 select+reserve
+                    reserved = self.repository.choose_and_reserve_account(
+                        self.settings_service.get_daily_quotas(),
+                        by=cost,
+                        strategy="least_used",
+                    )
+                if reserved is None and target_account_id is not None:
+                    # 显式指定 / sticky 复用:预扣失败 —— 回退已成功的预扣,抛错
+                    raise NoAvailableAccount(
+                        "无可用账号或配额已用完(v0.2.33 预扣失败)"
+                    )
+                if reserved is None:
+                    # 首 task 选不到账号:不抛错,任务保留 queued 等下次调度
+                    # (v0.2.9 起的语义);不走预扣路径,task 也不绑账号。
+                    reserved_account = None
+                else:
+                    reserved_account = reserved
+                if reserved_account is not None:
+                    sticky_account_id = reserved_account.id
+                    task = self.repository.create_video_task(
+                        reserved_account.id,
+                        p,
+                        model,
+                        ratio,
+                        duration,
+                        mode=mode,
+                        image_paths=image_paths or None,
+                        group_id=effective_group_id,
+                        group_index=index if effective_group_id else 0,
+                        callback_url=callback_url,
+                    )
+                    # 记录预扣 —— _run_inner 见到就跳过 update() 的二次扣,
+                    # 失败路径退款也走 _refund_pre_charge
+                    self._pre_charged_tasks[task.id] = (reserved_account.id, cost, model)
+                    pre_charged_to_refund.append((reserved_account.id, cost, model))
+                    self._schedule(task.id)
+                else:
+                    # 无可用账号 —— 创建 queued 任务(不绑账号),等 resume_queued
+                    # 或下次 _run_inner 看到 status=queued + 无 account_id 时走默认
+                    # 「账号全满,保持 queued」分支。
+                    task = self.repository.create_video_task(
+                        None, p, model, ratio, duration,
+                        mode=mode,
+                        image_paths=image_paths or None,
+                        group_id=effective_group_id,
+                        group_index=index if effective_group_id else 0,
+                        callback_url=callback_url,
+                    )
+                    # 仍调用 _schedule —— _run_inner 跑起来后选不到账号就保持
+                    # queued,和 v0.2.32 的行为一致(测试也只断言 status=queued)。
+                    self._schedule(task.id)
+                if first_task is None:
+                    first_task = task
+            # 全部预扣成功 —— 清空退款队列(失败回滚不再触发)
+            pre_charged_to_refund.clear()
+            return first_task
+        except Exception:
+            # 任一条预扣失败 / 异常 —— 回退已成功的预扣,避免孤儿扣款
+            for acc_id, by_val, _model in pre_charged_to_refund:
+                try:
+                    self.repository.decrement_account_quota(
+                        acc_id, model=_model, by=by_val,
+                    )
+                    # 把 _pre_charged_tasks 里的记录撤掉 —— _run_inner 可能
+                    # 在 schedule 后立刻跑(已被 asyncio.create_task),保险起见
+                    # 也清掉。
+                    self._pre_charged_tasks.pop(next(
+                        (k for k, v in self._pre_charged_tasks.items()
+                         if v[0] == acc_id and v[1] == by_val and v[2] == _model),
+                        None,
+                    ),
+                        None,
+                    )
+                except Exception:
+                    pass
+            raise
+
+    def _reserve_for_account(
+        self,
+        account_id: str,
+        *,
+        by: int,
+        daily_quotas: dict[str, int],
+    ) -> Account | None:
+        """v0.2.33:对指定账号做 CAS 预扣(sticky / caller 显式指定路径)。
+
+        实现为「选该候选 + CAS」的单次组合 —— 没有竞争者(已经是 sticky / 显式
+        指定),不需要 max_attempts 重试;CAS 失败直接返回 None(让上层抛
+        NoAvailableAccount)。
+        """
+        from doupool.db.repository import SHARED_QUOTA_FIELD
+        account = Account.get_or_none(Account.id == account_id)
+        if account is None or not account.enabled or account.status != "active":
+            return None
+        now = utcnow()
+        if account.video_limited_until is not None and account.video_limited_until > now:
+            return None
+        quota_limit = int(daily_quotas["shared"])
+        field = getattr(Account, SHARED_QUOTA_FIELD)
+        rows = (
+            Account.update(**{SHARED_QUOTA_FIELD: field + by}, updated_at=now)
+            .where(
+                (Account.id == account_id)
+                & (field + by <= quota_limit)
+                & ((Account.video_limited_until.is_null(True))
+                   | (Account.video_limited_until <= now))
             )
-            self._schedule(task.id)
-            if first_task is None:
-                first_task = task
-        return first_task
+            .execute()
+        )
+        if rows != 1:
+            return None
+        # v0.2.33:顺手 NULL-only 写 date —— 防止同周期 reset 把刚预扣值清 0
+        # (sticky 路径同样存在该问题,详见 repository._stamp_quota_date_if_null)。
+        self.repository._stamp_quota_date_if_null(account_id)
+        return Account.get_by_id(account_id)
 
     def _persist_images(self, images: list[dict]) -> list[str]:
         count = len(images)
@@ -289,6 +450,72 @@ class VideoTaskService:
                     pass
         except asyncio.CancelledError:
             raise
+
+    def _refund_pre_charge_if_present(self, task_id: str, *, reason: str) -> None:
+        """v0.2.33:兜底 —— 内存里 _pre_charged_tasks 仍记录的预扣撤销。
+
+        `_run_inner` 的失败路径已经在 token bundle / risk_control / 通用
+        失败 / 取消分支各自退预扣了,但 **顶层 _run 的 CancelledError / 通用
+        Exception 分支** 不在 _run_inner 的 try/except 内 —— 必须在这里
+        兜底,否则预扣变孤儿。pop(,None) 幂等;已被 _run_inner 退过的话
+        这里直接 noop。
+
+        退路:in-memory pop 拿到 None 时(典型场景:`_run_inner` 在 `runner.run`
+        之前已经把 entry pop 出来,但 `runner.run` 立刻抛 CancelledError →
+        bubble 到 _run 顶层 handler,此时 _pre_charged_tasks 已无对应 key),
+        从 DB 反推 account + 按 cost(model, duration) 重算 by_val,完成退款。
+        """
+        entry = self._pre_charged_tasks.pop(task_id, None)
+        if entry is None:
+            entry = self._derive_pre_charge_from_db(task_id)
+        if entry is None:
+            return
+        acc_id, by_val, mdl = entry
+        try:
+            self.repository.decrement_account_quota(acc_id, model=mdl, by=by_val)
+            self.logger.warning(
+                "v0.2.33 顶层兜底退预扣 %d 点 (reason=%s): %s",
+                by_val, reason, acc_id,
+                extra={
+                    "event": "video_pre_charge_refunded_top",
+                    "account_id": acc_id,
+                    "task_id": task_id,
+                    "refunded": by_val,
+                    "reason": reason,
+                },
+            )
+        except Exception as refund_exc:
+            self.logger.exception(
+                "v0.2.33 顶层兜底退预扣失败(非致命): %s", refund_exc,
+                extra={
+                    "event": "video_pre_charge_refund_failed",
+                    "account_id": acc_id,
+                    "task_id": task_id,
+                },
+            )
+
+    def _derive_pre_charge_from_db(self, task_id: str):
+        """v0.2.33:in-memory map 已被 pop 后,从 DB 反推预扣 entry 用于退款。
+
+        仅供 _refund_pre_charge_if_present 兜底使用:DB 状态对得上预扣场景
+        (task 有 account_id + 处于 starting/generating/queued 状态,且桶值
+        看起来「刚被扣过 cost」)才返回,否则返 None(让外层 noop,避免误退)。
+        """
+        try:
+            task = self.repository.get_video_task(task_id)
+        except Exception:
+            return None
+        if task is None or not task.account_id:
+            return None
+        # 已经写到 terminal 状态(failed/succeeded/cancelled)→ _run_inner 的
+        # 失败路径已自己处理过退款(走 refund_quota_if_recorded),不需要再退。
+        if task.status in {"failed", "succeeded", "cancelled"}:
+            return None
+        try:
+            cost = quota_cost(task.model, int(task.duration))
+        except Exception:
+            return None
+        return (task.account_id, cost, task.model)
 
     def _schedule_callback(self, task_id: str) -> None:
         """v0.2.9:任务到 terminal 状态后异步派发 callback。
@@ -625,6 +852,18 @@ class VideoTaskService:
         self._schedule_callback(task_id)
 
     async def resume_queued(self) -> None:
+        # v0.2.33:重启后恢复 _pre_charged_tasks —— start() 的 CAS 预扣已落 DB,
+        # 但内存失;如果不在 _pre_charged_tasks 重建记录,_run_inner 会走
+        # update() 闭包的 increment 分支,造成二次扣款。in-flight 任务 = 任何
+        # 还可能被 _schedule 拉起的 status(queued/starting/generating) +
+        # account_id 非空的行 —— 这些都是 start() 走通后被 schedule 的,
+        # 对应一次成功的 CAS 预扣。
+        recovered = self._reconcile_pre_charged_after_restart()
+        if recovered:
+            self.logger.info(
+                "v0.2.33:重启恢复预扣登记表 %d 条", recovered,
+                extra={"event": "video_pre_charge_recovered", "count": recovered},
+            )
         # v0.2.30:启动 sanitize —— 先把"卡 queued 太久"的任务标 failed。
         #
         # 历史 bug:被 cancel 的任务会写 status=queued + error="应用已停止,
@@ -701,6 +940,50 @@ class VideoTaskService:
                 )
         return count
 
+    def _reconcile_pre_charged_after_restart(self) -> int:
+        """v0.2.33:进程重启后恢复 _pre_charged_tasks。
+
+        start() 的 CAS 预扣已经写进 DB(used_shared += cost),进程崩溃 / 异常
+        退出后内存失。如果不在 _pre_charged_tasks 重建这些条目,_run_inner
+        的 update() 闭包会走 increment 分支,在 generating 时二次扣款。
+
+        实现:扫 status in (queued/starting/generating) 且 account_id 非空的
+        task —— 这些都是曾经 start() 走通的,在 DB 里留了一次成功的 CAS。
+        用 (model, duration) 重算 cost,回填到 _pre_charged_tasks。
+
+        只动内存里的 _pre_charged_tasks;不动 DB 的 used_shared(start() 预扣
+        已经精确写入,重启后再改 DB 等于猜测业务状态,可能踩跨 reset / 手动
+        重置的边界)。allowed_used vs actual_used 的偏差如果出现,留给日志告警
+        或手动对账处理。
+        """
+        try:
+            in_flight = list(
+                VideoTask.select().where(
+                    VideoTask.status.in_(("queued", "starting", "generating"))
+                    & VideoTask.account.is_null(False)
+                )
+            )
+        except Exception:
+            self.logger.exception(
+                "reconcile 查询 in-flight 失败,跳过",
+                extra={"event": "pre_charge_reconcile_failed"},
+            )
+            return 0
+        count = 0
+        for task in in_flight:
+            try:
+                cost = quota_cost(task.model, int(task.duration))
+            except Exception:
+                self.logger.exception(
+                    "reconcile 计算 cost 失败: %s", task.id,
+                    extra={"task_id": task.id},
+                )
+                continue
+            # 存 account_id(str)保持和 start() 路径一致(update() 闭包需要)
+            self._pre_charged_tasks[task.id] = (task.account.id, cost, task.model)
+            count += 1
+        return count
+
     async def _run(self, task_id: str, cancellation: threading.Event) -> None:
         try:
             await self._run_inner(task_id, cancellation)
@@ -720,10 +1003,10 @@ class VideoTaskService:
             #       CancelledError 会跳过 _run_inner 的 except 直接冒到这里。
             #
             # 改成 failed + 「应用已停止,任务已取消」让用户明确知道已作废。
-            # 不退额度 —— 顶层拿不到 _run_inner 里的 quota_recorded 闭包,
-            # 且绝大多数 cancel 发生在 runner.run 启动前 / 立刻,quota 未扣。
-            # 极端情况下「已扣 quota 后被 cancel」漏退,代价是一两个任务点的
-            # 用户额度,与「永远卡 queued 任务消失不见」比是可接受的。
+            # v0.2.33:start() 预扣场景下要退预扣,避免孤儿扣款。绝大多数
+            # cancel 发生在 runner.run 启动前 / 立刻,quota 未扣,但已经
+            # 在 start() 时预扣过 —— 这里按预扣值退。
+            self._refund_pre_charge_if_present(task_id, reason="cancel")
             try:
                 self.repository.assign_video_task(task_id, None)
                 self.repository.update_video_task(
@@ -748,6 +1031,8 @@ class VideoTaskService:
             # 顶层兜底:即使配额/账号选择/数据库出意外,也要把任务
             # 推进到一个 terminal 状态,绝不让它卡在 queued / starting
             # 永远不被前端看到。
+            # v0.2.33:同 CancelledError,start() 预扣必须退。
+            self._refund_pre_charge_if_present(task_id, reason="runner_crashed")
             self.logger.exception(
                 "视频任务执行器出现未捕获异常",
                 extra={"event": "video_runner_crashed", "task_id": task_id},
@@ -816,16 +1101,58 @@ class VideoTaskService:
                 self.repository.update_video_task(task_id, status="starting", error_message=None)
                 quota_recorded = False
                 recorded_cost = 0
+                # v0.2.33:start() 已预扣 → 此处跳过 increment。失败路径退款
+                # 仍走 refund_quota_if_recorded()(recorded_cost 已设 = 预扣值)。
+                pre_charged_entry = self._pre_charged_tasks.pop(task_id, None)
 
                 def update(**values) -> None:
                     nonlocal quota_recorded, recorded_cost
                     if values.get("status") == "generating" and not quota_recorded:
                         # v0.2.11:按 model + duration 算 cost,扣对应桶。
                         # 非法 duration 走兜底 max(1, duration)。
+                        # v0.2.33:start() 预扣 → 此处不再 increment(避免双重扣)。
                         recorded_cost = quota_cost(task.model, int(task.duration))
-                        self.repository.increment_account_quota(
-                            account.id, model=task.model, by=recorded_cost
-                        )
+                        if pre_charged_entry is None:
+                            # v0.2.33 兼容路径:resume_queued 启动后,内存里的
+                            # _pre_charged_tasks 已失(task 没经过 start()),需要
+                            # 在 _run_inner 首次进入 generating 时按老规则扣。
+                            self.repository.increment_account_quota(
+                                account.id, model=task.model, by=recorded_cost
+                            )
+                        else:
+                            # v0.2.33:start() 已预扣 → 通常跳过 increment。
+                            # 但 _run_inner 每轮会跑 reset_daily_quotas(business_date),
+                            # 新账号 video_quota_date=NULL 时会命中 reset 把它清零。
+                            # 此时 used_shared 已掉到 0,但预扣在 reset 之前已完成 →
+                            # 这里补扣一次,把预扣值补回,保证最终桶值正确。
+                            # 并发场景:同账号另一条 runner 也可能正在 reset,
+                            # 但 reset 只对 video_quota_date=NULL 账号生效一次,
+                            # date 写 today 后后续 noop → 各任务只补一次。
+                            if account.video_quota_used_shared < recorded_cost:
+                                # 用 pre_charged_entry 的 cost(start() 时预扣的真值)
+                                # 而不是 recorded_cost —— 因为 reset_daily_quotas 会
+                                # 清零已预扣的桶,而 recorded_cost 是 task 自身 cost,
+                                # 两者只在 task.duration/model 一致时才相等;但同组
+                                # 任务可能 model/duration 不一,这里取预扣的真值更稳。
+                                recover_by = pre_charged_entry[1]
+                                self.repository.increment_account_quota(
+                                    account.id, model=task.model, by=recover_by
+                                )
+                                self.logger.warning(
+                                    "v0.2.33:reset_daily_quotas 清零后补回预扣 %d",
+                                    recover_by,
+                                    extra={
+                                        "event": "video_pre_charge_recover",
+                                        "task_id": task_id,
+                                        "account_id": account.id,
+                                        "recovered": recover_by,
+                                    },
+                                )
+                            else:
+                                self.logger.debug(
+                                    "v0.2.33:start() 预扣已扣,update() 跳过 increment",
+                                    extra={"event": "video_pre_charge_skip", "task_id": task_id},
+                                )
                         quota_recorded = True
                     self.repository.update_video_task(task_id, **values)
 
@@ -834,20 +1161,37 @@ class VideoTaskService:
                     # 同一个 except 块调用多次幂等 —— recorded_cost = 0 后再调
                     # 直接 noop。Bucket 下界由 repository.decrement_account_quota
                     # 用 max(0, used-by) 保证。
-                    nonlocal quota_recorded, recorded_cost
+                    # v0.2.33:start() 已预扣 → 若 update(generating) 没跑过
+                    # (recorded_cost 仍是 0,常见于 runner 提前抛异常 / cancel
+                    # 信号触发),但 pre_charged_entry 已记录了预扣值 → 这里
+                    # 也要退,否则桶里就多了 5 点孤儿扣款。所有失败路径走同
+                    # 一处退款,避免漏退。
+                    nonlocal quota_recorded, recorded_cost, pre_charged_entry
+                    # 决策退多少:update() 走过 → 按 recorded_cost 退;没走过但
+                    # 是 start() 预扣路径 → 按 pre_charged_entry 的值退。
+                    refund_by = 0
                     if quota_recorded and recorded_cost > 0:
+                        refund_by = recorded_cost
+                    elif pre_charged_entry is not None:
+                        # 兼容路径:resume_queued 启动后,内存里的 _pre_charged_tasks
+                        # 已失,task 没经过 start() 的预扣 → pre_charged_entry 这里是 None,
+                        # 走不到这条分支。
+                        # 当前走到这里:start() 已预扣,但 update(generating) 没机会
+                        # 触发(runner 早抛 / cancel),需要退预扣。
+                        refund_by = pre_charged_entry[1]
+                    if refund_by > 0:
                         try:
                             self.repository.decrement_account_quota(
-                                account.id, model=task.model, by=recorded_cost
+                                account.id, model=task.model, by=refund_by
                             )
                             self.logger.warning(
                                 "失败退还额度 %d 点 (model=%s): %s",
-                                recorded_cost, task.model, account.id,
+                                refund_by, task.model, account.id,
                                 extra={
                                     "event": "video_quota_refunded",
                                     "account_id": account.id,
                                     "task_id": task_id,
-                                    "refunded": recorded_cost,
+                                    "refunded": refund_by,
                                 },
                             )
                         except Exception as refund_exc:
@@ -862,8 +1206,10 @@ class VideoTaskService:
                                     "task_id": task_id,
                                 },
                             )
+                        # 标记「已退过」,避免同 except 块多次退。
                         quota_recorded = False
                         recorded_cost = 0
+                        pre_charged_entry = None
 
                 try:
                     image_paths = []
@@ -929,6 +1275,9 @@ class VideoTaskService:
                     # 写清楚「请去浏览器访问主页 + 点刷新 token」,让用户自救。
                     # 直接 return:token 是 profile 级问题,重提同一 profile 必失败,
                     # 不要被外层 while not cancellation.is_set() 死循环重试。
+                    # v0.2.33:start() 已预扣 → refund_quota_if_recorded()
+                    # 已统一处理 recorded_cost=0 / pre_charged_entry 兜底退款。
+                    refund_quota_if_recorded()
                     self.repository.update_video_task(
                         task.id,
                         status="failed",
@@ -986,6 +1335,9 @@ class VideoTaskService:
                         # 风控:不动桶,只标 task failed,让用户知道是被风控。
                         # self.repository.assign_video_task(task_id, None) 让
                         # 任务回到 queued,下次调度可能会选别的账号重试。
+                        # v0.2.33:start() 已预扣 → refund_quota_if_recorded()
+                        # 已统一处理 recorded_cost=0 / pre_charged_entry 兜底退款。
+                        refund_quota_if_recorded()
                         self.repository.update_video_task(
                             task_id, status="failed",
                             error_message="账号被风控拦截（shark_admin verify），稍后重试或换号",
@@ -1051,13 +1403,12 @@ class VideoTaskService:
                     # 已经在上面 mark_account_limited 路径里处理。
                     # v0.2.27:加入 TIMEOUT —— 本地 deadline 等不到结果 = 用户
                     # 没拿到视频,应退。
-                    if failure.kind in (
-                        FailureKind.NETWORK,
-                        FailureKind.POLICY_VIOLATION,
-                        FailureKind.INVALID_INPUT,
-                        FailureKind.TIMEOUT,
-                    ):
-                        refund_quota_if_recorded()
+                    # v0.2.33:start() 已预扣 → 失败路径**无条件**退 recorded_cost,
+                    # 不再按 failure.kind 筛选。理由:预扣阶段已经把额度从账号扣走,
+                    # 用户没拿到视频就该退,只让"豆包大概率已计费"的 kind 退
+                    # (GENERATION_FAILED / UNKNOWN) 反而会留下预扣孤儿。
+                    # 已退过的 recorded_cost=0 → refund_quota_if_recorded() 守门 noop。
+                    refund_quota_if_recorded()
 
                     attempt = getattr(task, "prompt_retry_count", 0) or 0
                     max_attempts = int(settings.get("max_prompt_retries", 2))

@@ -7,7 +7,7 @@ import pytest
 from doupool.db.models import Account
 from doupool.video.browser import TokenBundleUnavailable
 from doupool.video.protocol import DoubaoContentRejected, DoubaoRateLimited
-from doupool.video.service import VideoTaskService
+from doupool.video.service import NoAvailableAccount, VideoTaskService
 
 
 class SuccessfulVideoRunner:
@@ -812,10 +812,11 @@ async def test_service_refunds_quota_on_refundable_failures(
             f"{failure_kind} 应该退款,但 shared 桶 = {acc.video_quota_used_shared}"
         )
     else:
-        # generation_failed 不退。revise_prompt 路径会跑 max_attempts=2 次重试,
-        # 每次扣 5 点(5s × 1.0/s),所以累计 15 点不退。
-        assert acc.video_quota_used_shared == 15, (
-            f"{failure_kind} 不该退款,但 shared 桶 = {acc.video_quota_used_shared}"
+        # v0.2.33:start() 已预扣 → 失败路径无条件退(不再按 kind 筛选)。
+        # revise_prompt 重试 3 次(1 原始 + 2 重试),每次 start() 都会预扣
+        # 5 点,然后失败路径退 5 点 → 终态仍为 0(最后一次失败退完)。
+        assert acc.video_quota_used_shared == 0, (
+            f"v0.2.33: 所有失败路径都退,shared 桶应=0,实={acc.video_quota_used_shared}"
         )
 
 
@@ -862,7 +863,9 @@ class FailBeforeGeneratingRunner:
 
 @pytest.mark.asyncio
 async def test_service_refund_noop_when_quota_was_not_charged(repository, temp_profile):
-    """v0.2.19:runner 在扣 quota 之前就抛了 → 退款路径要安全 noop,桶不动。"""
+    """v0.2.19:runner 在扣 quota 之前就抛了 → 退款路径要安全 noop,桶不动。
+    v0.2.33:start() 现在预扣 cost → 失败路径必须退预扣,终态仍是 0。
+    """
     Account.create(
         id="acc-noref", display_name="noref", doubao_user_id="u",
         profile_dir=temp_profile,
@@ -874,7 +877,7 @@ async def test_service_refund_noop_when_quota_was_not_charged(repository, temp_p
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     acc = Account.get_by_id("acc-noref")
-    # 桶没扣(没到 generating),decrement noop 后也是 0
+    # v0.2.33:start() 预扣 5 + 失败路径退 5 → 终态 0
     assert acc.video_quota_used_shared == 0
 
 
@@ -1265,7 +1268,9 @@ async def test_service_refunds_quota_on_user_cancel(repository, temp_profile):
 @pytest.mark.asyncio
 async def test_service_cancel_refund_noop_when_quota_not_charged(repository, temp_profile):
     """v0.2.27:runner 在扣 quota 前就 cancel → refund_quota_if_recorded()
-    安全 noop,不报错,quota 不动。"""
+    安全 noop,不报错,quota 不动。
+    v0.2.33:start() 已预扣 cost → 取消路径必须退预扣,终态仍是 0。
+    """
     Account.create(
         id="acc-cancel-noop", display_name="cn", doubao_user_id="u",
         profile_dir=temp_profile,
@@ -1283,7 +1288,8 @@ async def test_service_cancel_refund_noop_when_quota_not_charged(repository, tem
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     acc = Account.get_by_id("acc-cancel-noop")
-    assert acc.video_quota_used_shared == 0  # 从未扣过,refund 路径要安全
+    # v0.2.33:start() 预扣 5 + 取消退 5 → 终态 0
+    assert acc.video_quota_used_shared == 0  # 预扣已退,refund 路径要安全
 
 
 # --- v0.2.30:_run 顶层 CancelledError 也写 failed + resume_queued stale 兜底 ---
@@ -1337,7 +1343,7 @@ async def test_run_top_level_cancelled_error_writes_failed(repository, temp_prof
     assert saved.completed_at is not None, "failed 状态应写 completed_at"
     # 账号分配应该被解除,下次提交同 prompt 不会撞死账号
     assert saved.account_id is None, "cancel 后应释放账号分配"
-    # quota 从未扣(quota_recorded 闸门在 update("generating")),不退也不进
+    # v0.2.33:start() 已预扣 cost → cancel 路径必须退,终态 0
     acc = Account.get_by_id("acc-cancel-top")
     assert acc.video_quota_used_shared == 0
 
@@ -1493,3 +1499,245 @@ async def test_start_without_group_id_keeps_legacy_none_behavior(repository, tem
     saved = repository.get_video_task(task.id)
     assert saved.group_id is None
     assert saved.group_index == 0
+
+
+# ---------- v0.2.33:并发分散 + 同组粘同账号 + 重启 reconciliation ----------
+
+@pytest.mark.asyncio
+async def test_start_precharges_quota_before_runner_runs(repository, temp_profile):
+    """v0.2.33:start() 路径用 CAS 预扣 → used_shared 在 runner 启动前已 += cost。
+
+    之前所有版本都是 _run_inner 的 update("generating") 闭包才扣;v0.2.33
+    提前到 start() 防并发超扣。这里验证 start() 调用后立刻读到正确的预扣。
+    """
+    Account.create(
+        id="acc-pre", display_name="预扣", doubao_user_id="u", profile_dir=temp_profile
+    )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    task = service.start("预扣", "seedance_v2.0_mini", "1:1", 5)
+    # 不 await _tasks —— start() 内部已经预扣过 5 点
+    assert Account.get_by_id("acc-pre").video_quota_used_shared == 5
+    # 内存里的预登记表也已写入
+    assert task.id in service._pre_charged_tasks
+    assert service._pre_charged_tasks[task.id] == ("acc-pre", 5, "seedance_v2.0_mini")
+
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+    # 跑完后仍然是 5 —— update() 闭包见到预扣跳过 increment
+    assert Account.get_by_id("acc-pre").video_quota_used_shared == 5
+
+
+@pytest.mark.asyncio
+async def test_start_with_prompts_uses_same_account_for_group(repository, tmp_path):
+    """v0.2.33:同 group_id 的多个 prompt 沿用首 task 选中的账号(sticky)。
+
+    三个账号都是空的,首 task 选 least_used 的 acc-a;剩 2 个 task 应继续用 acc-a
+    而不是再次 choose_and_reserve_account。CAS 预扣 5 次,acc-a 桶加 15,
+    acc-b / acc-c 桶 0。
+    """
+    for i in ("a", "b", "c"):
+        Account.create(
+            id=f"acc-{i}", display_name=f"账号{i}", doubao_user_id=f"u{i}",
+            profile_dir=str(tmp_path / f"profile-{i}"),
+        )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    prompts = ["p1 跑", "p2 跑", "p3 跑"]
+    # prompt="" 避免和 prompts 双重给 —— 不然 prompt 会被当作第一段前缀补到队首
+    first_task = service.start("", "seedance_v2.0_mini", "1:1", 5, prompts=prompts)
+    assert first_task is not None
+    group_id = first_task.group_id
+    assert group_id is not None
+
+    # 等所有组内 task 跑完
+    import time
+    deadline = time.monotonic() + 2
+    from doupool.db.models import VideoTask as _VT
+    while time.monotonic() < deadline:
+        remaining = _VT.select().where(
+            (_VT.group_id == group_id) & _VT.status.in_(("queued", "starting", "generating"))
+        ).count()
+        if remaining == 0:
+            break
+        await asyncio.sleep(0.02)
+
+    group_tasks = list(_VT.select().where(_VT.group_id == group_id))
+    assert len(group_tasks) == 3
+    accounts_used = {t.account.id for t in group_tasks}
+    assert len(accounts_used) == 1, f"同组应只用一个账号,实际: {accounts_used}"
+    # 被选中的账号被扣 15,其余 0
+    chosen = accounts_used.pop()
+    for a in ("acc-a", "acc-b", "acc-c"):
+        used = Account.get_by_id(a).video_quota_used_shared
+        expected = 15 if a == chosen else 0
+        assert used == expected, f"{a} used={used} 期望 {expected}"
+
+
+@pytest.mark.asyncio
+async def test_start_distributes_parallel_calls_across_accounts(repository, tmp_path):
+    """v0.2.33:串行三次 start() 不同 group 时分散到不同账号(least_used CAS)。
+
+    三账号各 0,三次 start 三个 group → CAS 按 used 升序选,每个账号 used=5。
+    """
+    for i in ("a", "b", "c"):
+        Account.create(
+            id=f"acc-{i}", display_name=f"账号{i}", doubao_user_id=f"u{i}",
+            profile_dir=str(tmp_path / f"profile-{i}"),
+        )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    # 串行 start 也能验证分散(每次 CAS 都选 used 最小的)
+    t1 = service.start("g1", "seedance_v2.0_mini", "1:1", 5)
+    t2 = service.start("g2", "seedance_v2.0_mini", "1:1", 5)
+    t3 = service.start("g3", "seedance_v2.0_mini", "1:1", 5)
+
+    assert {t1.account.id, t2.account.id, t3.account.id} == {"acc-a", "acc-b", "acc-c"}
+    for a in ("acc-a", "acc-b", "acc-c"):
+        assert Account.get_by_id(a).video_quota_used_shared == 5
+
+    for t in (t1, t2, t3):
+        await asyncio.wait_for(service._tasks[t.id], timeout=2)
+    # 跑完后各账号仍 5(预扣路径,update 跳过 increment)
+    for a in ("acc-a", "acc-b", "acc-c"):
+        assert Account.get_by_id(a).video_quota_used_shared == 5
+
+
+@pytest.mark.asyncio
+async def test_start_with_explicit_account_id_raises_when_quota_full(
+    repository, tmp_path,
+):
+    """v0.2.33:caller 显式指定 account_id,目标账号桶满 → NoAvailableAccount。
+
+    区别于「无 target_account_id 时选不到也保持 queued」的兜底。
+    """
+    Account.create(
+        id="full-acc", display_name="满", doubao_user_id="u",
+        profile_dir=str(tmp_path / "full"), video_quota_used_shared=50,
+    )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    with pytest.raises(NoAvailableAccount):
+        service.start("指定满账号", "seedance_v2.0_mini", "1:1", 5, account_id="full-acc")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pre_charged_after_restart_skips_double_charge(
+    repository, tmp_path,
+):
+    """v0.2.33:进程重启后 resume_queued 重建 _pre_charged_tasks → 不会 double charge。
+
+    模拟场景:
+      1. service1 start() → 预扣 5,used_shared=5,task 进 starting/generating
+      2. service1 进程崩了(直接 _pre_charged_tasks 不清,模拟内存失)
+      3. service2 = new VideoTaskService + resume_queued()
+      4. reconcile 重建 _pre_charged_tasks
+      5. _run_inner 跑完 → used_shared 仍是 5(没二次扣)
+    """
+    Account.create(
+        id="acc-restart", display_name="重启", doubao_user_id="u",
+        profile_dir=str(tmp_path / "restart"),
+    )
+    # 用一个「卡住」不返回的 runner 模拟崩了 —— 但 start 不会等 runner 跑完
+    # 我们让 start 后立刻模拟「内存失」,建新 service 调 resume_queued
+    class _StuckRunner:
+        async def run(self, *a, **kw):
+            # 模拟 in-flight:跑到一半进程崩了
+            await asyncio.sleep(60)
+
+    service1 = VideoTaskService(
+        repository, _StuckRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+    task = service1.start("p", "seedance_v2.0_mini", "1:1", 5)
+    # start 后立刻 used_shared=5(预扣)
+    assert Account.get_by_id("acc-restart").video_quota_used_shared == 5
+
+    # 模拟进程崩:service1 直接丢弃,_pre_charged_tasks 内存失
+    del service1
+
+    # service2(新进程)调 resume_queued → reconcile 回填 _pre_charged_tasks
+    class _FinishRunner:
+        async def run(self, *a, **kw):
+            kw.get("update")  # noqa - 验证 update 是 keyword(实际是 positional,见下)
+            # 真实场景:resume_queued 走 _schedule → _run_inner → runner.run。
+            # runner.run 这里不再被调(因为 in-flight task 已经在用 StuckRunner 派发,
+            # 但 service1 没了,runner.run 永远不会跑)。直接返回 success。
+            return {
+                "remote_task_id": "remote-restart",
+                "result_url": "https://example.test/restart.mp4",
+                "cover_url": "https://example.test/restart.jpg",
+            }
+
+    service2 = VideoTaskService(
+        repository, _FinishRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+    # reconcile 走 resume_queued 路径
+    await asyncio.wait_for(service2.resume_queued(), timeout=2)
+    # _pre_charged_tasks 已被填回
+    assert task.id in service2._pre_charged_tasks
+    assert service2._pre_charged_tasks[task.id] == (
+        "acc-restart", 5, "seedance_v2.0_mini",
+    )
+    # 现在手动 schedule + 跑 _run_inner 验证不 double charge
+    # (service2 没有 StuckRunner 在跑这条 task,所以我们要再 schedule 一次)
+    # 注意:_schedule 会拿 service2 的 _FinishRunner 跑 → 走 success 路径。
+    # 先把 task.status 强制回 queued 模拟「重启」
+    from doupool.db.models import VideoTask as _VT
+    _VT.update(status="queued").where(_VT.id == task.id).execute()
+    service2._schedule(task.id)
+    await asyncio.wait_for(service2._tasks[task.id], timeout=2)
+
+    # used_shared 仍是 5 —— 没有二次扣
+    assert Account.get_by_id("acc-restart").video_quota_used_shared == 5
+
+
+@pytest.mark.asyncio
+async def test_start_refunds_pre_charge_when_runner_raises(repository, tmp_path):
+    """v0.2.33:start() 预扣后 runner 抛错 → 失败路径退预扣 → used_shared 归零。
+
+    SuccessfulVideoRunner 改为抛异常 → _run_inner 的 except 路径走
+    refund_quota_if_recorded → used_shared -= 5。同时内存里的 _pre_charged_tasks
+    也被 _refund_pre_charge_if_present 清掉。
+    """
+    Account.create(
+        id="acc-fail", display_name="失败", doubao_user_id="u",
+        profile_dir=str(tmp_path / "fail"),
+    )
+
+    class _FailingRunner:
+        async def run(self, *a, **kw):
+            update = a[5]  # update 是第 6 个 positional
+            update(status="generating", conversation_id="c1")
+            raise RuntimeError("runner crashed mid-run")
+
+    service = VideoTaskService(
+        repository, _FailingRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+    task = service.start("p", "seedance_v2.0_mini", "1:1", 5)
+    # start 后立刻预扣
+    assert Account.get_by_id("acc-fail").video_quota_used_shared == 5
+
+    try:
+        await asyncio.wait_for(service._tasks[task.id], timeout=2)
+    except Exception:
+        pass  # _run 的 except 写 failed 后 raise,测试里吞掉
+    # 退预扣后归零
+    assert Account.get_by_id("acc-fail").video_quota_used_shared == 0
+    # 内存也清空
+    assert task.id not in service._pre_charged_tasks
+    # task 状态是 failed
+    assert repository.get_video_task(task.id).status == "failed"
