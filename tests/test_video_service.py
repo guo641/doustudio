@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -102,6 +103,66 @@ async def test_service_respects_task_interval_seconds(repository, temp_profile):
     gap = captured["runner_called_at"] - captured["dispatched_at"]
     # 容差 50ms(调度器 + asyncio 调度有 ~10ms 抖动,0.2s 量级 50ms 够)
     assert gap >= 0.15, f"task_interval_seconds 应至少 sleep 0.2s,实际 {gap:.3f}s"
+
+
+@pytest.mark.asyncio
+async def test_service_serializes_task_interval_across_concurrent_tasks(repository, temp_profile):
+    """v0.2.34 hotfix:并发派发 N 个 task 时,interval 必须**全局串行** —— 3
+    个 task 同时间起跑,各自 sleep interval 失去意义(并行 sleep 一起醒来,
+    race 触发豆包风控)。验证:interval=0.15、3 task,第 2、3 个 runner
+    调用时刻相对第 1 个至少 +0.15 / +0.30s。
+    """
+    for i in range(3):
+        sub = Path(temp_profile) / f"p{i}"
+        sub.mkdir()
+        Account.create(
+            id=f"acc-{i}",
+            display_name=f"A{i}",
+            doubao_user_id=f"u{i}",
+            profile_dir=str(sub),
+        )
+
+    class SerialSettings:
+        def get(self):
+            return {
+                "daily_quota": 50,
+                "quota_reset_time": "00:00",
+                # max_concurrency=1 强制同账号串行,只让 interval 路径影响节奏
+                "max_concurrency": 1,
+                "task_interval_seconds": 0.15,
+            }
+
+        def get_daily_quotas(self):
+            return {"shared": 50}
+
+    captured = []
+
+    class CaptureRunner:
+        async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+            captured.append(asyncio.get_event_loop().time())
+            return {
+                "remote_task_id": "r",
+                "result_url": "https://example.test/v.mp4",
+                "cover_url": "https://example.test/c.jpg",
+            }
+
+    service = VideoTaskService(
+        repository, CaptureRunner(), SerialSettings(), account_poll_interval=0.01,
+    )
+    t0 = asyncio.get_event_loop().time()
+    tasks = [service.start(f"P{i}", "seedance_v2.0_mini", "1:1", 5) for i in range(3)]
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(service._tasks[t.id] for t in tasks)),
+            timeout=3,
+        )
+    finally:
+        await service.shutdown()
+
+    assert len(captured) == 3, f"预期 3 个 runner 调用,实际 {len(captured)}"
+    gaps = [captured[i] - captured[0] for i in range(3)]
+    assert gaps[1] >= 0.14, f"第 2 个 runner 应在 +0.15s 后跑,实际 +{gaps[1]:.3f}s"
+    assert gaps[2] >= 0.29, f"第 3 个 runner 应在 +0.30s 后跑,实际 +{gaps[2]:.3f}s"
 
 
 @pytest.mark.asyncio

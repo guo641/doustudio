@@ -116,6 +116,11 @@ class VideoTaskService:
         # _global_semaphore(max_concurrency,默认 1)。
         self._global_semaphore: asyncio.Semaphore | None = None
         self._semaphore_limit = 0
+        # v0.2.34:任务间隔串行化锁 —— 多个 task 并发进 _run_inner 时各自 sleep
+        # 自己的 interval 是无意义的(并行 sleep 一起醒来,race 触发豆包风控)。
+        # 用 Lock 把 interval 段串行化:排队等锁的 task 必须等前一个 task
+        # sleep 满 interval 才能开始自己的 sleep,真正拉开 dispatch 节奏。
+        self._interval_lock = asyncio.Lock()
         # v0.2.29:独立重置 cron —— 即使没有 task 在跑,到 quota_reset_time
         # 也能跨日清桶(原 _run_inner 里 reset_daily_quotas 只在迭代时触发)。
         self._reset_cron_task: asyncio.Task[None] | None = None
@@ -1099,15 +1104,36 @@ class VideoTaskService:
             # cancellation.is_set() 优雅退出,不浪费已经选的账号。
             interval = float(settings.get("task_interval_seconds", 0))
             if interval > 0:
-                # cancellation 是 threading.Event(不是 asyncio.Event),它的
-                # wait() 是同步阻塞调用、不能 await。用 to_thread 把它丢到
-                # 工作线程,既能阻塞等满 interval 秒、又能在
-                # cancellation.set() 时立即返回 True。
-                cancelled = await asyncio.to_thread(
-                    cancellation.wait, timeout=interval
-                )
-                if cancelled:
-                    return
+                # 多个 task 并发进 _run_inner 时各自 sleep 自己的 interval
+                # 是无意义的——并行 sleep 一起醒来,失去间隔效果。用全局
+                # _interval_lock 把 interval 段串行化:排队等锁的 task 必须
+                # 等前一个 task sleep 满 interval 才能开始自己的 sleep。
+                # 等锁期间也要响应 cancellation.set():别让关停时被锁卡住。
+                while True:
+                    if cancellation.is_set():
+                        return
+                    try:
+                        await asyncio.wait_for(
+                            self._interval_lock.acquire(),
+                            timeout=0.1,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        continue
+                try:
+                    if cancellation.is_set():
+                        return
+                    # cancellation 是 threading.Event(不是 asyncio.Event),
+                    # 它的 wait() 是同步阻塞调用、不能 await。用 to_thread
+                    # 把它丢到工作线程,既能阻塞等满 interval 秒、又能在
+                    # cancellation.set() 时立即返回 True。
+                    cancelled = await asyncio.to_thread(
+                        cancellation.wait, timeout=interval
+                    )
+                    if cancelled:
+                        return
+                finally:
+                    self._interval_lock.release()
             # v0.2.19:删除 _account_locks —— 同账号多 task 现在共享 BrowserContext,
             # 锁反而阻塞并发(50 点账号一次只能跑 1 个 task 是 bug)。剩下
             # _global_semaphore 限制全局并发数(max_concurrency,默认 1)。

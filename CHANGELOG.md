@@ -35,6 +35,27 @@
 
 ### 修复
 
+- **任务间隔串行化(hotfix)** v0.2.34 第一版只把
+  `await asyncio.sleep(interval)` 塞进 `_run_inner`,
+  但每个 task 各自 sleep 是**并行**的 —— N 个 task
+  一起 sleep N 秒一起醒,race 触发豆包风控,用户
+  视角「间隔不生效」。改用全局 `asyncio.Lock`
+  (`self._interval_lock`) 把 interval 段串行化:
+  排队等锁的 task 必须等前一个 task sleep 满
+  interval 才能开始自己的 sleep,真正拉开 dispatch
+  节奏(3 task + 2s 间隔 → runner 调用于 +2/+4/+6s,
+  而非 +2/+2/+2s)。等锁期间通过 100ms polling 检查
+  `cancellation.is_set()`,避免一个 60s interval +
+  锁队列把 shutdown 卡死。
+  - 实现:[service.py](src/doupool/video/service.py)
+    `__init__` 加 `self._interval_lock = asyncio.Lock()`;
+    `_run_inner` 的 interval 段改为 polling-acquire
+    + `try / finally release` 模式。
+  - 测试:[test_video_service.py](tests/test_video_service.py)
+    新增 `test_service_serializes_task_interval
+    _across_concurrent_tasks`:3 task + interval=0.15,
+    断言第 2/3 个 runner 调用相对第 1 个至少 +0.15
+    / +0.30s。
 - `_run_inner` 任务间隔的旧实现 `await asyncio.wait_for(
   cancellation.wait(), timeout=interval)` 永远挂死 —
   `cancellation` 是 `threading.Event`,它的 `wait()`
