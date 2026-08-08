@@ -78,6 +78,26 @@
 - 未涉及模块:`test_task_groups.py` / `test_login_browser.py`
   失败为既有问题,与本版本无关。
 
+### 预防
+
+- **`build_exe.py` 自动重建 frontend/dist**(v0.2.34
+  「字段不见了」根因 + 预防):之前
+  `packaging/doubao_manager.spec` 只读
+  `frontend/dist` 不重建,改完 .vue/.ts 没手动
+  `npm run build` 就打包 → exe 里仍是旧 UI,
+  新字段看不到。新版本在 PyInstaller 之前强制
+  跑 `npm ci`(只在 `node_modules` 缺失时)+
+  `npm run build`,失败立刻中断打包,绝不允许
+  带着陈旧的 dist 出包。`_resolve_npm()` 自动
+  从 `PATH` / `C:\Program Files\nodejs\npm.cmd`
+  / `%NVM_SYMLINK%\npm.cmd` 等常见位置定位
+  Node,Git Bash 子进程 PATH 缺失也能跑。
+  - Escape hatch:`--skip-frontend-build`
+    跳过重建(用于 CI 已经在前面单独跑过
+    `npm run build` 的场景)。
+  - 验证:`dist/index.html` 必须存在才算
+    成功,vite 静默失败也会被捕获。
+
 ## v0.2.33 - 2026-08-08
 
 ### 新增

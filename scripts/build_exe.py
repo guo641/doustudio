@@ -63,6 +63,73 @@ def _detect_platform() -> str:
     return f"{system}-{arch}"
 
 
+def _resolve_npm() -> str:
+    """
+    在 PATH 里找 npm,找不到时兜底常见 Windows 安装位置。
+    Git Bash / PyInstaller 子进程经常不继承完整 PATH,直接 shutil.which 会落空。
+    """
+    found = shutil.which("npm") or shutil.which("npm.cmd") or shutil.which("npm.exe")
+    if found:
+        return found
+    # Windows 常见位置(官方安装包 + nvm-windows)
+    candidates = [
+        r"C:\Program Files\nodejs\npm.cmd",
+        r"C:\Program Files (x86)\nodejs\npm.cmd",
+        os.path.expandvars(r"%NVM_SYMLINK%\npm.cmd"),
+        os.path.expandvars(r"%APPDATA%\nvm\v.bat"),  # nvm-windows 旧版
+    ]
+    for cand in candidates:
+        if cand and Path(cand).exists():
+            return cand
+    raise RuntimeError(
+        "找不到 npm。PATH 没 Node.js,常见原因:\n"
+        "  - 没装 Node:https://nodejs.org/\n"
+        "  - 装了但当前 shell 的 PATH 不含 Node 目录(Windows 默认 C:\\Program Files\\nodejs)\n"
+        "  - 用 nvm-windows:需让 NVM_SYMLINK 在 PATH(默认就在,但部分 sandbox 会过滤)\n"
+        "如果确认 Node 已装,请在新开的 cmd/PowerShell 重跑本脚本"
+    )
+
+
+def _run(cmd: list[str], cwd: Path, what: str) -> None:
+    """运行子命令并 fail-loud:returncode != 0 直接抛 RuntimeError"""
+    print(f"[{what}] $ {' '.join(cmd)}  (cwd={cwd})")
+    try:
+        subprocess.run(cmd, cwd=str(cwd), check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"{what} 失败: returncode={exc.returncode}\n"
+            f"  cmd: {' '.join(cmd)}\n"
+            f"  cwd: {cwd}"
+        ) from exc
+
+
+def build_frontend() -> None:
+    """
+    在 PyInstaller 之前重建 frontend/dist。
+
+    v0.2.34 教训:packaging/doubao_manager.spec 只读 frontend/dist,**不重建**。
+    如果开发改完 .vue/.ts 没手动 npm run build,exe 里就是旧 UI,新字段不会显示。
+    这里强制 npm ci(只在 node_modules 缺失时) + npm run build,失败立刻中断打包,
+    绝不允许带着陈旧的 dist 出包。
+    """
+    frontend = REPO_ROOT / "frontend"
+    if not (frontend / "package.json").exists():
+        raise RuntimeError(f"找不到 {frontend / 'package.json'},请确认仓库结构")
+    npm = _resolve_npm()
+    if not (frontend / "node_modules").exists():
+        _run([npm, "ci", "--no-audit", "--prefer-offline"], cwd=frontend, what="frontend npm ci")
+    else:
+        print("[frontend] node_modules 已存在,跳过 npm ci")
+    _run([npm, "run", "build"], cwd=frontend, what="frontend npm run build")
+    dist_marker = frontend / "dist" / "index.html"
+    if not dist_marker.exists():
+        raise RuntimeError(
+            f"frontend npm run build 跑完但 {dist_marker} 不存在,"
+            "可能是 vite 配置改了输出路径或 build 静默失败"
+        )
+    print(f"[frontend] ok -> {dist_marker}")
+
+
 def lift_up_browsers(dist: Path) -> None:
     """
     把仓库根的 ms-playwright/ 拷到 dist/<app>/ms-playwright/,
@@ -285,6 +352,12 @@ def main() -> int:
         action="store_true",
         help="跳过 build/zip,只上传 dist/ 下既有的 zip + sha(用于重试上传)",
     )
+    ap.add_argument(
+        "--skip-frontend-build",
+        action="store_true",
+        help="跳过前端 npm run build(默认会自动跑)。spec 只读 frontend/dist,"
+        "不重建会打包进陈旧的 UI(就是 v0.2.34 '字段不见了' 的根因)",
+    )
     args = ap.parse_args()
 
     version = args.version or os.environ.get("GITHUB_REF_NAME", "dev")
@@ -296,6 +369,8 @@ def main() -> int:
             raise SystemExit(f"--upload-only 需要 {zip_path} 与 {sha_path} 存在")
         print(f"[upload-only] 跳过 build,直接用 {zip_path.name} ({zip_path.stat().st_size // 1024} KB)")
     else:
+        if not args.skip_frontend_build:
+            build_frontend()
         dist = build(args.mode)
         if args.mode == "onedir":
             lift_up_browsers(dist)
