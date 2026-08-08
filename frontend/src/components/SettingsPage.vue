@@ -26,6 +26,9 @@ type Settings = {
   runner_window_visible: boolean;
   // v0.2.27:每个任务等待豆包生成的最长时长(分钟)。超时未成功自动退还额度。
   default_timeout_minutes: number;
+  // v0.2.34:并发任务间隔(秒)—— 每个 task 在抢并发位前 sleep N 秒,避免
+  // 多账号同时 dispatch 触发豆包风控。0 关闭(默认)。
+  task_interval_seconds: number;
 };
 
 const settings = ref<Settings | null>(null);
@@ -165,6 +168,23 @@ async function onCheckUpdate() {
           <span class="watermark-hint">
             1-20 分钟,默认 7。每个任务等待豆包生成的最长时间,超时未成功将自动退还额度。
             修改后对下一个提交的任务生效,正在跑的任务不受影响。
+          </span>
+        </DpField>
+        <!-- v0.2.34:并发任务间隔(秒)。每个 task 在抢 _global_semaphore 之
+             前 sleep 这个时长,适用单提交和组提交两种场景(都过 _run_inner)。
+             默认 0 = 不间隔。多账号同时 dispatch 触发豆包风控时调高。 -->
+        <DpField label="任务间隔(秒)" for-id="setting-task-interval-seconds">
+          <DpInput
+            id="setting-task-interval-seconds"
+            v-model.number="settings.task_interval_seconds"
+            type="number"
+            :min="0"
+            :max="60"
+          />
+          <span class="watermark-hint">
+            0-60 秒,默认 0(关闭)。每个任务在开始提交前 sleep 这段时间,组
+            提交和单提交都生效。设 50 并发 + 5 秒间隔 = 全部派发完约 4 分钟,
+            给豆包足够缓冲避免风控。修改后对下一个提交的任务生效。
           </span>
         </DpField>
       </div>

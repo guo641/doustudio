@@ -50,6 +50,11 @@ class SettingsService:
         # 启动时把 minutes × 60 写入 PlaywrightVideoRunner.timeout。修改设置
         # 后只对下一个 task 生效(live update 不做,见 plan 注释)。
         "default_timeout_minutes": 7,
+        # v0.2.34:并发任务间隔(秒)—— 用户在 SettingsPage 调,组提交和单提交
+        # 走同一路径(都过 _run_inner)。每个 task 在 assigning 到账号后、
+        # 抢 _global_semaphore 之前 sleep 这个时长,避免同 IP 多账号同时操作
+        # 触发豆包风控。默认 0 = 不间隔(沿用 v0.2.33 行为)。
+        "task_interval_seconds": 0,
         # v0.2.17:浏览器 PC 端版本号,被 video/browser.py 读取塞到
         # payload.client_meta.pc_version。不暴露前端(17-b 时一起加 UI),
         # 升级时只需改这里 + 重启服务。
@@ -138,5 +143,10 @@ class SettingsService:
         # 在队列里占名额太久,反而拖慢整批任务周转。1 分钟下限避免误设 0。
         if not 1 <= int(values["default_timeout_minutes"]) <= 20:
             raise ValueError("任务超时必须在 1 到 20 分钟之间")
+        # v0.2.34:0 = 不间隔(默认行为),1..60 限上限成 —— 单次间隔 60s 已
+        # 足够把 50 并发任务拉到 50 分钟,够「同 IP 触限」缓冲,再高用户自己
+        # 拉低 max_concurrency 更合适。
+        if not 0 <= int(values["task_interval_seconds"]) <= 60:
+            raise ValueError("任务间隔必须在 0 到 60 秒之间")
         if not Path(values["download_dir"]).expanduser().is_absolute():
             raise ValueError("下载目录必须是绝对路径")

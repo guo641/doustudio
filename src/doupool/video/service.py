@@ -1092,6 +1092,22 @@ class VideoTaskService:
                 await asyncio.sleep(self.account_poll_interval)
                 continue
             self.repository.assign_video_task(task_id, account.id)
+            # v0.2.34:任务间隔 —— 每个 task 在抢 _global_semaphore 之前 sleep
+            # N 秒,避免多账号同时 dispatch 触发豆包风控。
+            # 必须放在 semaphore 之外:放里面只 sleep 当前 task,不真正"间隔"。
+            # 放在 assign 之后:账号绑定已落库,cancel 信号触发时也能通过
+            # cancellation.is_set() 优雅退出,不浪费已经选的账号。
+            interval = float(settings.get("task_interval_seconds", 0))
+            if interval > 0:
+                # cancellation 是 threading.Event(不是 asyncio.Event),它的
+                # wait() 是同步阻塞调用、不能 await。用 to_thread 把它丢到
+                # 工作线程,既能阻塞等满 interval 秒、又能在
+                # cancellation.set() 时立即返回 True。
+                cancelled = await asyncio.to_thread(
+                    cancellation.wait, timeout=interval
+                )
+                if cancelled:
+                    return
             # v0.2.19:删除 _account_locks —— 同账号多 task 现在共享 BrowserContext,
             # 锁反而阻塞并发(50 点账号一次只能跑 1 个 task 是 bug)。剩下
             # _global_semaphore 限制全局并发数(max_concurrency,默认 1)。

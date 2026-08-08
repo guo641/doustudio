@@ -71,6 +71,20 @@ class TestClassifyFailure:
         assert info.retryable is True
         assert info.revise_prompt is True
 
+    # v0.2.34:豆包新增文案「视频生成失败,生成额度未扣除」—— 表面像 quota
+    # 类(没扣费),实际是「提示词过审失败、生成没出、所以也没扣」,必须
+    # 走 GENERATION_FAILED + revise_prompt=True 改写 prompt 重试。
+    # 旧版本把「额度未扣除」塞在 _RATE_LIMIT_PATTERNS 里,会被先吃掉 → 误
+    # 分类为 RATE_LIMITED,不改 prompt,白白浪费一次额度耗尽的标签。本次
+    # 修复:从 _RATE_LIMIT_PATTERNS 移除该 pattern,新文案中的「视频生成失败」
+    # 子串会落到 _GENERATION_FAILED_PATTERNS 触发 revise_prompt。
+    def test_generation_failed_v0_2_34_quota_not_deducted(self):
+        info = classify_failure("视频生成失败,生成额度未扣除")
+        assert info.kind == FailureKind.GENERATION_FAILED, (
+            f"新拒绝文案应走 GENERATION_FAILED,实际 {info.kind}"
+        )
+        assert info.revise_prompt is True, "必须改写 prompt 重试,不浪费额度"
+
     def test_invalid_input(self):
         info = classify_failure("参数无效: prompt 长度超过限制")
         # 不一定命中 INVALID_INPUT 模式,但应该是 NOT retryable 类

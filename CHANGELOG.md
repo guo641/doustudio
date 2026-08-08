@@ -2,6 +2,61 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.34 - 2026-08-08
+
+### 新增
+
+- **任务间隔可调(0-60 秒)** 用户反馈:多账号并发
+  时即便有 sticky + 共享额度,豆包侧仍偶发"批量
+  提交太快"的风控。现在每个 task 在抢
+  `_global_semaphore` 之前先 sleep 一个可调间隔,
+  减慢 dispatch 节奏。SettingsPage 新增「任务
+  间隔秒」字段(`<DpInput type="number" min=0
+  max=60>`),默认 0 = 不间隔(向后兼容)。
+  - 实现:[service.py](src/doupool/video/service.py)
+    `_run_inner` 在 `assign_video_task` 之后
+    读 `settings["task_interval_seconds"]`,>0 时
+    跑 `asyncio.to_thread(cancellation.wait,
+    timeout=interval)` —— 既能阻塞满 interval 秒,
+    又能在 shutdown 触发 `cancellation.set()` 时
+    立即返回(避免一个 60s 间隔卡死关停)。
+    放在 assign 之后是因为账号绑定已落库,
+    cancel 命中后退出不再浪费已经选的账号。
+  - 范围校验:[settings/service.py](src/doupool/settings/service.py)
+    `_validate` 加 `0 <= int(value) <= 60`,越界
+    拒写。DEFAULTS 默认 0,旧 DB 不受影响。
+- **新拒绝文案入分类** 用户报「视频生成失败,生成
+  额度未扣除。」也想自动重试。
+  [prompt_reviser.py](src/doupool/prompt_reviser.py)
+  原本 `额度未扣除` 走 RATE_LIMIT 桶,现在从
+  `_RATE_LIMIT_PATTERNS` 摘掉让它回落到
+  `_GENERATION_FAILED_PATTERNS`(匹配 `视频生成失败`
+  子串)→ `revise_prompt=True`,触发改写重试。
+
+### 修复
+
+- `_run_inner` 任务间隔的旧实现 `await asyncio.wait_for(
+  cancellation.wait(), timeout=interval)` 永远挂死 —
+  `cancellation` 是 `threading.Event`,它的 `wait()`
+  是同步阻塞返回 bool,不是 awaitable;`asyncio.wait_for`
+  要求 awaitable,所以等不到返回值。本次改成
+  `asyncio.to_thread` 在工作线程跑阻塞 wait,既保留
+  "cancel 时立即退出"语义又真正能跑完 interval。
+
+### 测试
+
+- `test_settings.py`:新增 3 个用例 — 默认 0、接受
+  0..60、拒绝 -1 和 61。
+- `test_prompt_reviser.py`:新增 `test_generation_failed
+  _v0_2_34_quota_not_deducted` 断言「视频生成失败,
+  生成额度未扣除」走 GENERATION_FAILED 桶 + 触发
+  revise_prompt。
+- `test_video_service.py`:新增 `test_service_respects
+  _task_interval_seconds`,0.2s 间隔断言
+  `runner_called_at - dispatched_at >= 0.15`。
+- 未涉及模块:`test_task_groups.py` / `test_login_browser.py`
+  失败为既有问题,与本版本无关。
+
 ## v0.2.33 - 2026-08-08
 
 ### 新增

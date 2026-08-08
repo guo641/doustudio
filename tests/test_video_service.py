@@ -53,6 +53,58 @@ async def test_service_runs_and_persists_video_result(repository, temp_profile):
 
 
 @pytest.mark.asyncio
+async def test_service_respects_task_interval_seconds(repository, temp_profile):
+    """v0.2.34:并发任务间隔(秒)—— 每个 task 在抢 _global_semaphore 之前
+    sleep N 秒。把 StaticSettings.max_concurrency 调成 1(强制串行),把
+    task_interval_seconds 设为 0.2,验证从「开始派发」到「runner.run 真正入
+    参」至少间隔 0.2s。如果回归成 interval 缺失或被 clamp 到 0,这次会
+    < 0.1s 跑完,断言失败。
+    """
+    Account.create(
+        id="account-1", display_name="g", doubao_user_id="u", profile_dir=temp_profile
+    )
+
+    class IntervalSettings:
+        def get(self):
+            return {
+                "daily_quota": 50,
+                "quota_reset_time": "00:00",
+                "max_concurrency": 1,
+                # v0.2.34:用户调成 0.2 秒,绕开 1s 阈值太慢的场景
+                "task_interval_seconds": 0.2,
+            }
+
+        def get_daily_quotas(self):
+            return {"shared": 50}
+
+    captured = {"dispatched_at": None, "runner_called_at": None}
+
+    class IntervalTimingRunner:
+        async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+            captured["runner_called_at"] = asyncio.get_event_loop().time()
+            update(status="generating", conversation_id="c1")
+            return {
+                "remote_task_id": "r1",
+                "result_url": "https://example.test/v.mp4",
+                "cover_url": "https://example.test/c.jpg",
+            }
+
+    service = VideoTaskService(
+        repository, IntervalTimingRunner(), IntervalSettings(), account_poll_interval=0.01,
+    )
+    captured["dispatched_at"] = asyncio.get_event_loop().time()
+    task = service.start("P", "seedance_v2.0_mini", "1:1", 5)
+    try:
+        await asyncio.wait_for(service._tasks[task.id], timeout=3)
+    finally:
+        await service.shutdown()
+
+    gap = captured["runner_called_at"] - captured["dispatched_at"]
+    # 容差 50ms(调度器 + asyncio 调度有 ~10ms 抖动,0.2s 量级 50ms 够)
+    assert gap >= 0.15, f"task_interval_seconds 应至少 sleep 0.2s,实际 {gap:.3f}s"
+
+
+@pytest.mark.asyncio
 async def test_service_keeps_task_queued_without_an_available_account(repository):
     service = VideoTaskService(repository, SuccessfulVideoRunner(), StaticSettings(), account_poll_interval=0.01)
     task = service.start("测试", "seedance_v2.0_mini", "1:1", 5)

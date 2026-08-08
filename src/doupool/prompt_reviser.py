@@ -69,7 +69,13 @@ _RATE_LIMIT_PATTERNS = [
     re.compile(r"今日(?:免费)?额度(?:已)?(?:用完|耗尽|不足)"),
     re.compile(r"quota.{0,20}(?:exhaust|limit)", re.IGNORECASE),
     re.compile(r"rate.{0,20}limit", re.IGNORECASE),
-    re.compile(r"额度未扣除"),  # 这种不算 rate limit,反而是豆包没扣成功
+    # 注:旧版把「额度未扣除」塞这里(line 72),分类成 RATE_LIMITED
+    # revise_prompt=False。但豆包近期新增文案是「视频生成失败,生成额度
+    # 未扣除」—— 表面像「没扣费」实际是「提示词过不了审、豆包主动拒收、
+    # 没生成、所以也没扣」,应该走 revise_prompt=True 改写 prompt 重试。
+    # 单独「额度未扣除」在新文案里几乎只出现在该拒绝模板里,改下面 _POLICY_PATTERNS
+    # 里加新条目匹配整段;此处不再单独 match,避免误判「正常扣费失败」
+    # (那种真要进 RATE_LIMITED 退额度)。
 ]
 
 _NETWORK_PATTERNS = [

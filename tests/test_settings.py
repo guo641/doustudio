@@ -97,6 +97,29 @@ def test_settings_reject_duration_out_of_range(repository, database_manager, tmp
         service.update({"default_duration": 11})
 
 
+def test_task_interval_seconds_default_zero(repository, database_manager, tmp_path):
+    """v0.2.34:新加的并发任务间隔,默认 0(沿用 v0.2.33 不间隔行为)。"""
+    service = SettingsService(repository, tmp_path, database_manager.path)
+    assert service.get()["task_interval_seconds"] == 0
+
+
+def test_settings_accept_task_interval_in_range(repository, database_manager, tmp_path):
+    """v0.2.34:0..60 秒间隔,边界值必须能保存。"""
+    service = SettingsService(repository, tmp_path, database_manager.path)
+    for v in (0, 1, 5, 30, 60):
+        updated = service.update({"task_interval_seconds": v})
+        assert updated["task_interval_seconds"] == v
+
+
+def test_settings_reject_task_interval_out_of_range(repository, database_manager, tmp_path):
+    """v0.2.34:任务间隔<0 或 >60 拒绝 —— 浏览器禁用 save 按钮,后端再兜底。"""
+    service = SettingsService(repository, tmp_path, database_manager.path)
+    with pytest.raises(ValueError, match="任务间隔"):
+        service.update({"task_interval_seconds": -1})
+    with pytest.raises(ValueError, match="任务间隔"):
+        service.update({"task_interval_seconds": 61})
+
+
 def test_settings_reject_round_robin_strategy(repository, database_manager, tmp_path):
     """v0.2.29:调度策略只剩 least_used —— round_robin 是 v0.2.9 死链。
 

@@ -24,6 +24,8 @@ const api = vi.hoisted(() => ({
     max_reject_retries: 2,
     runner_window_visible: true,
     default_timeout_minutes: 7,
+    // v0.2.34:并发任务间隔(秒)—— SettingsPage 新增字段。
+    task_interval_seconds: 0,
   }),
   saveSettings: vi.fn().mockImplementation(async value=>value),
   backupDatabase: vi.fn().mockResolvedValue({ path:'/tmp/backup.sqlite3' }),
