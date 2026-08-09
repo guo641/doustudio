@@ -2,6 +2,51 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.37 - 2026-08-09
+
+### 修复
+
+- **「打开浏览器 → 刷新 token」依然 500** v0.2.36 把 hint 透传修好了,但只要
+  Chromium v100+ 的 DPAPI 加密或 WebMSSDK 没跑完就继续 500。本次把根因一并
+  修掉:
+  - **登录 keepalive 30s → 90s** 用户扫码成功后,需要在浏览器里访问
+    `https://www.doubao.com/chat/` 让 WebMSSDK 跑完整链路(初始 web_id →
+    拉 msToken → 写 leveldb)。30s 太紧,用户经常被提前关窗。90s 留足
+    buffer。
+    - [main.py](src/doupool/main.py) `LoginService(keepalive_seconds=90.0)`
+    - [login/browser.py](src/doupool/login/browser.py) `__init__` 默认 30 → 90
+    - [login/service.py](src/doupool/login/service.py) 类型注解默认同步
+  - **refresh-tokens 等待时长 8s → 18s + 主动探测 WebMSSDK 落盘**
+    [api/app.py](src/doupool/api/app.py) `/api/accounts/{id}/refresh-tokens`
+    的 Playwright 等待从固定 `page.wait_for_timeout(8_000)` 改为
+    `page.wait_for_function(...)` 探 `__tea_cache_tokens_497858` /
+    `samantha_web_web_id` 写入 `localStorage`,命中即早退(典型 3-6s),
+    最长 18s,失败再等 2s 兜底 → `extract_webmssdk_tokens` 用真实 hint 提示
+    用户「profile 损坏」或「web_id 没落地」。
+  - **Chromium v100+ DPAPI cookie 加密兼容** Chromium v100 起
+    `cookies` 表的 `value` 列在 Windows 下被 DPAPI 加密,SQLite 读出来是
+    空字符串,真正值在 `encrypted_value` BLOB 里 —— 我们没有 win32 DPAPI
+    key 直接解密,改走「启动一个临时 Playwright persistent context,
+    Chromium 进程内用当前用户 DPAPI key 解密 → 调 `context.cookies()`」
+    的兜底路径。
+    - [video/browser.py](src/doupool/video/browser.py) `_read_chromium_cookies`
+      现在会检测 doubao.com 行是否存在 + 全部 `value` 为空 → 触发
+      `_read_chromium_cookies_via_browser` Playwright 兜底。
+    - 兜底函数走 `headless=True + --no-sandbox`,复用 refresh-tokens
+      刚关掉的同一个 profile_dir(避免 SingletonLock 冲突)。
+  - **hint 文案分三档** 用户根据提示就能定位问题:
+    1. `profile 里完全没有 web_id / device_id / msToken` —— 刚登录没
+       让 WebMSSDK 跑过(去浏览器访问 chat 主页停留 10-20 秒)
+    2. `localStorage 有部分字段但 web_id/device_id/msToken 全部缺失` ——
+       DPAPI / profile 损坏(建议删除 profile 目录后重新登录)
+    3. `msToken 缺失` —— 短期过期,直接点刷新就好
+
+### 改进
+
+- 没有任何纯 UI 改动 —— 全在 v0.2.36 已稳定的 token 状态页面透传真实 hint。
+- keepalive 计时器事件 `keepalive` / `succeeded` 继续复用,前端无需感知
+  keepalive 秒数变化。
+
 ## v0.2.36 - 2026-08-09
 
 ### 修复

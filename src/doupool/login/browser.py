@@ -495,7 +495,7 @@ class PlaywrightLoginRunner:
     让用户在那个浏览器窗口里访问 doubao.com/chat/ 生成 WebMSSDK token。
     """
 
-    def __init__(self, keepalive_seconds: float = 30.0):
+    def __init__(self, keepalive_seconds: float = 90.0):
         self.keepalive_seconds = keepalive_seconds
 
     def run(self, attempt_id, profile_dir: Path, emit, cancel_event: threading.Event):

@@ -161,7 +161,7 @@ class LoginService:
         timeout: float = 300,
         # v0.2.20:扫码成功后,保持浏览器打开 N 秒让用户访问
         # doubao.com/chat/ 生成 WebMSSDK token。0 = 关闭此功能(保留旧行为)。
-        keepalive_seconds: float = 30.0,
+        keepalive_seconds: float = 90.0,
     ):
         self.repository = repository
         self.runner = runner

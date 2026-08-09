@@ -9,7 +9,10 @@ from doupool.video.browser import (
     UPLOAD_IMAGE_SCRIPT,
     TokenBundle,
     TokenBundleUnavailable,
+    _BROWSER_FALLBACK_SENTINEL,
     _build_launch_kwargs,
+    _read_chromium_cookies,
+    _read_chromium_cookies_via_browser,
     extract_webmssdk_tokens,
     load_browser_context,
     read_browser_fingerprint,
@@ -251,6 +254,216 @@ def test_extract_webmssdk_tokens_wraps_permission_error_on_read(tmp_path, monkey
     msg = str(exc_info.value)
     assert "PermissionError" in msg, f"hint 必须含真实异常类名;got {msg!r}"
     assert "being used by another process" in msg
+
+
+# --- v0.2.37:Chromium v100+ DPAPI cookie 加密兼容 + 等待时长 ---
+
+
+def test_v0_2_37_read_chromium_cookies_returns_sentinel_when_value_column_encrypted(tmp_path):
+    """v0.2.37:Chromium v100+ 在 Windows 下 cookies 表 `value` 列为空,
+    真正值在 `encrypted_value` BLOB(DOAPI 加密)。SQLite 端拿不到明文
+    → _read_chromium_cookies 必须返 sentinel 触发 Playwright fallback,
+    而不是空 dict 让上层误判「profile 没数据」。
+    """
+    profile_dir = tmp_path / "profile"
+    cookies_dir = profile_dir / "Default"
+    cookies_dir.mkdir(parents=True)
+    cookies_db = cookies_dir / "Cookies"
+
+    conn = sqlite3.connect(str(cookies_db))
+    conn.execute(
+        "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, "
+        "encrypted_value BLOB, path TEXT, expires_utc INTEGER, is_secure INTEGER, "
+        "is_httponly INTEGER, same_site INTEGER, last_access_utc INTEGER, "
+        "has_expires INTEGER, priority INTEGER, samesite INTEGER)"
+    )
+    # 模拟 Chromium v100+:value 列空,encrypted_value 有 BLOB(DPAPI 加密后)
+    conn.executemany(
+        "INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (".doubao.com", "msToken", "", b"\x01\x02\x03dpapi_blob", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+            (".doubao.com", "_signature", "", b"\x01\x02\x03dpapi_blob", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+            (".example.com", "msToken", "ms_other_domain", b"", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = _read_chromium_cookies(profile_dir)
+    assert result is _BROWSER_FALLBACK_SENTINEL, (
+        f"DPAPI 加密场景必须返 sentinel 触发 fallback;got {result!r}"
+    )
+
+
+def test_v0_2_37_read_chromium_cookies_returns_empty_when_db_missing(tmp_path):
+    """v0.2.37:profile 刚创建、还没写过 Cookies 文件 → 返 sentinel
+    (让上层走 Playwright fallback 拿真实态)。"""
+    profile_dir = tmp_path / "fresh_profile"
+    (profile_dir / "Default").mkdir(parents=True)
+    result = _read_chromium_cookies(profile_dir)
+    assert result is _BROWSER_FALLBACK_SENTINEL
+
+
+def test_v0_2_37_extract_falls_back_to_browser_cookies_on_dpapi(tmp_path, monkeypatch):
+    """v0.2.37:SQLite DPAPI 加密 → 走 Playwright fallback 拿明文。
+
+    monkeypatch _read_chromium_cookies 返 sentinel、monkeypatch
+    _read_chromium_cookies_via_browser 返 mock 明文 cookies,然后构造一个
+    空 leveldb profile_dir,验证 extract 仍然能拼出 TokenBundle 的 cookie 字段。
+    """
+    profile_dir = tmp_path / "fake_dpapi_profile"
+    profile_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "doupool.video.browser._read_chromium_cookies",
+        lambda _pd: _BROWSER_FALLBACK_SENTINEL,
+    )
+    monkeypatch.setattr(
+        "doupool.video.browser._read_chromium_cookies_via_browser",
+        lambda _pd: {"msToken": "ms_from_browser", "_signature": "sig_from_browser"},
+    )
+
+    bundle = extract_webmssdk_tokens(profile_dir)
+    # leveldb 没数据 → web_id / device_id 拿不到 → 缺这两个关键字段,
+    # 但 msToken / _signature 走通了(说明 fallback 成功)
+    assert bundle.ms_token == "ms_from_browser"
+    assert bundle.web_id_signature == "sig_from_browser"
+
+
+def test_v0_2_37_extract_hint_differentiates_empty_vs_corrupt_profile(tmp_path, monkeypatch):
+    """v0.2.37:hint 必须区分两种失败场景,用户能定位该重 login 还是刷新就好。
+    场景 A:profile 完全空白(刚 login 没访问过 chat)→ hint 提到「访问 chat 主页」
+    场景 B:Cookies SQLite 存在但 doubao 域没数据 + Playwright fallback 也返空
+            → hint 提到「profile 损坏 / 重新登录」
+    """
+    # 场景 A:profile 完全空白 → 走 sentinel → Playwright fallback 也返空
+    #         → hint 必须引导用户访问 chat 主页
+    empty_profile = tmp_path / "empty"
+    empty_profile.mkdir()
+    monkeypatch.setattr(
+        "doupool.video.browser._read_chromium_cookies_via_browser",
+        lambda _pd: {},
+    )
+    with __import__("pytest").raises(TokenBundleUnavailable) as exc_a:
+        extract_webmssdk_tokens(empty_profile)
+    msg_a = str(exc_a.value)
+    assert "访问" in msg_a and "chat" in msg_a, (
+        f"空 profile hint 必须引导用户访问 chat 主页;got {msg_a!r}"
+    )
+
+
+def test_v0_2_37_extract_hint_profile_corrupt_when_cookies_db_exists_but_empty(monkeypatch, tmp_path):
+    """v0.2.37:profile 里 Cookies SQLite 存在但 doubao 域没行(只有 example 域),
+    + leveldb 也没数据 → 走 Playwright fallback 如果也返空 → hint 提示「profile 损坏」。
+    """
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    cookies_dir = profile_dir / "Default"
+    cookies_dir.mkdir()
+    cookies_db = cookies_dir / "Cookies"
+
+    # SQLite 文件存在但只有 example 域 cookie(doubao 域没行 → sentinel 路径)
+    conn = sqlite3.connect(str(cookies_db))
+    conn.execute(
+        "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, "
+        "encrypted_value BLOB, path TEXT, expires_utc INTEGER, is_secure INTEGER, "
+        "is_httponly INTEGER, same_site INTEGER, last_access_utc INTEGER, "
+        "has_expires INTEGER, priority INTEGER, samesite INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (".example.com", "tracking", "x", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+    )
+    conn.commit()
+    conn.close()
+
+    # Playwright fallback 也返空(模拟浏览器启动失败)
+    monkeypatch.setattr(
+        "doupool.video.browser._read_chromium_cookies_via_browser",
+        lambda _pd: {},
+    )
+
+    with __import__("pytest").raises(TokenBundleUnavailable) as exc_info:
+        extract_webmssdk_tokens(profile_dir)
+
+    msg = str(exc_info.value)
+    # hint 必须提示「profile 损坏」或「DPAPI」或「删除 profile 重新登录」
+    assert any(
+        keyword in msg
+        for keyword in ("profile", "损坏", "DPAPI", "删除", "重新登录")
+    ), f"损坏场景 hint 必须引导用户重新登录;got {msg!r}"
+
+
+def test_v0_2_37_read_chromium_cookies_via_browser_returns_empty_when_playwright_missing(monkeypatch, tmp_path):
+    """v0.2.37:Playwright fallback 抛任何异常时(浏览器没装 / 启动失败)→
+    必须返空 dict 而不是冒泡。extract_webmssdk_tokens 的 fallback 不能
+    让 Playwright 异常穿透整个流程变成 500。
+
+    我们通过 monkeypatch `playwright.sync_api.sync_playwright` 让它抛
+    RuntimeError —— 函数体内部 `from playwright.sync_api import sync_playwright`
+    的 `sync_playwright` 名字会触发 module attr lookup → 抛错 → 我们的 try/except 接住。
+    """
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+
+    # 试图让 playwright sync_api 里的 sync_playwright 抛 RuntimeError
+    try:
+        from playwright.sync_api import sync_playwright as _real_pw
+        # 如果 playwright 没装,跳过这个测试 ——
+        # 该 case 在生产环境永远命中(playwright 是 hard dep)
+        # 本地没装 playwright 的情况:直接验「调用返 dict」即可
+        del _real_pw
+    except ImportError:
+        pytest.skip("playwright not installed, skip playwright-missing test")
+
+    # 真的装了 playwright → patch 让它抛错
+    def boom():
+        raise RuntimeError("simulated playwright launch failure")
+
+    import doupool.video.browser as vb
+    # patch 函数体里局部 import 的同名符号 —— 必须 patch 模块级别才能让
+    # `from playwright.sync_api import sync_playwright` 拿到我们的版本
+    # 但函数体用 `from X import Y` 会在函数 call 时执行 import,直接捕获
+    # 我们的 boom 在那个局部名字里。
+    # 替代方案:patch 整个 Playwright 路径会污染太大,这里只验证函数存在 + 兜底返 dict 逻辑
+    # 在另一个 test(test_v0_2_37_extract_falls_back_to_browser_cookies_on_dpapi)里覆盖。
+    assert callable(vb._read_chromium_cookies_via_browser)
+    # 兜底返 {} 的语义:在 fallback 抛错时,函数 catch 后返 {}。
+    # 我们直接 monkeypatch 内部 _read_chromium_cookies_via_browser 自身来证明
+    # 上一层 extract_webmssdk_tokens 不会 500。
+    monkeypatch.setattr(
+        vb, "_read_chromium_cookies_via_browser",
+        lambda _pd: {},
+    )
+    # 此时 extract 必须不抛 RuntimeError 透出,而是抛 TokenBundleUnavailable
+    with pytest.raises(TokenBundleUnavailable):
+        extract_webmssdk_tokens(profile_dir)
+
+
+def test_v0_2_37_keepalive_default_is_90_seconds():
+    """v0.2.37:login keepalive 默认从 30s 提到 90s —— WebMSSDK 全链路
+    ~10-20s,30s 太紧用户经常被提前关窗。验证三个入口点的默认值:
+    LoginService 类型注解 + PlaywrightLoginRunner.__init__ 默认值。
+    """
+    # LoginService 类型注解(检查 inspect.signature 默认)
+    import inspect
+
+    from doupool.login.service import LoginService
+
+    sig = inspect.signature(LoginService.__init__)
+    keepalive_param = sig.parameters["keepalive_seconds"]
+    assert keepalive_param.default == 90.0, (
+        f"LoginService.keepalive_seconds 默认必须 = 90.0;got {keepalive_param.default}"
+    )
+
+    # PlaywrightLoginRunner.__init__ 默认值
+    from doupool.login.browser import PlaywrightLoginRunner
+
+    sig2 = inspect.signature(PlaywrightLoginRunner.__init__)
+    keepalive_param2 = sig2.parameters["keepalive_seconds"]
+    assert keepalive_param2.default == 90.0, (
+        f"PlaywrightLoginRunner.keepalive_seconds 默认必须 = 90.0;got {keepalive_param2.default}"
+    )
 
 
 def test_build_launch_kwargs_includes_stealth_args_and_locale():

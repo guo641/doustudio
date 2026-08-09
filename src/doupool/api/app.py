@@ -930,8 +930,31 @@ def create_app(
                         wait_until="domcontentloaded",
                         timeout=30_000,
                     )
-                    # WebMSSDK 跑 msToken 缓存通常 3-6 秒,留 8 秒 buffer
-                    page.wait_for_timeout(8_000)
+                    # v0.2.37:WebMSSDK 跑完整条链路(init → 拉 msToken → 写
+                    # __tea_cache_tokens_497858 → 写 samantha_web_web_id)
+                    # 实测冷启动 10-25s,8s 等不够 → 用户连续点 5 次还是
+                    # 抽不到 web_id。把 wait 提到 18s,并显式 wait_for_function
+                    # 探到 __tea_cache_tokens_497858 落盘就早退。
+                    web_id_ready = """
+                        () => {
+                            try {
+                                const t = JSON.parse(localStorage.getItem('__tea_cache_tokens_497858') || '{}');
+                                if (t && (t.web_id || t.user_unique_id)) return true;
+                            } catch (e) {}
+                            try {
+                                const s = JSON.parse(localStorage.getItem('samantha_web_web_id') || '{}');
+                                if (s && s.web_id) return true;
+                            } catch (e) {}
+                            return false;
+                        }
+                    """
+                    try:
+                        page.wait_for_function(web_id_ready, timeout=18_000)
+                    except Exception:
+                        # 18s 还是没等到 → 走兜底 wait_for_timeout 让进程
+                        # 自然 close,然后 extract 会用真实兜底 hint 提示
+                        # 用户「profile 损坏」或「web_id 没落地」。
+                        page.wait_for_timeout(2_000)
                 finally:
                     try:
                         ctx.close()

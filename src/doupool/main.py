@@ -42,12 +42,14 @@ def main() -> None:
     settings_service = SettingsService(repository, settings.data_dir, manager.path)
     service = LoginService(
         repository,
-        # v0.2.20:扫码成功后保持浏览器窗口 30 秒,让用户在那个窗口里
-        # 访问 doubao.com/chat/ 生成 WebMSSDK token。
-        PlaywrightLoginRunner(keepalive_seconds=30.0),
+        # v0.2.37:keepalive 从 30s 提到 90s —— 实测 WebMSSDK 跑完写入
+        # leveldb 全链路 ~10-20s,但用户需要先看到「扫码成功」→ 手动切
+        # chat 主页 → 让 SDK 跑 → 等落地,30s 太紧,用户经常被提前关窗。
+        # 90s 留足 buffer(初始 web_id → msToken 落地 → device_id 落地)。
+        PlaywrightLoginRunner(keepalive_seconds=90.0),
         settings.data_dir / "profiles",
         settings.login_timeout_seconds,
-        keepalive_seconds=30.0,
+        keepalive_seconds=90.0,
     )
     video_runner = PlaywrightVideoRunner()
     # v0.2.27:把 settings 里的全局超时默认值转成秒喂给 runner.timeout。
