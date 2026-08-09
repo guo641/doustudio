@@ -112,6 +112,10 @@ def _read_chromium_cookies(profile_dir: Path) -> dict[str, str]:
         return {}
 
     tmp = db_path.with_suffix(".doupool.read.tmp")
+    # v0.2.36:Chromium 在用时 read_bytes / connect 可能抛 PermissionError /
+    # DatabaseError / OperationalError(损坏文件 / 文件锁 / io error),全都归到
+    # TokenBundleUnavailable,让上层 endpoint 一处 catch 就能拿到真实原因
+    # 而不是 500 给前端一个「token 状态加载失败」的模糊兜底。
     try:
         try:
             tmp.write_bytes(db_path.read_bytes())
@@ -133,6 +137,11 @@ def _read_chromium_cookies(profile_dir: Path) -> dict[str, str]:
             return cookies
         finally:
             conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise TokenBundleUnavailable(
+            f"无法读取 Chromium Cookies({db_path.name}):{exc.__class__.__name__}:{exc}; "
+            "通常是 Chromium 正在使用该 profile(关闭浏览器窗口后再试)或 Cookies 文件损坏"
+        ) from exc
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -157,36 +166,43 @@ def _read_chromium_local_storage(profile_dir: Path) -> dict[str, str]:
     text = raw.decode("latin-1", errors="replace")
 
     out: dict[str, str] = {}
-    # __tea_cache_tokens_497858 是一个 JSON 串:{user_unique_id, web_id, ...}
-    tea_match = re.search(rb'__tea_cache_tokens_497858(.+?)</script>', raw, re.DOTALL)
-    if tea_match:
-        try:
-            obj = json.loads(tea_match.group(1).decode("utf-8", errors="replace"))
-            if isinstance(obj, dict):
-                if obj.get("web_id"):
-                    out["web_id"] = str(obj["web_id"])
-                if obj.get("user_unique_id"):
-                    out["tea_uuid"] = str(obj["user_unique_id"])
-        except (ValueError, TypeError):
-            pass
-    # samantha_web_web_id 是另一个 JSON:{web_id, ...}
-    sam_match = re.search(rb'samantha_web_web_id(.+?)</script>', raw, re.DOTALL)
-    if sam_match:
-        try:
-            obj = json.loads(sam_match.group(1).decode("utf-8", errors="replace"))
-            if isinstance(obj, dict) and obj.get("web_id"):
-                out["device_id"] = str(obj["web_id"])
-        except (ValueError, TypeError):
-            pass
-    # 备用:直接 regex 抓 web_id 的 string
-    if "web_id" not in out:
-        m = re.search(r'"web_id"\s*:\s*"([A-Za-z0-9_\-]{8,80})"', text)
-        if m:
-            out["web_id"] = m.group(1)
-    if "tea_uuid" not in out:
-        m = re.search(r'"user_unique_id"\s*:\s*"([A-Za-z0-9_\-]{8,80})"', text)
-        if m:
-            out["tea_uuid"] = m.group(1)
+    # v0.2.36:把所有 raw decode + regex + json.loads 异常都吞掉(leveldb .log 可能
+    # 在 Chromium 写入时被截断,读到半个 JSON → json.loads 抛 ValueError)。
+    # 让上层只通过 web_id 是否缺失来判定 TokenBundleUnavailable,而不是 500。
+    try:
+        # __tea_cache_tokens_497858 是一个 JSON 串:{user_unique_id, web_id, ...}
+        tea_match = re.search(rb'__tea_cache_tokens_497858(.+?)</script>', raw, re.DOTALL)
+        if tea_match:
+            try:
+                obj = json.loads(tea_match.group(1).decode("utf-8", errors="replace"))
+                if isinstance(obj, dict):
+                    if obj.get("web_id"):
+                        out["web_id"] = str(obj["web_id"])
+                    if obj.get("user_unique_id"):
+                        out["tea_uuid"] = str(obj["user_unique_id"])
+            except (ValueError, TypeError):
+                pass
+        # samantha_web_web_id 是另一个 JSON:{web_id, ...}
+        sam_match = re.search(rb'samantha_web_web_id(.+?)</script>', raw, re.DOTALL)
+        if sam_match:
+            try:
+                obj = json.loads(sam_match.group(1).decode("utf-8", errors="replace"))
+                if isinstance(obj, dict) and obj.get("web_id"):
+                    out["device_id"] = str(obj["web_id"])
+            except (ValueError, TypeError):
+                pass
+        # 备用:直接 regex 抓 web_id 的 string
+        if "web_id" not in out:
+            m = re.search(r'"web_id"\s*:\s*"([A-Za-z0-9_\-]{8,80})"', text)
+            if m:
+                out["web_id"] = m.group(1)
+        if "tea_uuid" not in out:
+            m = re.search(r'"user_unique_id"\s*:\s*"([A-Za-z0-9_\-]{8,80})"', text)
+            if m:
+                out["tea_uuid"] = m.group(1)
+    except Exception:
+        # 任何 decode / regex 异常都吞掉,返回部分结果(可能 web_id 缺失 → 上层 raise TokenBundleUnavailable)
+        pass
     return out
 
 

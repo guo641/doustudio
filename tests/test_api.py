@@ -961,6 +961,85 @@ def test_get_webmssdk_tokens_404_when_account_missing(repository, tmp_path, monk
     assert "account not found" in response.json()["detail"]
 
 
+def test_get_webmssdk_tokens_returns_available_false_on_unexpected_exception(
+    repository, tmp_path, temp_profile, monkeypatch,
+):
+    """v0.2.36:extract 抛了非 TokenBundleUnavailable 异常(profile 路径含特殊字符 /
+    sqlite3.DatabaseError 漏网 / 其他 OSError)→ 不能 500 让前端拿不到原因。
+
+    场景:账号已登录,token bundle 抽不到(可能 web_id 缺失或 SQLite 损坏)。
+    旧版会 500 → 前端用兜底文案「token 状态加载失败」(用户迷惑:账号明明已登录)。
+    现在应该 200 + available=False + hint 携带真实异常类名,让前端/用户能区分
+    "真的没 token"vs"系统读不到"。
+    """
+    from doupool.db.models import Account
+
+    account = Account.create(
+        id="account-broken", display_name="损坏 profile", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+
+    def fake_extract(profile_dir):
+        # 模拟:Profile 路径上的 SQLite 文件被损坏,抛 sqlite3.DatabaseError
+        # —— 不是预期的 TokenBundleUnavailable,旧版本会 500。
+        import sqlite3
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr("doupool.api.app.extract_webmssdk_tokens", fake_extract)
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.get(
+        f"/api/accounts/{account.id}/webmssdk-tokens",
+        headers={"X-DouPool-Token": "secret"},
+    )
+
+    assert response.status_code == 200, (
+        "v0.2.36: 非预期异常也应返回 200 + available=False,不能 500 让前端崩溃"
+    )
+    payload = response.json()
+    assert payload["available"] is False
+    assert "DatabaseError" in payload["hint"], (
+        f"v0.2.36: hint 必须携带真实异常类型,让前端能定位根因; got {payload['hint']!r}"
+    )
+    assert "database disk image is malformed" in payload["hint"]
+    assert payload["web_id"] == ""
+    assert payload["ms_token_preview"] == ""
+
+
+def test_get_webmssdk_tokens_returns_available_false_on_runtime_error(
+    repository, tmp_path, temp_profile, monkeypatch,
+):
+    """v0.2.36:兜底异常路径 —— extract 抛 RuntimeError(比如路径含非法字符 /
+    Windows 长路径 / 其他 ProfileDir 异常)也走 200 + available=False 而非 500。"""
+    from doupool.db.models import Account
+
+    account = Account.create(
+        id="account-rt", display_name="RuntimeError", doubao_user_id="u",
+        profile_dir=temp_profile,
+    )
+
+    def fake_extract(profile_dir):
+        raise RuntimeError("profile dir 含非法字符 ✗")
+
+    monkeypatch.setattr("doupool.api.app.extract_webmssdk_tokens", fake_extract)
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.get(
+        f"/api/accounts/{account.id}/webmssdk-tokens",
+        headers={"X-DouPool-Token": "secret"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is False
+    assert "RuntimeError" in payload["hint"]
+    assert "profile dir 含非法字符" in payload["hint"]
+
+
 def test_get_webmssdk_tokens_requires_auth(repository, tmp_path):
     """v0.2.17:无 token → 401,跟其他端点一致。"""
     login = LoginService(repository, IdleRunner(), tmp_path / "profiles")

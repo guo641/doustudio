@@ -2,6 +2,58 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.36 - 2026-08-09
+
+### 修复
+
+- **「token 状态加载失败」成无信息兜底** 用户扫码
+  登录成功后,Token 状态页却显示「token 状态加载
+  失败」—— 账号明明已经登录,token 应该有效。根
+  因:`/api/accounts/{id}/webmssdk-tokens` 只
+  catch 了 `TokenBundleUnavailable`,其他意外
+  (Chromium Cookies SQLite 损坏、文件被锁、权限
+  不足、`sqlite3.DatabaseError` 等)直接 500,前端
+  toast 拿到一个干瘪的「token 状态加载失败」,完全
+  看不到根因。
+  - 后端[api/app.py](src/doupool/api/app.py)
+    `get_webmssdk_tokens` 改为「所有异常都归到
+    `available: false` 返 200」,`hint` 字段直接
+    带上异常类名 + 原始消息(`DatabaseError: file
+    is not a database` / `PermissionError: ... being
+    used by another process` 等),前端照常展示
+    「不可用」并提示「关闭浏览器窗口后再试」。
+  - 后端[browser.py](src/doupool/video/browser.py)
+    `_read_chromium_cookies` 把 `OSError` +
+    `sqlite3.Error` 统一归到
+    `TokenBundleUnavailable`,`_read_chromium_local
+    _storage` 全路径包 `try/except Exception` —— 任
+    何意外不再冒泡到 endpoint 触发 500。
+  - 测试:[test_api.py](tests/test_api.py) 新增
+    `test_get_webmssdk_tokens_returns_available
+    _false_on_unexpected_exception`(DatabaseError)
+    + `test_get_webmssdk_tokens_returns_available
+    _false_on_runtime_error`;[test_video_browser.py]
+    (tests/test_video_browser.py) 新增
+    `test_extract_webmssdk_tokens_wraps_corrupted
+    _cookies_sqlite` + `test_extract_webmssdk_tokens
+    _wraps_permission_error_on_read`。
+
+### 改进
+
+- **json() 兜底文案带 HTTP 状态 + URL** 之前前端
+  `json()` helper 在 response 非 2xx 时只回吐调用
+  方传的固定文案(「刷新 token 失败」「任务创建
+  失败」...),用户看不到真实根因。现在 helper 自
+  动把 HTTP 状态码 + 请求 URL + 服务端响应体(优先
+  抽 FastAPI 标准 `detail`,否则贴前 240 字)拼到
+  Error message 里,典型输出变成
+  `刷新 token 失败 (POST /api/accounts/xxx/
+  refresh-tokens → 500): DatabaseError: file is
+  not a database`,用户不需要翻后端日志也能定位到
+  哪条 API 哪条异常。
+  - 实现:[api.ts](frontend/src/api.ts) `json()`
+    helper 替换。
+
 ## v0.2.35 - 2026-08-09
 
 ### 新增

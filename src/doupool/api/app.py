@@ -869,6 +869,27 @@ def create_app(
                 "fetched_at": 0.0,
                 "age_seconds": None,
             }
+        except Exception as exc:
+            # v0.2.36:兜底所有意外(profile 路径含特殊字符 / Windows 长路径 /
+            # sqlite3.DatabaseError 漏网 / 其他 OSError),避免前端拿到 500
+            # + 「token 状态加载失败」这种毫无信息量的兜底文案。改成 200 +
+            # available=False + hint 携带真实异常(账号"已登录"标识与 token
+            # 状态是两条独立路径,不应当让一个 IO 异常把整行 token 状态搞崩)。
+            logging.getLogger("doupool.api").exception(
+                "读取 token bundle 失败: account=%s profile=%s", account_id, profile_dir,
+            )
+            return {
+                "available": False,
+                "hint": f"{exc.__class__.__name__}:{exc}",
+                "ms_token_preview": "",
+                "web_id": "",
+                "web_id_signature": "",
+                "device_id": "",
+                "tea_uuid": "",
+                "pc_version": "",
+                "fetched_at": 0.0,
+                "age_seconds": None,
+            }
         return _token_bundle_dict(bundle, available=True)
 
     @app.post("/api/accounts/{account_id}/refresh-tokens", status_code=202)

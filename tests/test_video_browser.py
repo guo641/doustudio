@@ -190,6 +190,69 @@ def test_extract_webmssdk_tokens_raises_when_profile_dir_missing(tmp_path):
         extract_webmssdk_tokens(tmp_path / "empty_profile")
 
 
+def test_extract_webmssdk_tokens_wraps_corrupted_cookies_sqlite(tmp_path, monkeypatch):
+    """v0.2.36:Cookies SQLite 损坏(老版直接 raise sqlite3.DatabaseError →
+    500 给前端「token 状态加载失败」)→ 必须归一到 TokenBundleUnavailable,
+    让上层 endpoint 拿到真实原因。
+
+    场景:Chromium profile 的 Cookies SQLite 被损坏 / 锁占用时,read_bytes
+    可能成功但 sqlite3.connect 抛 DatabaseError。extract 必须 catch 并把
+    真实异常类名 + 消息塞进 hint,这样用户能看到「Cookies 文件损坏」而不是
+    「token 状态加载失败」这种没用的兜底。
+    """
+    profile_dir = tmp_path / "profile"
+    cookies_dir = profile_dir / "Default"
+    cookies_dir.mkdir(parents=True)
+    cookies_db = cookies_dir / "Cookies"
+    cookies_db.write_bytes(b"this is not a sqlite database")  # 损坏
+
+    # monkeypatch sqlite3.connect 让它在损坏文件上抛 DatabaseError
+    import sqlite3 as _sqlite3
+    orig_connect = _sqlite3.connect
+    calls = {"n": 0}
+
+    def broken_connect(*args, **kwargs):
+        calls["n"] += 1
+        # 第一次连接:tmp 拷贝(ro uri)抛 DatabaseError(因为内容不是 sqlite)
+        raise _sqlite3.DatabaseError("file is not a database")
+
+    monkeypatch.setattr(_sqlite3, "connect", broken_connect)
+
+    with __import__("pytest").raises(TokenBundleUnavailable) as exc_info:
+        extract_webmssdk_tokens(profile_dir)
+
+    msg = str(exc_info.value)
+    assert "DatabaseError" in msg, f"hint 必须含真实异常类名;got {msg!r}"
+    assert "file is not a database" in msg
+    assert calls["n"] >= 1
+
+
+def test_extract_webmssdk_tokens_wraps_permission_error_on_read(tmp_path, monkeypatch):
+    """v0.2.36:read_bytes 抛 PermissionError(Chromium 正在用 profile) →
+    必须归到 TokenBundleUnavailable,不再 500。"""
+    profile_dir = tmp_path / "profile"
+    cookies_dir = profile_dir / "Default"
+    cookies_dir.mkdir(parents=True)
+    cookies_db = cookies_dir / "Cookies"
+    cookies_db.write_bytes(b"x")
+
+    real_read_bytes = Path.read_bytes
+
+    def broken_read_bytes(self, *args, **kwargs):
+        if str(self).endswith("Cookies"):
+            raise PermissionError("The process cannot access the file because it is being used by another process")
+        return real_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", broken_read_bytes)
+
+    with __import__("pytest").raises(TokenBundleUnavailable) as exc_info:
+        extract_webmssdk_tokens(profile_dir)
+
+    msg = str(exc_info.value)
+    assert "PermissionError" in msg, f"hint 必须含真实异常类名;got {msg!r}"
+    assert "being used by another process" in msg
+
+
 def test_build_launch_kwargs_includes_stealth_args_and_locale():
     """v0.2.17:_build_launch_kwargs 必须包含反自动化开关 + zh-CN 时区/语言。"""
     kwargs = _build_launch_kwargs()

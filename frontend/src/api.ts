@@ -9,13 +9,33 @@ const headers = { 'X-DouPool-Token': token, 'Content-Type': 'application/json' }
 
 async function json(response: Response, message: string) {
   if (!response.ok) {
-    let detail = message;
+    // v0.2.36: 错误信息不再只有「刷新 token 失败」这种干瘪文案,
+    // 把 HTTP 状态码 + 请求 URL + 服务端响应体一起塞进去,这样用户能直接看到
+    // 「刷新 token 失败(POST /api/.../refresh-tokens → 500): DatabaseError: ...」,
+    // 不用再翻后端日志也能定位到根因(尤其是 Chromium Cookies 损坏、权限锁、
+    // sqlite3 报错这种之前被笼统吞掉的情况)。
+    let bodySnippet = '';
     try {
-      detail = (await response.json()).detail || message;
+      const raw = await response.text();
+      if (raw) {
+        // 截前 240 字避免前端 toast 被几 MB 的 Python traceback 撑爆
+        bodySnippet = raw.length > 240 ? raw.slice(0, 240) + '…' : raw;
+      }
     } catch {
-      /* keep default */
+      /* 响应体读不到(网络中断 / 流被关闭)→ 留空,后面 'no body' 兜底 */
     }
-    throw new Error(detail);
+    // FastAPI 标准错误格式 { "detail": "..." } 优先取 detail;非 JSON 时直接展示原文。
+    let detail = '';
+    if (bodySnippet) {
+      try {
+        const parsed = JSON.parse(bodySnippet);
+        if (parsed && typeof parsed.detail === 'string') detail = parsed.detail;
+      } catch {
+        /* 不是 JSON,继续用 bodySnippet 兜底 */
+      }
+    }
+    const tail = detail || bodySnippet || 'no body';
+    throw new Error(`${message} (${response.status} ${response.url}): ${tail}`);
   }
   if (response.status === 204) return undefined;
   return response.json();
