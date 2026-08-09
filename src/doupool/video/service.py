@@ -207,56 +207,45 @@ class VideoTaskService:
         else:
             effective_group_id = None
         first_task = None
-        # v0.2.33:同组粘同账号 —— 同 group_id 的后续 prompt 沿用首 task 的
-        # 账号(只对首 task 重新选),但每个 task 仍要单独走 CAS 预扣(总扣减 =
-        # sum(cost),不会因为粘同账号而少扣)。
-        sticky_account_id: str | None = None
+        # v0.2.35:跨账号凑余额 —— 每个 task 独立选 least_used,不再 sticky。
+        # 字段 sticky_account_id 保留在代码中作兼容占位,但实际不读(完全去掉
+        # 同组粘同账号逻辑)。每个 task 走 choose_and_reserve_account(自带
+        # max_attempts=8 重试),选不到再 fallback 到队列(queued,等下次调度)。
         # v0.2.33:start() 路径失败累积 —— 任意一条预扣失败时,把已成功的
         # 预扣回退掉,不让用户看到"任务列表出现但实际没账号"的孤儿。
         pre_charged_to_refund: list[tuple[str, int, str]] = []
+        # v0.2.35:逐条 prompt 的 partial_rejected 列表 —— 任一条选不到可用账号
+        # 且 caller 未显式指定 account_id 时,把这条 prompt 加进去,最终
+        # API 返回 200 OK + partial_rejected 给前端 Toast 提示用户「这几条
+        # 暂时排不进,稍候自动重试」。
+        partial_rejected: list[dict] = []
         try:
             for index, p in enumerate(prompt_list, start=1):
-                # caller 显式指定 account_id(API 单点指定)→ 强制走该账号,
-                # 不走 sticky 也不走 select_available。否则按 sticky 选。
-                if account_id:
-                    target_account_id = account_id
-                elif sticky_account_id is not None:
-                    target_account_id = sticky_account_id
-                else:
-                    target_account_id = None
-
-                # v0.2.33:预扣 —— 按 cost 选账号并原子扣额度。
-                # 首发(无 target_account_id):无账号可选时回落地到「不绑账号」,
-                # 任务保持 queued,等 _run_inner / resume_queued 之后重选;
-                # 不在此处抛错 —— 沿用 v0.2.9 起「提交即排队,无可用账号不报错」语义。
-                # 显式指定 / sticky 复用(target_account_id 非 None):预扣失败
-                # 立即抛 NoAvailableAccount —— 用户已锁定该账号,失败 = 不能做。
                 cost = quota_cost(model, duration)
-                if target_account_id is not None:
-                    # 显式指定 / sticky 复用:对单一账号做 CAS 预扣,失败立即感知
+
+                if account_id:
+                    # 显式指定:对该账号做 CAS,失败抛 NoAvailableAccount
+                    # (v0.2.33 起的语义保留 —— caller 显式锁账号,失败 = 报错)
                     reserved = self._reserve_for_account(
-                        target_account_id, by=cost, daily_quotas=self.settings_service.get_daily_quotas(),
+                        account_id, by=cost, daily_quotas=self.settings_service.get_daily_quotas(),
                     )
+                    if reserved is None:
+                        raise NoAvailableAccount(
+                            "无可用账号或配额已用完(v0.2.33 显式指定路径)"
+                        )
                 else:
-                    # 首 task / 跨 batch 自由选择:走原子 select+reserve
+                    # v0.2.35:跨账号凑余额 —— 走 choose_and_reserve_account
+                    # (least_used + max_attempts=8 CAS 重试)。单次调用本身
+                    # 已是「选 + 预扣」的原子组合,失败表示:全账号 shared 桶都
+                    # 没空间放 cost,自然 fallback 到 queued。
                     reserved = self.repository.choose_and_reserve_account(
                         self.settings_service.get_daily_quotas(),
                         by=cost,
                         strategy="least_used",
                     )
-                if reserved is None and target_account_id is not None:
-                    # 显式指定 / sticky 复用:预扣失败 —— 回退已成功的预扣,抛错
-                    raise NoAvailableAccount(
-                        "无可用账号或配额已用完(v0.2.33 预扣失败)"
-                    )
-                if reserved is None:
-                    # 首 task 选不到账号:不抛错,任务保留 queued 等下次调度
-                    # (v0.2.9 起的语义);不走预扣路径,task 也不绑账号。
-                    reserved_account = None
-                else:
+
+                if reserved is not None:
                     reserved_account = reserved
-                if reserved_account is not None:
-                    sticky_account_id = reserved_account.id
                     task = self.repository.create_video_task(
                         reserved_account.id,
                         p,
@@ -277,7 +266,10 @@ class VideoTaskService:
                 else:
                     # 无可用账号 —— 创建 queued 任务(不绑账号),等 resume_queued
                     # 或下次 _run_inner 看到 status=queued + 无 account_id 时走默认
-                    # 「账号全满,保持 queued」分支。
+                    # 「账号全满,保持 queued」分支。同时加入 partial_rejected,
+                    # API 返回 200 OK 时给前端 Toast 提示用户「这几条 prompt 暂时
+                    # 排不进」,让用户知道发生了什么(之前 v0.2.33 的行为是
+                    # 静默 queued,用户看不到原因)。
                     task = self.repository.create_video_task(
                         None, p, model, ratio, duration,
                         mode=mode,
@@ -286,14 +278,21 @@ class VideoTaskService:
                         group_index=index if effective_group_id else 0,
                         callback_url=callback_url,
                     )
-                    # 仍调用 _schedule —— _run_inner 跑起来后选不到账号就保持
-                    # queued,和 v0.2.32 的行为一致(测试也只断言 status=queued)。
+                    # v0.2.35:仍调用 _schedule —— _run_inner 跑起来后选不到
+                    # 账号就保持 queued,和 v0.2.33 的行为一致。
                     self._schedule(task.id)
+                    partial_rejected.append({
+                        "index": index,
+                        "prompt": p,
+                        "reason": "所有账号今日共享额度已用完,任务已入队稍后重试",
+                    })
                 if first_task is None:
                     first_task = task
             # 全部预扣成功 —— 清空退款队列(失败回滚不再触发)
             pre_charged_to_refund.clear()
-            return first_task
+            # v0.2.35:跨账号凑余额 —— start() 返回 (first_task, partial_rejected)
+            # 二元组给 API 端组装 {task, partial_rejected} 响应。
+            return first_task, partial_rejected
         except Exception:
             # 任一条预扣失败 / 异常 —— 回退已成功的预扣,避免孤儿扣款
             for acc_id, by_val, _model in pre_charged_to_refund:
@@ -748,6 +747,100 @@ class VideoTaskService:
             "video task deleted",
             extra={"event": "video_task_deleted", "task_id": task_id, "status": task.status},
         )
+
+    # ---------- v0.2.35:一键清除(批量 + 退额度) ----------
+    _CLEAR_COMPLETED_STATUSES: tuple[str, ...] = ("succeeded", "failed", "cancelled")
+
+    def clear_tasks(self, target: str) -> int:
+        """v0.2.35:一键清除任务。
+
+        target:
+          - "completed" —— 清 succeeded / failed / cancelled
+          - "queued"    —— 清 queued(running 状态绝对不动,防打断正在生成)
+
+        对每条任务:如果还在 `_pre_charged_tasks` 里 → 走预扣退路(顶层退);
+        否则无额度顾虑。退完调用 repository.delete_video_tasks_by_ids 物理删。
+
+        返回实际删除的任务数。
+        """
+        if target == "completed":
+            statuses = self._CLEAR_COMPLETED_STATUSES
+        elif target == "queued":
+            statuses = ("queued",)
+        else:
+            raise ValueError(f"未知清除目标: {target!r}")
+
+        tasks = self.repository.list_video_tasks_by_statuses(statuses)
+        if not tasks:
+            return 0
+
+        refunded_count = 0
+        refunded_total = 0
+        for task in tasks:
+            # 优先 _pre_charged_tasks 在内存里有记录 —— start() 预扣过;
+            # 否则查 DB(进程重启后内存失的孤儿预扣)。
+            entry = self._pre_charged_tasks.pop(task.id, None)
+            if entry is None:
+                entry = self._derive_pre_charge_from_db(task.id)
+            if entry is None:
+                continue
+            acc_id, by_val, _mdl = entry
+            try:
+                self.repository.decrement_account_quota(acc_id, model=_mdl, by=by_val)
+                refunded_count += 1
+                refunded_total += by_val
+            except Exception as exc:  # noqa: BLE001 —— 退额度失败不阻断清任务
+                self.logger.warning(
+                    "v0.2.35 批量清除退额度失败 task=%s acc=%s err=%s",
+                    task.id, acc_id, exc,
+                    extra={
+                        "event": "video_clear_refund_failed",
+                        "task_id": task.id,
+                        "account_id": acc_id,
+                        "error": str(exc),
+                    },
+                )
+
+        deleted = self.repository.delete_video_tasks_by_ids([t.id for t in tasks])
+        self.logger.info(
+            "v0.2.35 批量清除 target=%s deleted=%d refunded=%d (total %d 点)",
+            target, deleted, refunded_count, refunded_total,
+            extra={
+                "event": "video_tasks_cleared",
+                "target": target,
+                "deleted_count": deleted,
+                "refunded_count": refunded_count,
+                "refunded_total": refunded_total,
+            },
+        )
+        return deleted
+
+    def clear_results(self, *, downloaded_only: bool = False) -> int:
+        """v0.2.35:一键清除结果(只动 succeeded)。
+
+        downloaded_only=True  —— 只清 `clean_video_url OR result_url` 不为 NULL 的
+                                  (用户已经下载过 / 有可用 URL 的任务)
+        downloaded_only=False —— 清全部 succeeded
+
+        succeeded 任务在生成成功时已结算过额度,无需退额度(豆包扣过的已经扣过)。
+        只删 DB row,本地视频文件保留(用户已经下到本地的归用户管)。
+        """
+        tasks = self.repository.list_succeeded_results(
+            with_download_url=True if downloaded_only else None,
+        )
+        if not tasks:
+            return 0
+        deleted = self.repository.delete_video_tasks_by_ids([t.id for t in tasks])
+        self.logger.info(
+            "v0.2.35 批量清除结果 downloaded_only=%s deleted=%d",
+            downloaded_only, deleted,
+            extra={
+                "event": "video_results_cleared",
+                "downloaded_only": downloaded_only,
+                "deleted_count": deleted,
+            },
+        )
+        return deleted
 
     async def _retry_result_inner(
         self, task_id: str, profile_dir: str, cancellation: threading.Event

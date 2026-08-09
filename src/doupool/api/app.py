@@ -117,6 +117,41 @@ def _account_dict(account: Account, daily_quotas: dict[str, int] | None = None) 
     }
 
 
+def _sanitize_filename_part(text: str, max_len: int = 12) -> str:
+    """v0.2.35:把 prompt 截前 12 字符 + 清洗 Windows/Unix 非法字符。
+
+    Windows 不允许 \\ / : * ? " < > | 共 9 个,加控制字符(< 0x20)。
+    把不可用字符替换成下划线,前后空白裁掉,空字符串兜底为 "video"。
+    """
+    if not text:
+        return "video"
+    cleaned = []
+    for ch in text:
+        if ch.isprintable() and ch not in '\\/:*?"<>|\r\n\t':
+            cleaned.append(ch)
+        else:
+            cleaned.append("_")
+    result = "".join(cleaned).strip().strip(".")[:max_len]
+    return result or "video"
+
+
+def _build_download_filename(task) -> str:
+    """v0.2.35:批量下载命名 —— `{group_index:02d}_{HHMMSS}_{prompt前12字符}[-clean].mp4`。
+
+    单条任务(group_index=0)同样落到 01:统一格式方便排序。
+    -clean 后缀优先于重名去重 N(无水印版本始终命名为 -clean.mp4,
+    原画重名才加 -2/-3)。
+    """
+    group_index = getattr(task, "group_index", 0) or 0
+    index_str = f"{group_index:02d}"
+    ts = task.created_at.strftime("%H%M%S")
+    name_part = _sanitize_filename_part(task.prompt, max_len=12)
+    stem = f"{index_str}_{ts}_{name_part}"
+    if getattr(task, "clean_video_url", None):
+        stem = f"{stem}-clean"
+    return f"{stem}.mp4"
+
+
 def _video_task_dict(task, daily_quota: int = 50) -> dict:
     account = task.account if task.account_id else None
     image_count = 0
@@ -157,6 +192,8 @@ def _video_task_dict(task, daily_quota: int = 50) -> dict:
         "error": task.error_message,
         "created_at": task.created_at.isoformat(),
         "updated_at": task.updated_at.isoformat(),
+        # v0.2.35:批量下载命名 —— 单条下载建议文件名,与 group_download 共用
+        "download_filename": _build_download_filename(task),
     }
 
 
@@ -457,7 +494,7 @@ def create_app(
         quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
         return [_video_task_dict(t, quotas["shared"]) for t in repository.list_tasks_by_group(group_id)]
 
-    @app.post("/api/video-tasks", status_code=202)
+    @app.post("/api/video-tasks", status_code=200)
     async def create_video_task(
         body: CreateVideoTaskBody,
         x_doupool_token: str | None = Header(default=None),
@@ -477,11 +514,18 @@ def create_app(
             # v0.2.9:callback_url 直接透传给 service,service 负责入库
             # 与异步派发;这里不做 scheme 校验(让 dispatcher 留痕 callback_status=
             # 'failed' 即可,422 拒绝会让前端拿不到任务 ID,反而难排查)。
-            task = video_service.start(**payload)
+            # v0.2.35:跨账号凑余额 —— start() 改返回 (first_task, partial_rejected)
+            # 二元组;200 OK 响应 + partial_rejected 给前端 Toast,不再是 202。
+            task, partial_rejected = video_service.start(**payload)
         except (ValueError, NoAvailableAccount) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
-        return _video_task_dict(task, quotas["shared"])
+        # v0.2.35:把 task + partial_rejected 包成 dict 返回,
+        # partial_rejected 给前端 Toast 提示「这几条 prompt 暂时排不进」。
+        return {
+            "task": _video_task_dict(task, quotas["shared"]),
+            "partial_rejected": partial_rejected,
+        }
 
     @app.post("/api/requests/{task_id}/retry-result", status_code=202)
     async def retry_result(
@@ -634,12 +678,8 @@ def create_app(
                     url = task.clean_video_url or task.result_url
                     if not url:
                         continue
-                    # clean 标记优先于重名后缀:clean_video 始终命名为 -clean.mp4
-                    stem = (
-                        f"doubao-{task.id}-clean"
-                        if task.clean_video_url
-                        else f"doubao-{task.id}"
-                    )
+                    # v0.2.35:批量下载命名 —— 与 _video_task_dict.download_filename 同源
+                    stem = _build_download_filename(task).removesuffix(".mp4")
                     target = batch_folder / f"{stem}.mp4"
                     suffix_n = 2
                     while target.exists():
@@ -710,6 +750,73 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # ---------- v0.2.35:一键清除任务 + 一键清除结果 ----------
+
+    @app.post("/api/video-tasks/clear-completed")
+    def clear_completed_video_tasks(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.35:一键清除已完成任务(succeeded / failed / cancelled)。
+
+        running 状态(starting / generating / resolving) 不会被碰 —— 防打断正在生成。
+        对预扣过额度的任务在删除前退额度(走 `_pre_charged_tasks` 内存 + DB 兜底)。
+        本地视频文件保留(用户已下载过的归用户管)。
+
+        返回:{"deleted_count": int}
+        """
+        authorize(x_doupool_token, authorization)
+        if video_service is None:
+            raise HTTPException(status_code=503, detail="视频服务未启动")
+        deleted = video_service.clear_tasks("completed")
+        return {"deleted_count": deleted}
+
+    @app.post("/api/video-tasks/clear-queued")
+    def clear_queued_video_tasks(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.35:一键清除排队中任务(只动 queued,不动 starting/generating/resolving)。
+
+        同上:预扣额度在删除前退。返回 {"deleted_count": int}。
+        """
+        authorize(x_doupool_token, authorization)
+        if video_service is None:
+            raise HTTPException(status_code=503, detail="视频服务未启动")
+        deleted = video_service.clear_tasks("queued")
+        return {"deleted_count": deleted}
+
+    @app.post("/api/results/clear-downloaded")
+    def clear_downloaded_results(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.35:一键清除已下载结果(clean_video_url OR result_url IS NOT NULL)。
+
+        succeeded 状态 —— 豆包已结算额度,无需退额度。只删 DB row,本地文件保留。
+        返回 {"deleted_count": int}。
+        """
+        authorize(x_doupool_token, authorization)
+        if video_service is None:
+            raise HTTPException(status_code=503, detail="视频服务未启动")
+        deleted = video_service.clear_results(downloaded_only=True)
+        return {"deleted_count": deleted}
+
+    @app.post("/api/results/clear-all")
+    def clear_all_results(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """v0.2.35:一键清除全部结果(所有 succeeded 任务)。
+
+        同上:本地文件保留,DB row 物理删。返回 {"deleted_count": int}。
+        """
+        authorize(x_doupool_token, authorization)
+        if video_service is None:
+            raise HTTPException(status_code=503, detail="视频服务未启动")
+        deleted = video_service.clear_results(downloaded_only=False)
+        return {"deleted_count": deleted}
 
     def _token_bundle_dict(bundle, available: bool, hint: str = "") -> dict:
         """v0.2.17:把 TokenBundle 序列化成 API 响应。available=False(抽不到 web_id)

@@ -562,3 +562,53 @@ class AccountRepository:
         if row is None:
             return False
         return row.status not in self._RUNNING_STATUSES
+
+    # ---------- v0.2.35:一键清除(返回被删前的 rows,留给 service 退额度) ----------
+
+    def list_video_tasks_by_statuses(
+        self, statuses: tuple[str, ...]
+    ) -> list[VideoTask]:
+        """按 status 集合筛选任务(用于批量清除前的预读)。
+        不删任何东西,仅返回 VideoTask 列表,留给 service 处理退额度 + 删除。
+        """
+        return list(
+            VideoTask.select()
+            .where(VideoTask.status.in_(statuses))
+            .order_by(VideoTask.created_at.asc())
+        )
+
+    def delete_video_tasks_by_ids(self, task_ids: list[str]) -> int:
+        """物理删除一组任务(按 id)。返回实际删除的行数。
+        v0.2.35:clear 端点专用 —— 调用前 service 已退完额度。
+        """
+        if not task_ids:
+            return 0
+        return (
+            VideoTask.delete()
+            .where(VideoTask.id.in_(task_ids))
+            .execute()
+        )
+
+    def list_succeeded_results(
+        self, *, with_download_url: bool | None = None
+    ) -> list[VideoTask]:
+        """v0.2.35:列出 succeeded 任务。
+
+        with_download_url:
+          - True  —— 只列 `clean_video_url IS NOT NULL OR result_url IS NOT NULL`
+                      的任务(用户已经下载过 / 有可用 URL)
+          - False —— 只列两个 URL 都为 NULL 的(预留,本期不用)
+          - None  —— 不加 URL 过滤(全部 succeeded)
+        """
+        query = VideoTask.select().where(VideoTask.status == "succeeded")
+        if with_download_url is True:
+            query = query.where(
+                (VideoTask.clean_video_url.is_null(False))
+                | (VideoTask.result_url.is_null(False))
+            )
+        elif with_download_url is False:
+            query = query.where(
+                VideoTask.clean_video_url.is_null(True)
+                & VideoTask.result_url.is_null(True)
+            )
+        return list(query.order_by(VideoTask.created_at.asc()))

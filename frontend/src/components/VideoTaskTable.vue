@@ -24,6 +24,7 @@ type VideoTaskRow = {
   quota_total?: number;
   group_id?: string;
   group_index?: number;
+  download_filename?: string;
   created_at: string;
 };
 
@@ -169,7 +170,7 @@ function paramsText(task: VideoTaskRow) {
                 </DpLink>
                 <DpDownloadButton
                   :href="task.clean_video_url"
-                  :filename="`doubao-${task.id}-clean.mp4`"
+                  :filename="task.download_filename || `doubao-${task.id}.mp4`"
                   @download-failed="() => $emit('download-failed', task.id)"
                 >
                   <Download :size="12" />
@@ -183,7 +184,7 @@ function paramsText(task: VideoTaskRow) {
                 </DpLink>
                 <DpDownloadButton
                   :href="task.result_url"
-                  :filename="`doubao-${task.id}.mp4`"
+                  :filename="task.download_filename || `doubao-${task.id}.mp4`"
                   @download-failed="() => $emit('download-failed', task.id)"
                 >
                   <Download :size="12" />

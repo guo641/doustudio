@@ -49,6 +49,9 @@ class _StubRepo:
 
     def reset_daily_quotas(self, *_args, **_kw): pass
     def choose_available_account(self, *_args, **_kw): return None
+    def choose_and_reserve_account(self, *_args, **_kw):
+        # v0.2.35:跨账号凑余额——stub 始终返 None 表示无可用账号,任务入 queued
+        return None
     def assign_video_task(self, *_args, **_kw): pass
     def update_video_task(self, *_args, **_kw): pass
     def get_video_task(self, *_args, **_kw):
@@ -69,9 +72,16 @@ class _StubService(VideoTaskService):
     def __init__(self, repo):
         self.repository = repo
         self.assets_dir = None
+        # v0.2.35:start() 调 settings_service.get_daily_quotas() —— stub 默认返 shared=50
+        self.settings_service = _StubSettings()
 
     def _schedule(self, task_id):  # type: ignore[override]
         pass
+
+
+class _StubSettings:
+    def get_daily_quotas(self):
+        return {"shared": 50}
 
 
 @pytest.fixture

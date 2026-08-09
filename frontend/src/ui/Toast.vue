@@ -28,9 +28,13 @@ const LOADING_TYPES = new Set([
   'info',
 ]);
 
+// v0.2.35:warning(橙色)—— 任务部分入队等"非致命但需告知"的场景。
+const WARNING_TYPES = new Set(['warning']);
+
 const variant = computed(() => {
   if (ERROR_TYPES.has(props.type)) return 'error';
   if (LOADING_TYPES.has(props.type)) return 'info';
+  if (WARNING_TYPES.has(props.type)) return 'warning';
   if (props.type === 'succeeded' || props.type === 'success') return 'success';
   return 'success';
 });
@@ -39,11 +43,13 @@ const resolvedDuration = computed(() => {
   if (props.duration != null) return props.duration;
   if (variant.value === 'info') return 0;
   if (variant.value === 'error') return 5000;
+  if (variant.value === 'warning') return 6000;
   return 3500;
 });
 
 const Icon = computed(() => {
   if (variant.value === 'error') return AlertCircle;
+  if (variant.value === 'warning') return AlertCircle;
   if (variant.value === 'info') return Loader2;
   if (variant.value === 'success') return CheckCircle2;
   return Info;
@@ -139,6 +145,14 @@ onBeforeUnmount(clearTimer);
   border-color: rgba(124, 106, 245, 0.32);
   background: rgba(18, 16, 28, 0.94);
   color: var(--accent-text, #c4bbff);
+}
+
+/* v0.2.35:warning(橙色)—— 部分入队等"非致命但需告知"的场景。 */
+.toast.is-warning,
+.toast.warning {
+  border-color: rgba(245, 158, 11, 0.32);
+  background: rgba(28, 22, 12, 0.94);
+  color: var(--warning-text, #fbbf24);
 }
 
 .toast-icon {

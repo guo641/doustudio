@@ -120,10 +120,13 @@ export async function createVideoTask(body: {
   // v0.2.32:手动重试路径透传原 task.group_id,新任务仍归属同组。
   group_id?: string;
 }) {
-  return json(
+  // v0.2.35:跨账号凑余额 —— 200 OK + {task, partial_rejected} 包装。
+  // 解析返 {task, partial_rejected},App.vue 据此 Toast 提示哪几条 prompt
+  // 当前无可用账号、稍后会被自动重试。
+  return (await json(
     await fetch('/api/video-tasks', { method: 'POST', headers, body: JSON.stringify(body) }),
     '任务创建失败',
-  );
+  )) as { task: Record<string, unknown>; partial_rejected: Array<{ index: number; prompt: string; reason: string }> };
 }
 
 // v0.2.11:删除一条视频任务(running 状态服务端会 409)。
@@ -257,6 +260,30 @@ export async function groupDownload(groupId: string): Promise<{
       body: JSON.stringify({ group_id: groupId }),
     }),
     '保存批量视频失败',
+  );
+}
+
+// v0.2.35:一键清除任务 + 一键清除结果。
+// target 端点:
+//   - "completed"  清 succeeded / failed / cancelled(预扣过额度的会在删前退)
+//   - "queued"     只清 queued(running 状态绝不动)
+// downloaded_only 在「清除结果」端点区分已下载 vs 全部。
+export async function clearVideoTasks(target: 'completed' | 'queued'): Promise<{ deleted_count: number }> {
+  const path = target === 'completed'
+    ? '/api/video-tasks/clear-completed'
+    : '/api/video-tasks/clear-queued';
+  return json(
+    await fetch(path, { method: 'POST', headers }),
+    '清除任务失败',
+  );
+}
+export async function clearResults(downloaded_only: boolean): Promise<{ deleted_count: number }> {
+  const path = downloaded_only
+    ? '/api/results/clear-downloaded'
+    : '/api/results/clear-all';
+  return json(
+    await fetch(path, { method: 'POST', headers }),
+    '清除结果失败',
   );
 }
 

@@ -337,6 +337,13 @@ main.workspace {
   font-variant-numeric: tabular-nums;
 }
 
+/* v0.2.35:一键清除按钮组 —— 右侧「清已完成」「清排队」「+ 添加任务」横排 */
+.page-actions .action-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 @media (max-width: 900px) {
   :root {
     --sidebar-w: 200px;

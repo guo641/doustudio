@@ -2,6 +2,128 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.35 - 2026-08-09
+
+### 新增
+
+- **跨账号凑余额** 多账号场景下,如果当前活跃账号
+  的共享额度已用完,允许同 batch 的剩余 prompt 「跨
+  过去」打其他账号 —— 过去是直接返回 `quota
+  exhausted` 把整 batch 拒掉,用户得手动拆批再点。
+  现在 `repository.choose_and_reserve_account` 失败
+  后 `service.start` 递归选下一个账号重试;若整个
+  活跃账号集都满了,把失败 prompt 收进
+  `partial_rejected` 一起返回 200,前端弹 warning
+  Toast 给出明细(「3 条暂无可用账号,稍后自动
+  重试:#2「xxx」、#5「yyy」、#8「zzz」」)。失败
+  的 prompt 仍以 `status=queued` 落库,等其他账号
+  隔天重置后被 `resume_queued` 兜底接住。
+  - 实现:[service.py](src/doupool/video/service.py)
+    `start()` 增加循环 + `partial_rejected` 累加
+    逻辑;[repository.py](src/doupool/db/repository.py)
+    `choose_and_reserve_account` 复用 v0.2.33 CAS
+    路径(失败 → 选下一个账号)。
+  - 端点:[api/app.py](src/doupool/api/app.py)
+    `create_video_task` 改返 `{task, partial_rejected}`,
+    200 OK + 明细(过去是 503 `quota_exhausted`)。
+  - 前端:[api.ts](frontend/src/api.ts) 同步包装 +
+    [App.vue](frontend/src/App.vue) `onCreateTask` 显
+    示 partial rejected Toast。
+  - 测试:[test_api.py](tests/test_api.py) 新增
+    `test_create_video_task_partial_rejected_across
+    _accounts` —— 两个账号都满 + 3 prompt,期望
+    200 + `task` 入队 + `partial_rejected` 长度 1。
+- **批量下载命名规范** 用户下载批量任务产物时,所
+  有文件都叫 `video.mp4`(浏览器去重 + 后端
+  `attachment; filename="video.mp4"` 不带 index)
+  → 多个文件覆盖彼此。改成统一格式
+  `{group_index:02d}_{HHMMSS}_{prompt前12字符}[-clean].mp4`。
+  - 后端:[api/app.py](src/doupool/api/app.py)
+    `_video_task_dict` 加 `download_filename` 字段
+    给前端备用;[repository.py](src/doupool/db/repository.py)
+    `_download_response` 把 Content-Disposition
+    的 filename 改成计算后的 `download_filename`(单
+    条 + group download 两条链路都覆盖),group 下
+    载维持 zip 内部同样命名。
+  - 前端:[ResultsTable.vue](frontend/src/components/ResultsTable.vue)
+    `sanitizeFilenamePart` 把控制字符 + Windows 非
+    法字符 `\\ / : * ? " < > | \r \n \t` 替换成
+    `_`,fallback 时用 prompt 切片组装;`download`
+    属性透传。
+  - 测试:[test_api.py](tests/test_api.py) 新增
+    `test_video_task_dict_download_filename` +
+    `test_download_response_uses_download_filename`。
+- **一键清除任务** 用户场景:跑了一堆实验性任务
+  后,视频任务页 + 结果页堆满几十条历史记录,手
+  动一行行点删除太累。新增 2 个后端端点 + 4 个
+  前端按钮(视频任务页「清已完成」「清排队」/
+  结果页「清已下载」「清全部」)。
+  - 端点:[api/app.py](src/doupool/api/app.py)
+    `POST /api/video-tasks/clear-completed`(删
+    `status ∈ {succeeded, failed, cancelled}`) +
+    `POST /api/video-tasks/clear-queued`(删
+    `status=queued`)。两条都走
+    `refund_quota_if_recorded` 退还在途预扣
+    (queued 可能从未跑过,`_pre_charged_tasks` 仍
+    记录它的预扣值),DB 行物理删除。
+  - 结果端点:`POST /api/results/clear-downloaded`
+    (按 `clean_video_url || result_url` 筛 —
+    有可下载链接的视为「已下载」)+ `POST
+    /api/results/clear-all`(全 succeeded)。
+  - 鉴权沿用 `authorize()`,前端按钮 `confirm()`
+    dialog 二次确认后调,完成后 `showToast` 报
+    `deleted_count`。
+  - 前端:[api.ts](frontend/src/api.ts) 加
+    `clearVideoTasks` / `clearResults` 包装;
+    [App.vue](frontend/src/App.vue) 加 4 个 computed
+    计数 + 2 个 handler;视频任务页 / 结果页
+    `.page-actions` 右侧加按钮组
+    (`.action-group`,CSS 在
+    [styles.css](frontend/src/styles.css))。
+  - 测试:[test_video_service.py](tests/test_video_service.py)
+    新增 `test_clear_queued_refunds_pre_charge_and
+    _deletes_task`(走真实预扣 → 立刻 clear → 验
+    shared 桶回到 0 + DB 行物理删) +
+    `test_clear_completed_refunds_pre_charge_for
+    _stuck_queued_tasks`(clear-completed 不应碰
+    queued 的回归断言)。
+
+### 修复
+
+- 6 个 v0.2.35 之前的 `vue-tsc` typecheck 噪音(与本
+  版本无关,顺手清掉):
+  - [VideoTaskTable.vue](frontend/src/components/VideoTaskTable.vue)
+    `VideoTaskRow` 加 `download_filename?: string;`
+    字段(配合 v0.2.28 _video_task_dict 的同名字段)。
+  - [api.ts](frontend/src/api.ts) `json<T>()` 不接
+    受泛型 → 改为 `await json(...) as T` 风格。
+  - [ResultsTable.vue](frontend/src/components/ResultsTable.vue)
+    `ch.isPrintable` 不是 JS 字符串方法,改成
+    `ch.charCodeAt(0) < 0x20 || === 0x7f` 控制字
+    符判断。
+  - [App.vue](frontend/src/App.vue) partial
+    rejected `map((r) => …)` 给 `r` 显式
+    `{ index: number; prompt: string }` 注解。
+
+### 测试
+
+- 后端 `pytest tests/ -q` 458 passed(+ 2 个
+  pre-existing `test_login_browser.py` Windows 控制
+  台编码失败,与本版本无关,见 v0.2.34 changelog)。
+- 前端 `npm run build`(内部含 `vue-tsc --noEmit`)
+  0 错误。
+
+### 预防
+
+- `_pre_charged_tasks` + `partial_rejected` 两套
+  退款机制覆盖全失败路径:
+  - `service._run_inner` 顶层异常 / `CancelledError`
+    / runner 抛错 / 风控拒绝 / TokenBundleUnavailable
+    全部走 `refund_quota_if_recorded`。
+  - clear_tasks(queued) 走相同的预扣退款逻辑,
+    让「从未跑过的孤儿 queued」也安全退还,
+    避免「清了任务但 shared 桶一直扣着」的脏状态。
+
 ## v0.2.34 - 2026-08-08
 
 ### 新增

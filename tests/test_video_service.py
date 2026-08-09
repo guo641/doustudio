@@ -42,7 +42,7 @@ async def test_service_runs_and_persists_video_result(repository, temp_profile):
     )
     service = VideoTaskService(repository, SuccessfulVideoRunner(), StaticSettings(), account_poll_interval=0.01)
 
-    task = service.start("一只猫在草地上行走", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("一只猫在草地上行走", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -94,7 +94,7 @@ async def test_service_respects_task_interval_seconds(repository, temp_profile):
         repository, IntervalTimingRunner(), IntervalSettings(), account_poll_interval=0.01,
     )
     captured["dispatched_at"] = asyncio.get_event_loop().time()
-    task = service.start("P", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("P", "seedance_v2.0_mini", "1:1", 5)
     try:
         await asyncio.wait_for(service._tasks[task.id], timeout=3)
     finally:
@@ -150,7 +150,7 @@ async def test_service_serializes_task_interval_across_concurrent_tasks(reposito
         repository, CaptureRunner(), SerialSettings(), account_poll_interval=0.01,
     )
     t0 = asyncio.get_event_loop().time()
-    tasks = [service.start(f"P{i}", "seedance_v2.0_mini", "1:1", 5) for i in range(3)]
+    tasks = [service.start(f"P{i}", "seedance_v2.0_mini", "1:1", 5)[0] for i in range(3)]
     try:
         await asyncio.wait_for(
             asyncio.gather(*(service._tasks[t.id] for t in tasks)),
@@ -168,7 +168,7 @@ async def test_service_serializes_task_interval_across_concurrent_tasks(reposito
 @pytest.mark.asyncio
 async def test_service_keeps_task_queued_without_an_available_account(repository):
     service = VideoTaskService(repository, SuccessfulVideoRunner(), StaticSettings(), account_poll_interval=0.01)
-    task = service.start("测试", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("测试", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.sleep(0.03)
     assert repository.get_video_task(task.id).status == "queued"
     await service.shutdown()
@@ -237,7 +237,7 @@ async def test_service_cools_limited_account_and_fails_over(repository, tmp_path
     runner = FailoverRunner()
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
 
-    task = service.start("测试换号", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("测试换号", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -281,7 +281,7 @@ async def test_service_does_not_cap_buckets_on_shark_admin_risk_control(reposito
     runner = RiskControlRunner()
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
 
-    task = service.start("风控测试", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("风控测试", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -323,7 +323,7 @@ async def test_service_does_not_cap_buckets_on_token_bundle_unavailable(reposito
     runner = TokenBundleUnavailableRunner()
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
 
-    task = service.start("token 测试", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("token 测试", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -373,7 +373,7 @@ async def test_service_persists_and_runs_i2v_task(repository, temp_profile, tmp_
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
     )
 
-    task = service.start(
+    task, _ = service.start(
         "动起来",
         "seedance_v2.0_mini",
         "9:16",
@@ -405,7 +405,7 @@ async def test_service_accepts_up_to_nine_i2v_images(repository, temp_profile, t
     )
     images = [{"name": f"demo-{i}.png", "data_base64": png_b64} for i in range(9)]
 
-    task = service.start(
+    task, _ = service.start(
         "九图", "seedance_v2.0_mini", "1:1", 5, mode="i2v", images=images
     )
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
@@ -671,11 +671,11 @@ async def test_service_charges_shared_bucket_per_model_cost(repository, temp_pro
     )
 
     # 第一个 mini 任务
-    task_mini = service.start("mini 任务", "seedance_v2.0_mini", "1:1", 5)
+    task_mini, _ = service.start("mini 任务", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task_mini.id], timeout=2)
 
     # 第二个 std 任务
-    task_std = service.start("std 任务", "seedance_v2.0_std", "1:1", 5)
+    task_std, _ = service.start("std 任务", "seedance_v2.0_std", "1:1", 5)
     await asyncio.wait_for(service._tasks[task_std.id], timeout=2)
 
     account = Account.get_by_id("acc-iso")
@@ -784,7 +784,7 @@ async def test_concurrent_tasks_on_same_account_share_browser_context(repository
     service = VideoTaskService(repository, runner, settings, account_poll_interval=0.01)
 
     # 提交 3 个 mini 10s 任务(总成本 3*10 = 30 点,远低于 50 点桶)
-    tasks = [service.start(f"并发测试 {i}", "seedance_v2.0_mini", "1:1", 10) for i in range(3)]
+    tasks = [service.start(f"并发测试 {i}", "seedance_v2.0_mini", "1:1", 10)[0] for i in range(3)]
     await asyncio.wait_for(
         asyncio.gather(*[service._tasks[t.id] for t in tasks]),
         timeout=5,
@@ -835,7 +835,7 @@ async def test_concurrent_tasks_do_not_serialise_per_account(repository, tmp_pat
     settings = HighConcurrencySettings()
     service = VideoTaskService(repository, runner, settings, account_poll_interval=0.01)
 
-    tasks = [service.start(f"并发 {i}", "seedance_v2.0_mini", "1:1", 10) for i in range(3)]
+    tasks = [service.start(f"并发 {i}", "seedance_v2.0_mini", "1:1", 10)[0] for i in range(3)]
     await asyncio.wait_for(
         asyncio.gather(*[service._tasks[t.id] for t in tasks]),
         timeout=5,
@@ -911,7 +911,7 @@ async def test_service_refunds_quota_on_refundable_failures(
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
 
     # mini 5s = 5 点,cost = quota_cost("seedance_v2.0_mini", 5) = 5
-    task = service.start(f"{failure_kind} 测试", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start(f"{failure_kind} 测试", "seedance_v2.0_mini", "1:1", 5)
     # generation_failed 走 revise_prompt 路径,会触发 2 次重试;
     # 用 5s 留点余量
     await asyncio.wait_for(service._tasks[task.id], timeout=5)
@@ -956,7 +956,7 @@ async def test_service_refunds_quota_on_each_retry_attempt(repository, temp_prof
     runner = RefundAfterRetryRunner()
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
 
-    task = service.start("违规测试", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("违规测试", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=5)
 
     # runner 被调 3 次:1 次原始 + max_attempts=2 次重试,每次都失败
@@ -986,7 +986,7 @@ async def test_service_refund_noop_when_quota_was_not_charged(repository, temp_p
     runner = FailBeforeGeneratingRunner()
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
 
-    task = service.start("前置失败", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("前置失败", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     acc = Account.get_by_id("acc-noref")
@@ -1030,7 +1030,7 @@ async def test_service_marks_failed_and_refunds_on_content_rejected(repository, 
     runner = ContentRejectedRunner()
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
 
-    task = service.start("违规测试", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("违规测试", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -1057,7 +1057,7 @@ async def test_content_rejected_skips_prompt_retry(repository, temp_profile):
     runner = ContentRejectedRunner()
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
 
-    task = service.start("违规再测", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("违规再测", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -1160,7 +1160,7 @@ async def test_content_rejected_revise_when_enabled_uses_two_attempts(repository
         account_poll_interval=0.01,
     )
 
-    task = service.start("习近平出场", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("习近平出场", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -1196,7 +1196,7 @@ async def test_content_rejected_revise_exhausts_after_max_attempts(repository, t
         account_poll_interval=0.01,
     )
 
-    task = service.start("色情片", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("色情片", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -1227,7 +1227,7 @@ async def test_content_rejected_revise_disabled_keeps_v0_2_21_behavior(repositor
         account_poll_interval=0.01,
     )
 
-    task = service.start("违规再试", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("违规再试", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -1361,7 +1361,7 @@ async def test_service_refunds_quota_on_user_cancel(repository, temp_profile):
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
 
     # mini 5s = 5 点
-    task = service.start("取消测试", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("取消测试", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -1397,7 +1397,7 @@ async def test_service_cancel_refund_noop_when_quota_not_charged(repository, tem
     runner = CancelBeforeChargingRunner()
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
 
-    task = service.start("早取消", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("早取消", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     acc = Account.get_by_id("acc-cancel-noop")
@@ -1439,7 +1439,7 @@ async def test_run_top_level_cancelled_error_writes_failed(repository, temp_prof
         account_poll_interval=0.01,
     )
 
-    task = service.start("顶层取消", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("顶层取消", "seedance_v2.0_mini", "1:1", 5)
     # _run 顶层 except CancelledError 处理完后会 re-raise,这是预期行为
     # (上层 shutdown 收到 cancel 信号知道自己该停了),但 pytest-asyncio
     # 会把 re-raise 当成测试失败,所以这里 swallow 一下。
@@ -1579,7 +1579,7 @@ async def test_start_with_explicit_group_id_inherits_into_new_task(repository, t
     )
 
     # 模拟手动重试:caller 拿到原 task.group_id 后原样透传给 service.start。
-    task = service.start(
+    task, _ = service.start(
         "重试 prompt", "seedance_v2.0_mini", "1:1", 5,
         group_id="grp-existing-uuid",
     )
@@ -1606,7 +1606,7 @@ async def test_start_without_group_id_keeps_legacy_none_behavior(repository, tem
         repository, SuccessfulVideoRunner(), StaticSettings(),
         account_poll_interval=0.01,
     )
-    task = service.start("单条 prompt", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("单条 prompt", "seedance_v2.0_mini", "1:1", 5)
     await asyncio.wait_for(service._tasks[task.id], timeout=2)
 
     saved = repository.get_video_task(task.id)
@@ -1631,7 +1631,7 @@ async def test_start_precharges_quota_before_runner_runs(repository, temp_profil
         account_poll_interval=0.01,
     )
 
-    task = service.start("预扣", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("预扣", "seedance_v2.0_mini", "1:1", 5)
     # 不 await _tasks —— start() 内部已经预扣过 5 点
     assert Account.get_by_id("acc-pre").video_quota_used_shared == 5
     # 内存里的预登记表也已写入
@@ -1644,12 +1644,12 @@ async def test_start_precharges_quota_before_runner_runs(repository, temp_profil
 
 
 @pytest.mark.asyncio
-async def test_start_with_prompts_uses_same_account_for_group(repository, tmp_path):
-    """v0.2.33:同 group_id 的多个 prompt 沿用首 task 选中的账号(sticky)。
+async def test_start_with_prompts_distributes_across_accounts_per_prompt(repository, tmp_path):
+    """v0.2.35:跨账号凑余额 —— 同 group_id 的多个 prompt 不再粘同账号。
 
-    三个账号都是空的,首 task 选 least_used 的 acc-a;剩 2 个 task 应继续用 acc-a
-    而不是再次 choose_and_reserve_account。CAS 预扣 5 次,acc-a 桶加 15,
-    acc-b / acc-c 桶 0。
+    v0.2.33 的 sticky 行为被废弃:每个 task 独立调 choose_and_reserve_account,
+    按 least_used 自动分散到不同账号(只要账号桶还能装下 cost)。三个账号都空,
+    3 个 prompt → 每个账号承担 1 个 task,各扣 5 点。
     """
     for i in ("a", "b", "c"):
         Account.create(
@@ -1663,8 +1663,10 @@ async def test_start_with_prompts_uses_same_account_for_group(repository, tmp_pa
 
     prompts = ["p1 跑", "p2 跑", "p3 跑"]
     # prompt="" 避免和 prompts 双重给 —— 不然 prompt 会被当作第一段前缀补到队首
-    first_task = service.start("", "seedance_v2.0_mini", "1:1", 5, prompts=prompts)
+    first_task, partial_rejected = service.start("", "seedance_v2.0_mini", "1:1", 5, prompts=prompts)
     assert first_task is not None
+    # v0.2.35:三账号都能装下,partial_rejected 应为空
+    assert partial_rejected == [], f"应有空间时不应有 partial_rejected,实际 {partial_rejected}"
     group_id = first_task.group_id
     assert group_id is not None
 
@@ -1683,13 +1685,117 @@ async def test_start_with_prompts_uses_same_account_for_group(repository, tmp_pa
     group_tasks = list(_VT.select().where(_VT.group_id == group_id))
     assert len(group_tasks) == 3
     accounts_used = {t.account.id for t in group_tasks}
-    assert len(accounts_used) == 1, f"同组应只用一个账号,实际: {accounts_used}"
-    # 被选中的账号被扣 15,其余 0
-    chosen = accounts_used.pop()
+    # v0.2.35:跨账号凑余额 → 3 个 task 应分散到 3 个不同账号(同组不再粘同账号)
+    assert len(accounts_used) == 3, f"v0.2.35 期望分散到 3 个账号,实际: {accounts_used}"
     for a in ("acc-a", "acc-b", "acc-c"):
         used = Account.get_by_id(a).video_quota_used_shared
-        expected = 15 if a == chosen else 0
-        assert used == expected, f"{a} used={used} 期望 {expected}"
+        assert used == 5, f"{a} used={used} 期望 5(各 task 独立 CAS)"
+
+
+@pytest.mark.asyncio
+async def test_start_with_prompts_returns_partial_rejected_when_all_full(repository, tmp_path):
+    """v0.2.35:跨账号凑余额 —— 所有账号桶都满时,每条 prompt 都进 partial_rejected。
+
+    三账号都 shared=50(桶满),3 个 prompt 任何一个都无法 CAS → 任务
+    保留 queued + partial_rejected 全 3 条;任务列表里也能看到这 3 条
+    (不绑账号,等下次调度)。
+    """
+    from datetime import date as _date
+    for i in ("a", "b", "c"):
+        sub = tmp_path / f"profile-{i}"; sub.mkdir()
+        Account.create(
+            id=f"acc-{i}", display_name=f"账号{i}", doubao_user_id=f"u{i}",
+            profile_dir=str(sub),
+            video_quota_used_shared=50,
+            video_quota_date=_date.today(),
+        )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    prompts = ["p1", "p2", "p3"]
+    first_task, partial_rejected = service.start(
+        "", "seedance_v2.0_mini", "1:1", 5, prompts=prompts,
+    )
+    assert first_task is not None
+    # v0.2.35:全满 → 3 条全部进 partial_rejected
+    assert len(partial_rejected) == 3, f"期望 3 条 partial_rejected,实际 {len(partial_rejected)}"
+    for idx, item in enumerate(partial_rejected, start=1):
+        assert item["index"] == idx
+        assert item["prompt"] == prompts[idx - 1]
+        assert "共享额度" in item["reason"] or "用完" in item["reason"]
+    # 3 条任务都创建(queued),账号都没绑
+    from doupool.db.models import VideoTask as _VT
+    group_tasks = list(_VT.select().where(_VT.group_id == first_task.group_id))
+    assert len(group_tasks) == 3
+    for t in group_tasks:
+        assert t.account_id is None, f"全满时任务不应绑账号,实际 {t.account_id}"
+        assert t.status == "queued"
+    # 桶值未变(没扣)
+    for a in ("acc-a", "acc-b", "acc-c"):
+        assert Account.get_by_id(a).video_quota_used_shared == 50
+
+
+@pytest.mark.asyncio
+async def test_start_with_prompts_partial_rejected_only_when_some_full(repository, tmp_path):
+    """v0.2.35:跨账号凑余额 —— 部分账号满时,前面的 task 进账户,后面的进 partial_rejected。
+
+    场景:acc-a 已 shared=50(满),acc-b / acc-c 空的。
+    第 1 个 prompt:least_used 选 acc-b → 成功扣 5,partial_rejected 不增。
+    第 2 个 prompt:least_used 选 acc-c → 成功扣 5。
+    第 3 个 prompt:least_used 选 acc-b(acc-b 还剩 45) → 成功扣 5。
+    验证:3 个 task 全部 succeeded,partial_rejected 为空。
+    """
+    from datetime import date as _date
+    sub = tmp_path / "profile-a"; sub.mkdir()
+    # v0.2.29:_run_inner 入口的 reset_daily_quotas 在 video_quota_date=NULL
+    # 时会重置 shared 桶 —— 测试里必须显式写当天日期,否则被踩掉
+    Account.create(
+        id="acc-a", display_name="A", doubao_user_id="ua",
+        profile_dir=str(sub),
+        video_quota_used_shared=50,
+        video_quota_date=_date.today(),
+    )
+    for i in ("b", "c"):
+        sub = tmp_path / f"profile-{i}"; sub.mkdir()
+        Account.create(
+            id=f"acc-{i}", display_name=i.upper(), doubao_user_id=f"u{i}",
+            profile_dir=str(sub),
+            video_quota_date=_date.today(),
+        )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+    prompts = ["p1", "p2", "p3"]
+    first_task, partial_rejected = service.start(
+        "", "seedance_v2.0_mini", "1:1", 5, prompts=prompts,
+    )
+    # v0.2.35:acc-b/c 各扣 5 装得下 3 个 task;acc-a 满被绕过
+    assert partial_rejected == []
+    # 等跑完
+    import time
+    deadline = time.monotonic() + 2
+    from doupool.db.models import VideoTask as _VT
+    while time.monotonic() < deadline:
+        remaining = _VT.select().where(
+            (_VT.group_id == first_task.group_id)
+            & _VT.status.in_(("queued", "starting", "generating"))
+        ).count()
+        if remaining == 0:
+            break
+        await asyncio.sleep(0.02)
+    group_tasks = list(_VT.select().where(_VT.group_id == first_task.group_id))
+    assert len(group_tasks) == 3
+    # acc-a 桶未动(被绕过)
+    assert Account.get_by_id("acc-a").video_quota_used_shared == 50
+    # acc-b / acc-c 桶分担任务(按 least_used + CAS,具体分配可能 1+2 或 2+1)
+    b_used = Account.get_by_id("acc-b").video_quota_used_shared
+    c_used = Account.get_by_id("acc-c").video_quota_used_shared
+    assert b_used + c_used == 15, f"期望 b+c=15,实际 b={b_used} c={c_used}"
+    assert b_used in (5, 10)
+    assert c_used in (5, 10)
 
 
 @pytest.mark.asyncio
@@ -1709,9 +1815,9 @@ async def test_start_distributes_parallel_calls_across_accounts(repository, tmp_
     )
 
     # 串行 start 也能验证分散(每次 CAS 都选 used 最小的)
-    t1 = service.start("g1", "seedance_v2.0_mini", "1:1", 5)
-    t2 = service.start("g2", "seedance_v2.0_mini", "1:1", 5)
-    t3 = service.start("g3", "seedance_v2.0_mini", "1:1", 5)
+    t1, _ = service.start("g1", "seedance_v2.0_mini", "1:1", 5)
+    t2, _ = service.start("g2", "seedance_v2.0_mini", "1:1", 5)
+    t3, _ = service.start("g3", "seedance_v2.0_mini", "1:1", 5)
 
     assert {t1.account.id, t2.account.id, t3.account.id} == {"acc-a", "acc-b", "acc-c"}
     for a in ("acc-a", "acc-b", "acc-c"):
@@ -1773,7 +1879,7 @@ async def test_reconcile_pre_charged_after_restart_skips_double_charge(
         repository, _StuckRunner(), StaticSettings(),
         account_poll_interval=0.01,
     )
-    task = service1.start("p", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service1.start("p", "seedance_v2.0_mini", "1:1", 5)
     # start 后立刻 used_shared=5(预扣)
     assert Account.get_by_id("acc-restart").video_quota_used_shared == 5
 
@@ -1840,7 +1946,7 @@ async def test_start_refunds_pre_charge_when_runner_raises(repository, tmp_path)
         repository, _FailingRunner(), StaticSettings(),
         account_poll_interval=0.01,
     )
-    task = service.start("p", "seedance_v2.0_mini", "1:1", 5)
+    task, _ = service.start("p", "seedance_v2.0_mini", "1:1", 5)
     # start 后立刻预扣
     assert Account.get_by_id("acc-fail").video_quota_used_shared == 5
 
@@ -1854,3 +1960,73 @@ async def test_start_refunds_pre_charge_when_runner_raises(repository, tmp_path)
     assert task.id not in service._pre_charged_tasks
     # task 状态是 failed
     assert repository.get_video_task(task.id).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_clear_queued_refunds_pre_charge_and_deletes_task(repository, tmp_path):
+    """v0.2.35:clear_tasks("queued") 走真实 _pre_charged_tasks 预扣退款 + 物理删。
+
+    场景:start() 预扣 5 点 → 不等 runner 跑 → 立即 clear_tasks("queued")。
+    期望:shared 桶回到 0,_pre_charged_tasks 清空,DB row 物理删。
+    """
+    from doupool.db.models import VideoTask as _VT
+
+    Account.create(
+        id="acc-clear", display_name="C", doubao_user_id="u",
+        profile_dir=str(tmp_path / "profile-clear"),
+    )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    task, _ = service.start("清测试", "seedance_v2.0_mini", "1:1", 5)
+    # 预扣已扣
+    assert Account.get_by_id("acc-clear").video_quota_used_shared == 5
+    assert task.id in service._pre_charged_tasks
+
+    # 不 await _tasks —— 模拟"还没开始跑就清"
+    deleted = service.clear_tasks("queued")
+    assert deleted == 1
+    # 退额度
+    assert Account.get_by_id("acc-clear").video_quota_used_shared == 0
+    # 预登记表也清
+    assert task.id not in service._pre_charged_tasks
+    # DB row 物理删
+    assert _VT.select().where(_VT.id == task.id).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_clear_completed_refunds_pre_charge_for_stuck_queued_tasks(
+    repository, tmp_path,
+):
+    """v0.2.35:clear_tasks("completed") 也走退路 —— 兜底场景。
+
+    预设一条 status=queued 的 task 且 _pre_charged_tasks 里有记录(从没跑过的孤儿),
+    clear_tasks("completed") → 不会动 queued 但 clear_tasks("queued") 应退。
+    这个测试反过来验证 clear_tasks("completed") 对 queued 任务不会误删。
+    """
+    from doupool.db.models import VideoTask as _VT
+
+    Account.create(
+        id="acc-b", display_name="B", doubao_user_id="u",
+        profile_dir=str(tmp_path / "profile-b"),
+    )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    task, _ = service.start("兜底", "seedance_v2.0_mini", "1:1", 5)
+    assert Account.get_by_id("acc-b").video_quota_used_shared == 5
+
+    # clear_tasks("completed") 不该动 queued
+    deleted = service.clear_tasks("completed")
+    assert deleted == 0
+    assert Account.get_by_id("acc-b").video_quota_used_shared == 5
+    assert task.id in service._pre_charged_tasks
+    assert _VT.select().where(_VT.id == task.id).count() == 1
+
+    # 后续 clear_tasks("queued") 才应当退
+    service.clear_tasks("queued")
+    assert Account.get_by_id("acc-b").video_quota_used_shared == 0

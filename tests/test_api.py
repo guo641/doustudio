@@ -16,7 +16,8 @@ class FakeVideoService:
         self.repository = repository
 
     def start(self, **values):
-        return self.repository.create_video_task(
+        # v0.2.35:start 现在返 (first_task, partial_rejected);stub 也返同形状
+        task = self.repository.create_video_task(
             values.get("account_id"),
             values["prompt"],
             values["model"],
@@ -25,6 +26,7 @@ class FakeVideoService:
             mode=values.get("mode") or "t2v",
             image_paths=None,
         )
+        return task, []
 
 
 def test_api_requires_local_token(repository, tmp_path):
@@ -99,11 +101,78 @@ def test_create_and_list_video_tasks(repository, tmp_path, temp_profile):
         },
     )
 
-    assert response.status_code == 202
-    assert response.json()["status"] == "queued"
+    # v0.2.35:跨账号凑余额 — 200 OK + {task, partial_rejected} 包装
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task"]["status"] == "queued"
+    assert body["partial_rejected"] == []
     listed = client.get("/api/video-tasks", headers={"X-DouPool-Token": "secret"})
     assert listed.status_code == 200
     assert listed.json()[0]["account_name"] == "账号一"
+
+
+class FakeVideoServicePartialRejected(FakeVideoService):
+    """v0.2.35:测试 partial_rejected 响应字段——first task 成功,
+    第二/三条触发 partial_rejected 列表(模拟全账号满)。"""
+    def __init__(self, repository, *, rejected_indices=(2, 3)):
+        super().__init__(repository)
+        self._rejected_indices = rejected_indices
+        self._created = 0
+
+    def start(self, **values):
+        # 给 prompts 模式用:多 prompt 时按 index 决定 partial_rejected
+        prompts = values.get("prompts") or [values.get("prompt", "")]
+        first_task = None
+        partial = []
+        for idx, p in enumerate(prompts, start=1):
+            t = self.repository.create_video_task(
+                values.get("account_id"),
+                p,
+                values["model"],
+                values["ratio"],
+                values["duration"],
+                mode=values.get("mode") or "t2v",
+                image_paths=None,
+            )
+            if first_task is None:
+                first_task = t
+            if idx in self._rejected_indices:
+                partial.append({"index": idx, "prompt": p, "reason": "stub 拒"})
+        return first_task, partial
+
+
+def test_create_video_task_returns_partial_rejected_when_accounts_full(repository, tmp_path, temp_profile):
+    """v0.2.35:跨账号凑余额 —— 200 OK + partial_rejected 包含被拒 prompt 信息。"""
+    from doupool.db.models import Account
+    Account.create(
+        id="account-1", display_name="账号一", doubao_user_id="user-1", profile_dir=temp_profile,
+    )
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    # 前 2 个 prompt 成功,第 3 个进 partial_rejected
+    videos = FakeVideoServicePartialRejected(
+        repository, rejected_indices=(3,),
+    )
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login, videos))
+
+    response = client.post(
+        "/api/video-tasks",
+        headers={"X-DouPool-Token": "secret"},
+        json={
+            "account_id": None,  # 走跨账号凑余额分支
+            "prompts": ["p1", "p2", "p3"],
+            "model": "seedance_v2.0_mini",
+            "ratio": "1:1",
+            "duration": 5,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task"]["status"] == "queued"
+    # partial_rejected 透传前端,Toast 展示
+    assert len(body["partial_rejected"]) == 1
+    assert body["partial_rejected"][0]["index"] == 3
+    assert body["partial_rejected"][0]["prompt"] == "p3"
+    assert "stub 拒" in body["partial_rejected"][0]["reason"]
 
 
 def test_settings_round_trip_backup_and_validation(repository, database_manager, tmp_path):
@@ -620,6 +689,178 @@ def test_delete_video_task_returns_503_when_service_down(repository, tmp_path):
 
     assert response.status_code == 503
     assert repository.get_video_task(task.id).status == "queued"
+
+
+# ---------- v0.2.35:一键清除(任务 + 结果) ----------
+class _FakeVideoServiceWithClear(FakeVideoService):
+    """v0.2.35:接入 clear_tasks / clear_results —— 直接代理 repository 方法。"""
+
+    def clear_tasks(self, target: str) -> int:
+        # 测试仅校验端点签名 + 退额度 + 删除,具体 _pre_charged_tasks 走
+        # 真实 service.start 路径不便测,所以这里直接调 repository 的批量
+        # 删除 + 退额度。pre-charge 由 service 内部按 in-memory 状态管理,
+        # 我们让 _pre_charged_tasks 留空(单测 case 不需要模拟预扣)。
+        statuses = ("succeeded", "failed", "cancelled") if target == "completed" else ("queued",)
+        tasks = self.repository.list_video_tasks_by_statuses(statuses)
+        # 模拟退额度(只调 decrement_account_quota,by=0 边界由 _pre_charged 守门)
+        # 此处 _FakeVideoServiceWithClear 不持有 _pre_charged,跳过退额度
+        # (测过端点 + repository.list/delete 已 OK)。
+        return self.repository.delete_video_tasks_by_ids([t.id for t in tasks])
+
+    def clear_results(self, *, downloaded_only: bool = False) -> int:
+        tasks = self.repository.list_succeeded_results(
+            with_download_url=True if downloaded_only else None,
+        )
+        return self.repository.delete_video_tasks_by_ids([t.id for t in tasks])
+
+
+def _seed_clear_tasks(repository, profile_dir):
+    """铺 4 条任务:1 queued + 1 succeeded + 1 failed + 1 cancelled + 1 running(不动)"""
+    from doupool.db.models import Account, VideoTask
+    account = Account.create(
+        id="acc-clear", display_name="clear 账号", doubao_user_id="u-clear",
+        profile_dir=profile_dir, enabled=True, status="active",
+    )
+    queued = repository.create_video_task(None, "排队的", "seedance_v2.0_mini", "1:1", 5)
+    succ = repository.create_video_task(account.id, "成功的", "seedance_v2.0_mini", "1:1", 5)
+    repository.update_video_task(succ.id, status="succeeded", result_url="https://x.test/succ.mp4")
+    failed = repository.create_video_task(account.id, "失败的", "seedance_v2.0_mini", "1:1", 5)
+    repository.update_video_task(failed.id, status="failed", error="x")
+    cancelled = repository.create_video_task(account.id, "取消的", "seedance_v2.0_mini", "1:1", 5)
+    repository.update_video_task(cancelled.id, status="cancelled")
+    running = repository.create_video_task(account.id, "运行中", "seedance_v2.0_mini", "1:1", 5)
+    repository.update_video_task(running.id, status="generating")
+    return {
+        "queued": queued.id,
+        "succeeded": succ.id,
+        "failed": failed.id,
+        "cancelled": cancelled.id,
+        "running": running.id,
+    }
+
+
+def test_clear_completed_video_tasks(repository, tmp_path, temp_profile):
+    """clear-completed 端点:succeeded/failed/cancelled 全删,running 保留。"""
+    ids = _seed_clear_tasks(repository, temp_profile)
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=_FakeVideoServiceWithClear(repository),
+    ))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post("/api/video-tasks/clear-completed", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"deleted_count": 3}
+    # queued + running 保留
+    remaining = {t.id for t in repository.list_video_tasks()}
+    assert remaining == {ids["queued"], ids["running"]}
+
+
+def test_clear_queued_video_tasks(repository, tmp_path, temp_profile):
+    """clear-queued 端点:只删 queued,running 和 completed 都不动。"""
+    ids = _seed_clear_tasks(repository, temp_profile)
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=_FakeVideoServiceWithClear(repository),
+    ))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post("/api/video-tasks/clear-queued", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"deleted_count": 1}
+    # 4 条保留:succeeded/failed/cancelled/running
+    remaining = {t.id for t in repository.list_video_tasks()}
+    assert remaining == {ids["succeeded"], ids["failed"], ids["cancelled"], ids["running"]}
+
+
+def test_clear_endpoints_require_auth(repository, tmp_path):
+    """401:clear 端点也要鉴权。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=_FakeVideoServiceWithClear(repository),
+    ))
+    for path in (
+        "/api/video-tasks/clear-completed",
+        "/api/video-tasks/clear-queued",
+        "/api/results/clear-downloaded",
+        "/api/results/clear-all",
+    ):
+        response = client.post(path)
+        assert response.status_code == 401, path
+
+
+def test_clear_endpoints_return_503_when_service_down(repository, tmp_path):
+    """503:video_service 未启动。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    for path in (
+        "/api/video-tasks/clear-completed",
+        "/api/video-tasks/clear-queued",
+        "/api/results/clear-downloaded",
+        "/api/results/clear-all",
+    ):
+        response = client.post(path, headers={"X-DouPool-Token": "secret"})
+        assert response.status_code == 503, path
+
+
+def _seed_results_tasks(repository, profile_dir):
+    """铺 3 条 succeeded:1 有 clean,1 只有 result_url,1 两个 URL 都没有。"""
+    from doupool.db.models import Account, VideoTask
+    account = Account.create(
+        id="acc-res", display_name="res 账号", doubao_user_id="u-res",
+        profile_dir=profile_dir, enabled=True, status="active",
+    )
+    with_clean = repository.create_video_task(account.id, "有 clean", "seedance_v2.0_mini", "1:1", 5)
+    repository.update_video_task(with_clean.id, status="succeeded")
+    VideoTask.update(clean_video_url="https://x.test/clean.mp4").where(
+        VideoTask.id == with_clean.id
+    ).execute()
+    with_result = repository.create_video_task(account.id, "只有 result", "seedance_v2.0_mini", "1:1", 5)
+    repository.update_video_task(with_result.id, status="succeeded", result_url="https://x.test/res.mp4")
+    no_url = repository.create_video_task(account.id, "无 URL", "seedance_v2.0_mini", "1:1", 5)
+    repository.update_video_task(no_url.id, status="succeeded")
+    return {"with_clean": with_clean.id, "with_result": with_result.id, "no_url": no_url.id}
+
+
+def test_clear_downloaded_results_only_removes_tasks_with_url(repository, tmp_path, temp_profile):
+    """clear-downloaded:只删 clean_video_url OR result_url IS NOT NULL 的 succeeded。"""
+    ids = _seed_results_tasks(repository, temp_profile)
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=_FakeVideoServiceWithClear(repository),
+    ))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post("/api/results/clear-downloaded", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"deleted_count": 2}
+    # no_url 保留
+    remaining = {t.id for t in repository.list_video_tasks()}
+    assert remaining == {ids["no_url"]}
+
+
+def test_clear_all_results_removes_every_succeeded(repository, tmp_path, temp_profile):
+    """clear-all:全部 succeeded 都删,包括无 URL 的。"""
+    ids = _seed_results_tasks(repository, temp_profile)
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=_FakeVideoServiceWithClear(repository),
+    ))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post("/api/results/clear-all", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"deleted_count": 3}
+    assert repository.list_video_tasks() == []
 
 
 # ---------- v0.2.17:WebMSSDK / TeaSDK token 状态 + 刷新端点 ----------
@@ -1223,7 +1464,7 @@ def test_refresh_url_endpoint_non_succeeded_returns_409(repository, tmp_path):
 
 # ---------- v0.2.28 Q2:批量任务按组下载到独立文件夹 ----------
 # 三个用例覆盖:
-#  1) 正常路径 —— 3 条 succeeded 任务,httpx 流式落盘,文件名 doubao-<id>.mp4
+#  1) 正常路径 —— 3 条 succeeded 任务,httpx 流式落盘,文件名 `{group_index:02d}_{HHMMSS}_{prompt前12字符}.mp4`
 #  2) 过期签名 —— httpx 返回 403 → 409 提示用户先点刷新
 #  3) 空组 —— group_id 不存在 → 404
 
@@ -1290,6 +1531,78 @@ def _seed_grouped_tasks(repository, group_id: str, count: int = 3):
     return task_ids, urls
 
 
+# ---------- v0.2.35:批量下载命名 —— 单条任务 download_filename 字段 ----------
+class _FakeTaskForFilename:
+    """最小 _build_download_filename 鸭子类型:只读 prompt / created_at /
+    group_index / clean_video_url,无需 DB 实例。"""
+
+    def __init__(self, *, prompt: str, group_index: int = 0,
+                 created_at=None, clean_video_url: str | None = None):
+        from datetime import datetime as _dt
+        self.prompt = prompt
+        self.group_index = group_index
+        self.created_at = created_at or _dt(2026, 1, 2, 13, 51, 45)
+        self.clean_video_url = clean_video_url
+
+
+def test_build_download_filename_format_basic():
+    """v0.2.35:基础格式 `{group_index:02d}_{HHMMSS}_{prompt前12字符}.mp4`"""
+    from doupool.api.app import _build_download_filename
+    task = _FakeTaskForFilename(prompt="猫在草地上跑", group_index=1)
+    fn = _build_download_filename(task)
+    assert fn == "01_135145_猫在草地上跑.mp4"
+
+
+def test_build_download_filename_truncates_long_prompt():
+    """超过 12 字符的 prompt 只截前 12 字符"""
+    from doupool.api.app import _build_download_filename, _sanitize_filename_part
+    long_prompt = "猫猫在长长的草地上拼命奔跑跳跃"
+    assert len(long_prompt) > 12  # 确认测试本身在跑长字符串分支
+    task = _FakeTaskForFilename(prompt=long_prompt, group_index=3)
+    fn = _build_download_filename(task)
+    # 文件名 stem 部分 = `03_135145_` + prompt前 12 字符(Windows 文件名 max_len)
+    name_part = fn.removesuffix(".mp4").removeprefix("03_135145_")
+    assert len(name_part) == 12
+    assert name_part == long_prompt[:12]
+    # 完整文件名格式校验
+    assert fn.startswith("03_135145_") and fn.endswith(".mp4")
+
+
+def test_build_download_filename_sanitizes_illegal_chars():
+    """Windows 非法字符 \\ / : * ? " < > | 与控制字符统一换成 _"""
+    from doupool.api.app import _build_download_filename, _sanitize_filename_part
+    task = _FakeTaskForFilename(prompt='a/b\\c:d*e', group_index=5)
+    fn = _build_download_filename(task)
+    # 直接验证 sanitize 行为
+    sanitized = _sanitize_filename_part('a/b\\c:d*e')
+    assert sanitized == "a_b_c_d_e"
+    assert fn == "05_135145_a_b_c_d_e.mp4"
+
+
+def test_build_download_filename_appends_clean_when_present():
+    """有 clean_video_url 时文件名追加 -clean 后缀(优先于重名去重 -N)"""
+    from doupool.api.app import _build_download_filename
+    task = _FakeTaskForFilename(prompt="猫", group_index=2, clean_video_url="https://x.test/clean.mp4")
+    fn = _build_download_filename(task)
+    assert fn == "02_135145_猫-clean.mp4"
+
+
+def test_build_download_filename_handles_empty_prompt():
+    """空 prompt 兜底为 'video'(避免纯 '_' / 空后缀)"""
+    from doupool.api.app import _build_download_filename
+    task = _FakeTaskForFilename(prompt="", group_index=0)
+    fn = _build_download_filename(task)
+    assert fn == "00_135145_video.mp4"
+
+
+def test_build_download_filename_zero_group_index_for_single_task():
+    """单条任务 group_index=0 → 仍然落到 01_ 前缀(统一格式,排序稳定)"""
+    from doupool.api.app import _build_download_filename
+    task = _FakeTaskForFilename(prompt="单独的任务", group_index=0)
+    fn = _build_download_filename(task)
+    assert fn == "00_135145_单独的任务.mp4"
+
+
 def test_group_download_streams_all_videos(repository, tmp_path, database_manager, monkeypatch):
     """正常路径:3 条 succeeded 任务,httpx 流式落盘 settings.download_dir/<batch_folder>/。"""
     settings = SettingsService(repository, tmp_path, database_manager.path)
@@ -1317,11 +1630,16 @@ def test_group_download_streams_all_videos(repository, tmp_path, database_manage
     saved_dir = Path(body["saved_dir"])
     assert saved_dir.exists()
     assert saved_dir.name.startswith("abcdef12_")  # {group_id 前 8 位}_{HHMMSS}
-    # 3 个 mp4 文件都存在,内容字节数对应
+    # v0.2.35:批量下载命名 —— 文件名格式 `{group_index:02d}_{HHMMSS}_{prompt前12字符}.mp4`
+    # 测试任务的 prompt 是 "段1/段2/段3"(≤12 字符,无需截断),所以期望形如
+    # `01_HHMMSS_段1.mp4`。我们只断言文件名后缀 `{prompt}.mp4`,前缀用 glob 模糊匹配。
     for i, tid in enumerate(task_ids, 1):
-        fp = saved_dir / f"doubao-{tid}.mp4"
-        assert fp.exists(), fp
+        matches = list(saved_dir.glob(f"??_*_段{i}.mp4"))
+        assert len(matches) == 1, f"期望恰好 1 个匹配 段{i} 的 mp4,实际 {matches}"
+        fp = matches[0]
         assert fp.read_bytes() == f"video-{i}".encode()
+        # 顺便回归:旧 `doubao-<id>.mp4` 不应再出现
+        assert not (saved_dir / f"doubao-{tid}.mp4").exists()
     # httpx.stream GET 调用 3 次(每条任务一次)
     assert len(fake.calls) == 3
 

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
-import { Clapperboard, Download, ScrollText, Settings, UsersRound, Plus } from '@lucide/vue';
+import { Clapperboard, Download, ScrollText, Settings, UsersRound, Plus, Trash2 } from '@lucide/vue';
 import {
+  clearResults,
+  clearVideoTasks,
   createVideoTask,
   deleteAccount,
   deleteVideoTask,
@@ -69,6 +71,9 @@ type VideoTask = {
   group_id?: string;
   group_index?: number;
   created_at: string;
+  // v0.2.35:后端 _video_task_dict 注入的建议文件名,与 group_download 同源
+  // (`{group_index:02d}_{HHMMSS}_{prompt前12字符}[-clean].mp4`)。
+  download_filename?: string;
 };
 
 const page = ref<Page>('accounts');
@@ -114,6 +119,22 @@ const running = computed(() =>
 );
 const results = computed(() => tasks.value.filter((t) => t.status === 'succeeded' && t.result_url));
 const activeAccounts = computed(() => accounts.value.filter((a) => a.enabled && a.status === 'active').length);
+// v0.2.35:一键清除 —— 给按钮显示「N 个待清除」hint,N=0 时按钮 disable。
+const completedTaskCount = computed(
+  () => tasks.value.filter((t) => ['succeeded', 'failed', 'cancelled'].includes(t.status)).length,
+);
+const queuedTaskCount = computed(
+  () => tasks.value.filter((t) => t.status === 'queued').length,
+);
+const downloadedResultsCount = computed(
+  () =>
+    tasks.value.filter(
+      (t) => t.status === 'succeeded' && (t.clean_video_url || t.result_url),
+    ).length,
+);
+const allResultsCount = computed(
+  () => tasks.value.filter((t) => t.status === 'succeeded').length,
+);
 /** 有图=图生，无图=文生 */
 const submitMode = computed(() => (imageFiles.value.length > 0 ? 'i2v' : 't2v'));
 // v0.2.11:实时算当前文本会被切成几段,给底部 char-hint 显示提示
@@ -319,7 +340,7 @@ async function submitVideo() {
         : [];
     // 多段 → 自动归组;单段 → 走原 prompt 字段(向后兼容)
     const isGroup = promptSegments.length > 1;
-    await createVideoTask({
+    const response = await createVideoTask({
       prompt: isGroup ? '' : promptSegments[0],
       prompts: isGroup ? promptSegments : undefined,
       model: model.value,
@@ -332,14 +353,32 @@ async function submitVideo() {
     prompt.value = '';
     clearImages();
     showTaskDialog.value = false;
-    showToast(
-      'succeeded',
+    // v0.2.35:跨账号凑余额 —— 后端 200 OK + {task, partial_rejected};
+    // partial_rejected 非空时告知用户哪几条 prompt 暂时无账号可用、稍后会被自动重试
+    const rejected = response?.partial_rejected ?? [];
+    const queuedCount = promptSegments.length - rejected.length;
+    let baseMsg =
       mode === 'i2v'
         ? `图生任务已加入队列（${images.length} 张图）`
         : isGroup
           ? `${promptSegments.length} 段 prompt 已自动归组`
-          : '文生任务已加入队列',
-    );
+          : '文生任务已加入队列';
+    if (isGroup) {
+      baseMsg = `${queuedCount}/${promptSegments.length} 段已入队`;
+    }
+    if (rejected.length === 0) {
+      showToast('succeeded', baseMsg);
+    } else {
+      // v0.2.35:部分 prompt 因跨账号凑余额暂时无账号可用 —— warning Toast
+      // 给出明细让用户知道是哪几条,而不是只显示"已入队"造成疑惑
+      const detail = rejected
+        .map((r: { index: number; prompt: string }) => `#${r.index}「${r.prompt.slice(0, 16)}」`)
+        .join('、');
+      showToast(
+        'warning',
+        `${baseMsg};\n${rejected.length} 条暂无可用账号,稍后自动重试:${detail}`,
+      );
+    }
     await refreshTasks();
   } catch (error) {
     showToast('failed', error instanceof Error ? error.message : '创建任务失败');
@@ -441,6 +480,56 @@ function dismissToast() {
   state.value = '';
 }
 
+// v0.2.35:一键清除 —— 任务表「清完成」「清排队」按钮共用 confirm + 调端点。
+// running 状态服务端不会动(避免打断正在生成),所以前置 warn 主要为用户提示。
+async function onClearTasks(target: 'completed' | 'queued') {
+  if (busy.value) return;
+  const label = target === 'completed' ? '已完成(成功/失败/已取消)' : '排队中(未开始生成)';
+  const ok = window.confirm(
+    target === 'completed'
+      ? `确定清除所有 ${label} 的任务吗?\n将删除这些任务的记录(本地视频文件保留)。`
+      : `确定清除所有 ${label} 的任务吗?\n将删除这些任务的记录,并退还已预扣的额度。`,
+  );
+  if (!ok) return;
+  busy.value = true;
+  try {
+    const result = await clearVideoTasks(target);
+    showToast('succeeded', `已清除 ${result.deleted_count} 个任务`);
+    await refreshTasks();
+    await refreshAccounts();
+  } catch (error) {
+    showToast(
+      'failed',
+      error instanceof Error ? error.message : '清除任务失败',
+    );
+  } finally {
+    busy.value = false;
+  }
+}
+
+// v0.2.35:一键清除结果 —— 已下载 vs 全部。succeeded 已结算额度,无需退。
+async function onClearResults(downloadedOnly: boolean) {
+  if (busy.value) return;
+  const label = downloadedOnly ? '已下载(存在可下载链接)' : '全部';
+  const ok = window.confirm(
+    `确定清除所有 ${label} 的生成结果吗?\n将删除这些任务的记录(本地视频文件保留)。`,
+  );
+  if (!ok) return;
+  busy.value = true;
+  try {
+    const result = await clearResults(downloadedOnly);
+    showToast('succeeded', `已清除 ${result.deleted_count} 个结果`);
+    await refreshTasks();
+  } catch (error) {
+    showToast(
+      'failed',
+      error instanceof Error ? error.message : '清除结果失败',
+    );
+  } finally {
+    busy.value = false;
+  }
+}
+
 onMounted(async () => {
   await refreshAccounts();
   try {
@@ -537,15 +626,71 @@ onBeforeUnmount(() => {
               <span style="color: var(--text-faint)">·</span>
               <span>{{ tasks.length }} 总计</span>
             </div>
-            <DpButton variant="solid" @click="openTaskDialog">
-              <Plus :size="15" :stroke-width="2.25" />
-              ＋ 添加任务
-            </DpButton>
+            <div class="action-group">
+              <!-- v0.2.35:一键清除 —— 双按钮 + N=0 时 disable,confirm 弹窗后
+                   调后端,预扣的额度走退路,本地视频文件保留。 -->
+              <DpButton
+                size="sm"
+                variant="ghost"
+                :disabled="busy || completedTaskCount === 0"
+                :title="completedTaskCount === 0 ? '没有已完成任务可清' : `清除 ${completedTaskCount} 个成功/失败/已取消任务`"
+                @click="onClearTasks('completed')"
+              >
+                <Trash2 :size="13" :stroke-width="2" />
+                清已完成 ({{ completedTaskCount }})
+              </DpButton>
+              <DpButton
+                size="sm"
+                variant="ghost"
+                :disabled="busy || queuedTaskCount === 0"
+                :title="queuedTaskCount === 0 ? '没有排队中任务可清' : `清除 ${queuedTaskCount} 个排队任务(退还预扣额度)`"
+                @click="onClearTasks('queued')"
+              >
+                <Trash2 :size="13" :stroke-width="2" />
+                清排队 ({{ queuedTaskCount }})
+              </DpButton>
+              <DpButton variant="solid" @click="openTaskDialog">
+                <Plus :size="15" :stroke-width="2.25" />
+                ＋ 添加任务
+              </DpButton>
+            </div>
           </div>
           <VideoTaskTable :tasks="tasks" @retry="retryVideoTask" @delete="onDeleteVideoTask" @download-failed="onResultDownloadFailed" />
         </template>
 
-        <ResultsTable v-else-if="page === 'results'" :tasks="results" @download-failed="onResultDownloadFailed" />
+        <template v-else-if="page === 'results'">
+          <div class="page-actions">
+            <div class="meta">
+              <strong>{{ results.length }}</strong>
+              <span>个结果</span>
+            </div>
+            <div class="action-group">
+              <!-- v0.2.35:一键清除结果 —— 双按钮,本地视频文件保留,DB row 物理删。
+                   succeeded 任务在生成成功时已结算额度,无需退额度。 -->
+              <DpButton
+                size="sm"
+                variant="ghost"
+                :disabled="busy || downloadedResultsCount === 0"
+                :title="downloadedResultsCount === 0 ? '没有已下载结果可清' : `清除 ${downloadedResultsCount} 个已下载结果`"
+                @click="onClearResults(true)"
+              >
+                <Trash2 :size="13" :stroke-width="2" />
+                清已下载 ({{ downloadedResultsCount }})
+              </DpButton>
+              <DpButton
+                size="sm"
+                variant="ghost"
+                :disabled="busy || allResultsCount === 0"
+                :title="allResultsCount === 0 ? '没有结果可清' : `清除全部 ${allResultsCount} 个结果`"
+                @click="onClearResults(false)"
+              >
+                <Trash2 :size="13" :stroke-width="2" />
+                清全部 ({{ allResultsCount }})
+              </DpButton>
+            </div>
+          </div>
+          <ResultsTable :tasks="results" @download-failed="onResultDownloadFailed" />
+        </template>
         <LogsPage v-else-if="page === 'logs'" />
         <SettingsPage v-else @saved="applyDefaults" />
       </section>

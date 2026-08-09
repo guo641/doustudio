@@ -33,6 +33,9 @@ type ResultTask = {
   group_id?: string;
   group_index?: number;
   created_at: string;
+  // v0.2.35:后端 _video_task_dict 注入的建议文件名,与 group_download 同源
+  // (`{group_index:02d}_{HHMMSS}_{prompt前12字符}[-clean].mp4`)
+  download_filename?: string;
 };
 
 // v0.2.22 Q4:DownloadButton 三层 fallback 全失败时(reason 来自签名
@@ -117,6 +120,33 @@ function toggleGroup(key: string) {
   expandedGroups.value = next;
 }
 
+// v0.2.35:批量下载命名 —— 优先用后端 _video_task_dict.download_filename
+// (单条 + group_download 共用 `{group_index:02d}_{HHMMSS}_{prompt前12字符}[-clean].mp4`),
+// 后端没返就 fallback 到前端组装(老版本兼容)。
+function sanitizeFilenamePart(text: string, maxLen = 12): string {
+  if (!text) return 'video';
+  let out = '';
+  for (const ch of text) {
+    // Windows 非法字符 + 控制字符统一换成 _
+    const code = ch.charCodeAt(0);
+    if (code < 0x20 || code === 0x7f) { out += '_'; continue; }
+    if ('\\/:*?"<>|\r\n\t'.includes(ch)) { out += '_'; continue; }
+    out += ch;
+  }
+  out = out.trim().replace(/^\.+|\.+$/g, '');
+  return out.slice(0, maxLen) || 'video';
+}
+
+function filenameForTask(task: ResultTask, groupId: string | undefined): string {
+  // v0.2.35:后端主推 —— 命名一致;用户单条下载与 group_download 同格式
+  if (task.download_filename) {
+    return groupId ? `${batchFolderName(groupId)}/${task.download_filename}` : task.download_filename;
+  }
+  // v0.2.28 兼容:无 download_filename(老后端)时退化到 {group_id前8}_{HHMMSS}/doubao-{id}[-clean].mp4
+  const stem = `doubao-${task.id}${hasCleanVideo(task) ? '-clean' : ''}.mp4`;
+  return groupId ? `${batchFolderName(groupId)}/${stem}` : stem;
+}
+
 // v0.2.28:组 ID 前 8 位 + HHMMSS,作为浏览器下载管理器自动建子目录的
 // 文件名前缀。仅用于 filename 拼接,不在 FS 真建目录(那是后端的事)。
 function batchFolderName(groupId: string): string {
@@ -125,11 +155,6 @@ function batchFolderName(groupId: string): string {
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
   return `${groupId.slice(0, 8)}_${hh}${mm}${ss}`;
-}
-
-function filenameForTask(task: ResultTask, groupId: string | undefined): string {
-  const stem = `doubao-${task.id}${hasCleanVideo(task) ? '-clean' : ''}.mp4`;
-  return groupId ? `${batchFolderName(groupId)}/${stem}` : stem;
 }
 
 /**
