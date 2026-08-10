@@ -2,6 +2,64 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.37.2 - 2026-08-09
+
+v0.2.37 上线当天用户反馈:「只要 cookie 在线账号就没有问题」—— 软件读 cookie
+的姿势不对,而且 v0.2.37 加的 keepalive 90s + DPAPI Playwright 兜底 + 18s
+web_id 落盘探测太复杂。本次按用户决策简化为三步:
+
+### 修复(按用户原话「1方向对,2不保留,3需要」)
+
+1. **cookie 读取主源改成 cookies.json(首选)** v0.2.37 之前的代码读
+   `Default/Cookies` SQLite,Windows + Chromium v100+ 下 SQLite 里 `value` 列
+   被 DPAPI 加密成空串 → 拿不到 cookie → 抛 `TokenBundleUnavailable` →
+   前端 hint「profile 损坏」误导用户。
+
+   我们的 login 流程早就主动调 `context.cookies()` 把 doubao.com 明文 cookie
+   写到 `profile_dir/cookies.json`(见 `login/browser.py:_save_doubao_cookies_to_disk`),
+   这份备份就是首选数据源。
+
+   - [video/browser.py](src/doupool/video/browser.py) 新增
+     `_read_cookies_from_json` —— 从 `cookies.json` 读明文,文件不存在或
+     JSON 解析失败才回退到 SQLite(读 SQLite 即使拿到空 dict 也不再算错误,
+     仅当 cookies.json 也没数据时才抛 `TokenBundleUnavailable`)。
+   - [video/browser.py](src/doupool/video/browser.py) `extract_webmssdk_tokens`
+     改顺序:cookies.json 优先 → SQLite 兜底 → 任一有 doubao.com cookie 即可。
+
+2. **删 v0.2.37 的 DPAPI Playwright 兜底 + keepalive 90s + 18s 探测**(用户
+   明确说「不保留」):
+   - [video/browser.py](src/doupool/video/browser.py) 删除
+     `_BROWSER_FALLBACK_SENTINEL` 常量 + `_read_chromium_cookies_via_browser`
+     函数,`_read_chromium_cookies` 简化为只读 SQLite。
+   - [login/browser.py](src/doupool/login/browser.py) `keepalive_seconds`
+     90 → 30。
+   - [login/service.py](src/doupool/login/service.py) 默认 90 → 30。
+   - [main.py](src/doupool/main.py) `LoginService(keepalive_seconds=30.0)`。
+   - [api/app.py](src/doupool/api/app.py) `refresh-tokens` 删除
+     18s `wait_for_function` 探测,改回固定 8s wait,顺便在 cookies 落盘后
+     调 `_save_doubao_cookies_to_disk` 重写一份明文备份。
+
+3. **新增「🍪 重新导出 cookies」行级按钮**(用户明确说「需要」):
+   - [api/app.py](src/doupool/api/app.py) 新增
+     `POST /api/accounts/{id}/re-export-cookies` 端点 —— 打开 Chromium 约 8
+     秒,让 WebMSSDK 初始化,然后把当前 doubao.com cookie 明文写到
+     `profile_dir/cookies.json`。如果浏览器里读不到 doubao.com cookie(账号
+     已掉登录)返回 400 让用户重新扫码。
+   - [frontend/src/api.ts](frontend/src/api.ts) 加 `reExportCookies` 包装。
+   - [frontend/src/components/AccountTable.vue](frontend/src/components/AccountTable.vue)
+     每行加「🍪 重新导出 cookies」按钮 + confirm 二次确认防误触(因为会弹
+     浏览器窗口)。
+
+### 顺手修
+
+- **Local Storage 正则 bug** v0.2.17 起读 `leveldb/000003.log` 拿 web_id 时
+  regex 是 `__tea_cache_tokens_497858(.+?)</script>`,但 leveldb .log 文件
+  不是 HTML,根本不会有 `</script>` → 那个分支从来不会命中 → web_id 永远
+  从 storage 拿不到,只能 fall back 到 cookies.samantha_web_web_id(那条也
+  不一定存在)。本次改成
+  `(\{[^{}]{0,800}?"web_id"[^{}]{0,400}?\})` 抓最近的 JSON object,实测能命中。
+  - [video/browser.py](src/doupool/video/browser.py) `_read_chromium_local_storage`。
+
 ## v0.2.37 - 2026-08-09
 
 ### 修复

@@ -1097,6 +1097,17 @@ def test_refresh_tokens_returns_new_bundle(repository, tmp_path, temp_profile, m
                 def close(self):
                     pass
 
+                def is_closed(self):
+                    return False
+
+                def cookies(self, urls=None):
+                    return [
+                        {"name": "msToken", "value": "ms_refreshed_zzz",
+                         "domain": ".doubao.com", "path": "/"},
+                        {"name": "_signature", "value": "sig_refreshed",
+                         "domain": ".doubao.com", "path": "/"},
+                    ]
+
             return _Ctx()
 
     def fake_extract(profile_dir):
@@ -1173,6 +1184,15 @@ def test_refresh_tokens_returns_unavailable_when_bundle_still_missing(
                 def close(self):
                     pass
 
+                def is_closed(self):
+                    return False
+
+                def cookies(self, urls=None):
+                    return [
+                        {"name": "msToken", "value": "ms_fake",
+                         "domain": ".doubao.com", "path": "/"},
+                    ]
+
             return _Ctx()
 
     def fake_extract(profile_dir):
@@ -1244,6 +1264,212 @@ def test_refresh_tokens_requires_auth(repository, tmp_path):
 
 
 # ============================================================
+# v0.2.37.2:re-export-cookies 端点 —— 让 Playwright 重新打开浏览器拉一次
+# cookies 写回 cookies.json,适合 SQLite DPAPI 加密读不出明文时用户兜底用。
+# ============================================================
+
+
+def test_re_export_cookies_returns_ok_when_cookies_saved(
+    repository, tmp_path, temp_profile, monkeypatch,
+):
+    """v0.2.37.2:Playwright 拉到 doubao.com cookie → 200 + ok/saved=True + elapsed。"""
+    from doupool.db.models import Account
+
+    account = Account.create(
+        id="account-reexport-1", display_name="账号1", doubao_user_id="re1",
+        profile_dir=temp_profile,
+    )
+
+    class _Page:
+        def goto(self, url, **kw):
+            pass
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    class FakeBrowser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        @property
+        def chromium(self):
+            return self
+
+        def launch_persistent_context(self, profile_dir, **kwargs):
+            # 验证 endpoint 走可视化窗口 + 偏移位置(避免主屏闪烁)
+            assert kwargs.get("headless") is False
+            assert "--window-position=-2400,-2400" in kwargs["args"]
+
+            class _Ctx:
+                def __init__(self):
+                    self.pages = [_Page()]
+
+                def is_closed(self):
+                    return False
+
+                def close(self):
+                    pass
+
+                def new_page(self):
+                    return _Page()
+
+                def cookies(self, urls=None):
+                    return [
+                        {"name": "msToken", "value": "ms_reexport",
+                         "domain": ".doubao.com", "path": "/"},
+                        {"name": "_signature", "value": "sig_reexport",
+                         "domain": ".doubao.com", "path": "/"},
+                    ]
+
+            return _Ctx()
+
+    monkeypatch.setattr("doupool.api.app.sync_playwright", lambda: FakeBrowser())
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(
+        f"/api/accounts/{account.id}/re-export-cookies",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["saved"] is True
+    assert payload["elapsed"] >= 0
+    assert "已重新导出 cookies.json" in payload["hint"]
+    # 关键副作用:cookies.json 真的写出来了
+    cookies_json = Path(temp_profile) / "cookies.json"
+    assert cookies_json.exists()
+    import json as _json
+    data = _json.loads(cookies_json.read_text(encoding="utf-8"))
+    assert any(c["name"] == "msToken" for c in data)
+
+
+def test_re_export_cookies_returns_400_when_no_doubao_cookies(
+    repository, tmp_path, temp_profile, monkeypatch,
+):
+    """v0.2.37.2:Playwright 拉到 cookie 但没有 doubao.com 域 → 400,提示用户重新扫码。
+
+    场景:账号掉登录、或另一个用户在该 profile 登录了别的域名。
+    """
+    from doupool.db.models import Account
+
+    account = Account.create(
+        id="account-reexport-empty", display_name="空账号", doubao_user_id="re_empty",
+        profile_dir=temp_profile,
+    )
+
+    class _Page:
+        def goto(self, url, **kw):
+            pass
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    class FakeBrowser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        @property
+        def chromium(self):
+            return self
+
+        def launch_persistent_context(self, profile_dir, **kwargs):
+            class _Ctx:
+                pages = []  # 空 → 让 endpoint 走 new_page() 分支
+
+                def is_closed(self):
+                    return False
+
+                def close(self):
+                    pass
+
+                def new_page(self):
+                    return _Page()
+
+                def cookies(self, urls=None):
+                    return []  # 空数组 → 没有 doubao.com cookie
+
+            return _Ctx()
+
+    monkeypatch.setattr("doupool.api.app.sync_playwright", lambda: FakeBrowser())
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(
+        f"/api/accounts/{account.id}/re-export-cookies",
+        headers=headers,
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "掉登录" in detail or "重新扫码" in detail
+
+
+def test_re_export_cookies_returns_503_when_playwright_raises(
+    repository, tmp_path, temp_profile, monkeypatch,
+):
+    """v0.2.37.2:Playwright 启动失败 / Chromium 没装 → 503,跟 refresh-tokens 一致。"""
+    from doupool.db.models import Account
+
+    account = Account.create(
+        id="account-reexport-fail", display_name="坏账号", doubao_user_id="re_fail",
+        profile_dir=temp_profile,
+    )
+
+    def fake_playwright():
+        raise RuntimeError("Chromium 没装")
+
+    monkeypatch.setattr("doupool.api.app.sync_playwright", fake_playwright)
+
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+    headers = {"X-DouPool-Token": "secret"}
+
+    response = client.post(
+        f"/api/accounts/{account.id}/re-export-cookies",
+        headers=headers,
+    )
+
+    assert response.status_code == 503
+    assert "Chromium 没装" in response.json()["detail"]
+
+
+def test_re_export_cookies_404_when_account_missing(repository, tmp_path):
+    """v0.2.37.2:对不存在的账号调 re-export-cookies → 404,不触发 Playwright。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.post(
+        "/api/accounts/does-not-exist/re-export-cookies",
+        headers={"X-DouPool-Token": "secret"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_re_export_cookies_requires_auth(repository, tmp_path):
+    """v0.2.37.2:无 token → 401,跟其他端点一致。"""
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app("secret", tmp_path / "missing", repository, login))
+
+    response = client.post("/api/accounts/anything/re-export-cookies")
+
+    assert response.status_code == 401
+
+
+# ============================================================
 # v0.2.20:open-browser / close-browser / browser-status 端点
 # ============================================================
 
@@ -1253,6 +1479,9 @@ class _FakeOpenBrowserCtx:
 
     def __init__(self):
         self.pages = []
+
+    def is_closed(self):
+        return False
 
     def on(self, event, handler):
         pass

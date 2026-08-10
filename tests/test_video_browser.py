@@ -9,10 +9,10 @@ from doupool.video.browser import (
     UPLOAD_IMAGE_SCRIPT,
     TokenBundle,
     TokenBundleUnavailable,
-    _BROWSER_FALLBACK_SENTINEL,
     _build_launch_kwargs,
     _read_chromium_cookies,
-    _read_chromium_cookies_via_browser,
+    _read_chromium_local_storage,
+    _read_cookies_from_json,
     extract_webmssdk_tokens,
     load_browser_context,
     read_browser_fingerprint,
@@ -172,6 +172,7 @@ def test_extract_webmssdk_tokens_reads_cookies_sqlite(tmp_path):
         (".doubao.com", "msToken", "ms_from_sqlite", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
         (".doubao.com", "_signature", "sig_from_sqlite", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
         (".doubao.com", "s_v_web_id", "fp_from_sqlite", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+        (".doubao.com", "samantha_web_web_id", "wb_from_sqlite", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
         (".example.com", "msToken", "ms_other_domain", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
     ]
     conn.executemany(
@@ -180,16 +181,19 @@ def test_extract_webmssdk_tokens_reads_cookies_sqlite(tmp_path):
     conn.commit()
     conn.close()
 
-    # leveldb 路径不存在 → storage 空 → web_id / device_id 拿不到
+    # v0.2.37.2:cookies.json 不存在 → 走 SQLite 兜底。samantha_web_web_id
+    # 是 cookie 兜底给 web_id 用的字段,没有它现在的 hint 不再容忍。
     bundle = extract_webmssdk_tokens(profile_dir)
     assert bundle.ms_token == "ms_from_sqlite"
     assert bundle.web_id_signature == "sig_from_sqlite"
+    assert bundle.web_id == "wb_from_sqlite"
     assert bundle.device_id == "fp_from_sqlite"  # 兜底 s_v_web_id
 
 
 def test_extract_webmssdk_tokens_raises_when_profile_dir_missing(tmp_path):
-    """v0.2.17:profile 目录里啥都没有 → 抛 TokenBundleUnavailable。"""
-    with __import__("pytest").raises(TokenBundleUnavailable, match="web_id"):
+    """v0.2.37.2:profile 目录里啥都没有 → 抛 TokenBundleUnavailable,
+    hint 引导用户点「重新导出 cookies」按钮(替代 v0.2.17 的「web_id」字眼)。"""
+    with __import__("pytest").raises(TokenBundleUnavailable, match="重新导出 cookies"):
         extract_webmssdk_tokens(tmp_path / "empty_profile")
 
 
@@ -256,20 +260,98 @@ def test_extract_webmssdk_tokens_wraps_permission_error_on_read(tmp_path, monkey
     assert "being used by another process" in msg
 
 
-# --- v0.2.37:Chromium v100+ DPAPI cookie 加密兼容 + 等待时长 ---
+# --- v0.2.37.2:cookies.json 优先 + 删 DPAPI Playwright fallback ---
 
 
-def test_v0_2_37_read_chromium_cookies_returns_sentinel_when_value_column_encrypted(tmp_path):
-    """v0.2.37:Chromium v100+ 在 Windows 下 cookies 表 `value` 列为空,
-    真正值在 `encrypted_value` BLOB(DOAPI 加密)。SQLite 端拿不到明文
-    → _read_chromium_cookies 必须返 sentinel 触发 Playwright fallback,
-    而不是空 dict 让上层误判「profile 没数据」。
+def test_v0_2_37_2_read_cookies_from_json_returns_login_backup(tmp_path):
+    """v0.2.37.2:_read_cookies_from_json 读 login 流程主动导出的明文备份,
+    这是 DPAPI 加密问题的源头替代方案:登录成功的瞬间从 Chromium 进程直接
+    拉 cookies() 写明文到 profile_dir/cookies.json,后续任何时刻读此文件
+    都能拿到当前登录态。
     """
     profile_dir = tmp_path / "profile"
-    cookies_dir = profile_dir / "Default"
-    cookies_dir.mkdir(parents=True)
-    cookies_db = cookies_dir / "Cookies"
+    profile_dir.mkdir()
+    cookies_json = profile_dir / "cookies.json"
+    # 模拟 Playwright context.cookies() 输出的 Playwright Cookie 数组
+    cookies_json.write_text(
+        json.dumps([
+            {"name": "msToken", "value": "ms_from_json", "domain": ".doubao.com", "path": "/"},
+            {"name": "_signature", "value": "sig_from_json", "domain": ".doubao.com", "path": "/"},
+            {"name": "s_v_web_id", "value": "fp_from_json", "domain": ".doubao.com", "path": "/"},
+        ]),
+        encoding="utf-8",
+    )
 
+    result = _read_cookies_from_json(profile_dir)
+    assert result == {
+        "msToken": "ms_from_json",
+        "_signature": "sig_from_json",
+        "s_v_web_id": "fp_from_json",
+    }
+
+
+def test_v0_2_37_2_read_cookies_from_json_returns_none_when_missing(tmp_path):
+    """v0.2.37.2:profile 还没经过 login 流程(cookies.json 不存在)→
+    返 None 让上层走 SQLite 兜底,而不是空 dict 让上层误判「profile 没数据」。"""
+    profile_dir = tmp_path / "fresh_profile"
+    profile_dir.mkdir()
+    assert _read_cookies_from_json(profile_dir) is None
+
+
+def test_v0_2_37_2_read_cookies_from_json_returns_none_on_corrupt_json(tmp_path):
+    """v0.2.37.2:cookies.json 内容损坏(写到一半被 kill)→ 返 None 走 SQLite 兜底,
+    而不是冒泡让 endpoint 500。"""
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    (profile_dir / "cookies.json").write_text("{not valid json", encoding="utf-8")
+    assert _read_cookies_from_json(profile_dir) is None
+
+
+def test_v0_2_37_2_read_cookies_from_json_skips_malformed_entries(tmp_path):
+    """v0.2.37.2:cookies.json 数组里掺杂非 dict / 缺 name / 缺 value 项时,
+    必须跳过这些项而不是抛 KeyError。"""
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    (profile_dir / "cookies.json").write_text(
+        json.dumps([
+            {"name": "msToken", "value": "ms_ok"},
+            "not a dict",
+            {"name": "no_value"},
+            {"value": "no_name"},
+            {"name": "sig", "value": "sig_ok"},
+        ]),
+        encoding="utf-8",
+    )
+    result = _read_cookies_from_json(profile_dir)
+    assert result == {"msToken": "ms_ok", "sig": "sig_ok"}
+
+
+def test_v0_2_37_2_extract_prefers_cookies_json_over_sqlite(tmp_path, monkeypatch):
+    """v0.2.37.2:extract_webmssdk_tokens 优先用 cookies.json,即使 SQLite
+    也能返回数据,只要 cookies.json 存在就用它的值(cookies.json 是从
+    Chromium 进程实时拉的,比 SQLite 拿到的磁盘值更新)。
+
+    还顺带验证:cookies.json 里只放 msToken / _signature 时,web_id
+    仍从 cookies.samantha_web_web_id 兜底拿(s_v_web_id 也兜底 device_id)。
+    """
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+
+    # cookies.json 写明文
+    (profile_dir / "cookies.json").write_text(
+        json.dumps([
+            {"name": "msToken", "value": "ms_from_json_priority", "domain": ".doubao.com"},
+            {"name": "_signature", "value": "sig_from_json_priority", "domain": ".doubao.com"},
+            {"name": "samantha_web_web_id", "value": "wb_from_json_cookie", "domain": ".doubao.com"},
+            {"name": "s_v_web_id", "value": "fp_from_json_cookie", "domain": ".doubao.com"},
+        ]),
+        encoding="utf-8",
+    )
+
+    # SQLite 里写「旧」的值 —— 验证 cookies.json 优先
+    cookies_dir = profile_dir / "Default"
+    cookies_dir.mkdir()
+    cookies_db = cookies_dir / "Cookies"
     conn = sqlite3.connect(str(cookies_db))
     conn.execute(
         "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, "
@@ -277,92 +359,34 @@ def test_v0_2_37_read_chromium_cookies_returns_sentinel_when_value_column_encryp
         "is_httponly INTEGER, same_site INTEGER, last_access_utc INTEGER, "
         "has_expires INTEGER, priority INTEGER, samesite INTEGER)"
     )
-    # 模拟 Chromium v100+:value 列空,encrypted_value 有 BLOB(DPAPI 加密后)
     conn.executemany(
         "INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            (".doubao.com", "msToken", "", b"\x01\x02\x03dpapi_blob", "/", 0, 0, 0, 0, 0, 0, 0, 0),
-            (".doubao.com", "_signature", "", b"\x01\x02\x03dpapi_blob", "/", 0, 0, 0, 0, 0, 0, 0, 0),
-            (".example.com", "msToken", "ms_other_domain", b"", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+            (".doubao.com", "msToken", "ms_from_sqlite_stale", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+            (".doubao.com", "_signature", "sig_from_sqlite_stale", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
         ],
     )
     conn.commit()
     conn.close()
 
-    result = _read_chromium_cookies(profile_dir)
-    assert result is _BROWSER_FALLBACK_SENTINEL, (
-        f"DPAPI 加密场景必须返 sentinel 触发 fallback;got {result!r}"
-    )
-
-
-def test_v0_2_37_read_chromium_cookies_returns_empty_when_db_missing(tmp_path):
-    """v0.2.37:profile 刚创建、还没写过 Cookies 文件 → 返 sentinel
-    (让上层走 Playwright fallback 拿真实态)。"""
-    profile_dir = tmp_path / "fresh_profile"
-    (profile_dir / "Default").mkdir(parents=True)
-    result = _read_chromium_cookies(profile_dir)
-    assert result is _BROWSER_FALLBACK_SENTINEL
-
-
-def test_v0_2_37_extract_falls_back_to_browser_cookies_on_dpapi(tmp_path, monkeypatch):
-    """v0.2.37:SQLite DPAPI 加密 → 走 Playwright fallback 拿明文。
-
-    monkeypatch _read_chromium_cookies 返 sentinel、monkeypatch
-    _read_chromium_cookies_via_browser 返 mock 明文 cookies,然后构造一个
-    空 leveldb profile_dir,验证 extract 仍然能拼出 TokenBundle 的 cookie 字段。
-    """
-    profile_dir = tmp_path / "fake_dpapi_profile"
-    profile_dir.mkdir(parents=True)
-
-    monkeypatch.setattr(
-        "doupool.video.browser._read_chromium_cookies",
-        lambda _pd: _BROWSER_FALLBACK_SENTINEL,
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._read_chromium_cookies_via_browser",
-        lambda _pd: {"msToken": "ms_from_browser", "_signature": "sig_from_browser"},
-    )
-
     bundle = extract_webmssdk_tokens(profile_dir)
-    # leveldb 没数据 → web_id / device_id 拿不到 → 缺这两个关键字段,
-    # 但 msToken / _signature 走通了(说明 fallback 成功)
-    assert bundle.ms_token == "ms_from_browser"
-    assert bundle.web_id_signature == "sig_from_browser"
+    # cookies.json 优先 → 拿到的是 ms_from_json_priority,不是 sqlite 的 stale 版本
+    assert bundle.ms_token == "ms_from_json_priority"
+    assert bundle.web_id_signature == "sig_from_json_priority"
+    # web_id / device_id 在 cookies.json 里走 cookie 兜底
+    assert bundle.web_id == "wb_from_json_cookie"
+    assert bundle.device_id == "fp_from_json_cookie"
 
 
-def test_v0_2_37_extract_hint_differentiates_empty_vs_corrupt_profile(tmp_path, monkeypatch):
-    """v0.2.37:hint 必须区分两种失败场景,用户能定位该重 login 还是刷新就好。
-    场景 A:profile 完全空白(刚 login 没访问过 chat)→ hint 提到「访问 chat 主页」
-    场景 B:Cookies SQLite 存在但 doubao 域没数据 + Playwright fallback 也返空
-            → hint 提到「profile 损坏 / 重新登录」
-    """
-    # 场景 A:profile 完全空白 → 走 sentinel → Playwright fallback 也返空
-    #         → hint 必须引导用户访问 chat 主页
-    empty_profile = tmp_path / "empty"
-    empty_profile.mkdir()
-    monkeypatch.setattr(
-        "doupool.video.browser._read_chromium_cookies_via_browser",
-        lambda _pd: {},
-    )
-    with __import__("pytest").raises(TokenBundleUnavailable) as exc_a:
-        extract_webmssdk_tokens(empty_profile)
-    msg_a = str(exc_a.value)
-    assert "访问" in msg_a and "chat" in msg_a, (
-        f"空 profile hint 必须引导用户访问 chat 主页;got {msg_a!r}"
-    )
-
-
-def test_v0_2_37_extract_hint_profile_corrupt_when_cookies_db_exists_but_empty(monkeypatch, tmp_path):
-    """v0.2.37:profile 里 Cookies SQLite 存在但 doubao 域没行(只有 example 域),
-    + leveldb 也没数据 → 走 Playwright fallback 如果也返空 → hint 提示「profile 损坏」。
+def test_v0_2_37_2_extract_falls_back_to_sqlite_when_cookies_json_absent(tmp_path):
+    """v0.2.37.2:cookies.json 不存在(老用户升级前 / 走的 SQLite 路径)→
+    必须能继续从 Default/Cookies 拿到 msToken / _signature,不能因为优先
+    cookies.json 就把老路径打挂。
     """
     profile_dir = tmp_path / "profile"
-    profile_dir.mkdir()
     cookies_dir = profile_dir / "Default"
-    cookies_dir.mkdir()
+    cookies_dir.mkdir(parents=True)
     cookies_db = cookies_dir / "Cookies"
-
-    # SQLite 文件存在但只有 example 域 cookie(doubao 域没行 → sentinel 路径)
     conn = sqlite3.connect(str(cookies_db))
     conn.execute(
         "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, "
@@ -370,99 +394,133 @@ def test_v0_2_37_extract_hint_profile_corrupt_when_cookies_db_exists_but_empty(m
         "is_httponly INTEGER, same_site INTEGER, last_access_utc INTEGER, "
         "has_expires INTEGER, priority INTEGER, samesite INTEGER)"
     )
-    conn.execute(
+    conn.executemany(
         "INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (".example.com", "tracking", "x", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+        [
+            (".doubao.com", "msToken", "ms_from_sqlite", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+            (".doubao.com", "_signature", "sig_from_sqlite", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+            (".doubao.com", "s_v_web_id", "fp_from_sqlite", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+            (".doubao.com", "samantha_web_web_id", "wb_from_sqlite_cookie", "", "/", 0, 0, 0, 0, 0, 0, 0, 0),
+        ],
     )
     conn.commit()
     conn.close()
 
-    # Playwright fallback 也返空(模拟浏览器启动失败)
-    monkeypatch.setattr(
-        "doupool.video.browser._read_chromium_cookies_via_browser",
-        lambda _pd: {},
-    )
+    bundle = extract_webmssdk_tokens(profile_dir)
+    assert bundle.ms_token == "ms_from_sqlite"
+    assert bundle.web_id_signature == "sig_from_sqlite"
+    # web_id SQLite 拿不到 → 走 cookie 兜底(s_v_web_id 或 samantha_web_web_id)
+    assert bundle.web_id == "wb_from_sqlite_cookie"
+    assert bundle.device_id == "fp_from_sqlite"
 
+
+def test_v0_2_37_2_extract_raises_when_essential_fields_missing(tmp_path):
+    """v0.2.37.2:cookies.json / SQLite / storage 三个源都拿不到 web_id +
+    msToken → 抛 TokenBundleUnavailable 且 hint 引导用户点「重新导出 cookies」。
+    """
+    profile_dir = tmp_path / "empty_profile"
+    profile_dir.mkdir()
     with __import__("pytest").raises(TokenBundleUnavailable) as exc_info:
         extract_webmssdk_tokens(profile_dir)
-
     msg = str(exc_info.value)
-    # hint 必须提示「profile 损坏」或「DPAPI」或「删除 profile 重新登录」
-    assert any(
-        keyword in msg
-        for keyword in ("profile", "损坏", "DPAPI", "删除", "重新登录")
-    ), f"损坏场景 hint 必须引导用户重新登录;got {msg!r}"
+    assert "重新导出 cookies" in msg, (
+        f"hint 必须引导用户点「重新导出 cookies」按钮;got {msg!r}"
+    )
 
 
-def test_v0_2_37_read_chromium_cookies_via_browser_returns_empty_when_playwright_missing(monkeypatch, tmp_path):
-    """v0.2.37:Playwright fallback 抛任何异常时(浏览器没装 / 启动失败)→
-    必须返空 dict 而不是冒泡。extract_webmssdk_tokens 的 fallback 不能
-    让 Playwright 异常穿透整个流程变成 500。
-
-    我们通过 monkeypatch `playwright.sync_api.sync_playwright` 让它抛
-    RuntimeError —— 函数体内部 `from playwright.sync_api import sync_playwright`
-    的 `sync_playwright` 名字会触发 module attr lookup → 抛错 → 我们的 try/except 接住。
+def test_v0_2_37_2_local_storage_regex_extracts_web_id_without_script_tag(tmp_path):
+    """v0.2.37.2:修复 v0.2.17 的 leveldb regex bug —— 之前用 `(.+?)</script>`
+    期待 HTML script 边界,但 leveldb 000003.log 是二进制文本,根本没有
+    `</script>` → 那个分支永远不命中,导致 web_id 永远从 storage 拿不到。
+    新 regex 用 `(\\{...?"web_id"...\\})` 抓最近的 JSON object,本测试用
+    一个不含 `</script>` 但包含 `__tea_cache_tokens_497858` 块的 leveldb
+    数据,验证能抽出 web_id + user_unique_id。
     """
     profile_dir = tmp_path / "profile"
-    profile_dir.mkdir()
-
-    # 试图让 playwright sync_api 里的 sync_playwright 抛 RuntimeError
-    try:
-        from playwright.sync_api import sync_playwright as _real_pw
-        # 如果 playwright 没装,跳过这个测试 ——
-        # 该 case 在生产环境永远命中(playwright 是 hard dep)
-        # 本地没装 playwright 的情况:直接验「调用返 dict」即可
-        del _real_pw
-    except ImportError:
-        pytest.skip("playwright not installed, skip playwright-missing test")
-
-    # 真的装了 playwright → patch 让它抛错
-    def boom():
-        raise RuntimeError("simulated playwright launch failure")
-
-    import doupool.video.browser as vb
-    # patch 函数体里局部 import 的同名符号 —— 必须 patch 模块级别才能让
-    # `from playwright.sync_api import sync_playwright` 拿到我们的版本
-    # 但函数体用 `from X import Y` 会在函数 call 时执行 import,直接捕获
-    # 我们的 boom 在那个局部名字里。
-    # 替代方案:patch 整个 Playwright 路径会污染太大,这里只验证函数存在 + 兜底返 dict 逻辑
-    # 在另一个 test(test_v0_2_37_extract_falls_back_to_browser_cookies_on_dpapi)里覆盖。
-    assert callable(vb._read_chromium_cookies_via_browser)
-    # 兜底返 {} 的语义:在 fallback 抛错时,函数 catch 后返 {}。
-    # 我们直接 monkeypatch 内部 _read_chromium_cookies_via_browser 自身来证明
-    # 上一层 extract_webmssdk_tokens 不会 500。
-    monkeypatch.setattr(
-        vb, "_read_chromium_cookies_via_browser",
-        lambda _pd: {},
+    storage_dir = profile_dir / "Default" / "Local Storage" / "leveldb"
+    storage_dir.mkdir(parents=True)
+    log = storage_dir / "000003.log"
+    # 模拟 leveldb 一条记录:key=`__tea_cache_tokens_497858`,value 是 JSON
+    # 注意:leveldb 没有 `</script>` —— 这正是 v0.2.17 旧 regex 抓不到的原因
+    log.write_bytes(
+        b"\x00\x01__tea_cache_tokens_497858"
+        b'{"user_unique_id":"tu_abc12345","web_id":"wb_xyz98765","expire":1234567890}'
+        b"\x00\x00",
     )
-    # 此时 extract 必须不抛 RuntimeError 透出,而是抛 TokenBundleUnavailable
-    with pytest.raises(TokenBundleUnavailable):
-        extract_webmssdk_tokens(profile_dir)
+
+    out = _read_chromium_local_storage(profile_dir)
+    assert out.get("web_id") == "wb_xyz98765", f"web_id 必须从 storage 抽出;got {out!r}"
+    assert out.get("tea_uuid") == "tu_abc12345", f"tea_uuid (user_unique_id) 必须抽出;got {out!r}"
 
 
-def test_v0_2_37_keepalive_default_is_90_seconds():
-    """v0.2.37:login keepalive 默认从 30s 提到 90s —— WebMSSDK 全链路
-    ~10-20s,30s 太紧用户经常被提前关窗。验证三个入口点的默认值:
+def test_v0_2_37_2_local_storage_regex_extracts_samantha_web_id(tmp_path):
+    """v0.2.37.2:samantha_web_web_id 块中的 web_id 字段 → 抽到 device_id
+    (device_id 之前是从 s_v_web_id cookie 兜底,现在优先从 samantha web_id 拿,
+    因为这是 WebMSSDK 的真实 device 字段)。"""
+    profile_dir = tmp_path / "profile"
+    storage_dir = profile_dir / "Default" / "Local Storage" / "leveldb"
+    storage_dir.mkdir(parents=True)
+    log = storage_dir / "000003.log"
+    log.write_bytes(
+        b"samantha_web_web_id"
+        b'{"web_id":"dev_from_samantha_block","mode":"strict"}',
+    )
+
+    out = _read_chromium_local_storage(profile_dir)
+    assert out.get("device_id") == "dev_from_samantha_block", (
+        f"device_id 必须从 samantha_web_web_id 块抽出;got {out!r}"
+    )
+
+
+def test_v0_2_37_2_local_storage_returns_empty_when_log_missing(tmp_path):
+    """v0.2.37.2:leveldb 000003.log 还没创建(冷启动)→ 返 {} 不抛异常。"""
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    assert _read_chromium_local_storage(profile_dir) == {}
+
+
+def test_v0_2_37_2_local_storage_handles_partial_corrupt_json(tmp_path):
+    """v0.2.37.2:leveldb 二进制可能在 Chromium 写入时被截断,只读到半个 JSON
+    → json.loads 抛 ValueError → 必须吞掉,返 {}(让上层走 cookie 兜底)
+    而不是冒泡。"""
+    profile_dir = tmp_path / "profile"
+    storage_dir = profile_dir / "Default" / "Local Storage" / "leveldb"
+    storage_dir.mkdir(parents=True)
+    log = storage_dir / "000003.log"
+    log.write_bytes(
+        b"__tea_cache_tokens_497858"
+        b'{"user_unique_id":"tu_half","web_id":"wb_hal',  # 故意截断
+    )
+
+    # 不能让 ValueError 冒泡
+    out = _read_chromium_local_storage(profile_dir)
+    # 解析失败 → 备用 regex 抓不到完整 web_id → 返 {}
+    assert isinstance(out, dict)
+
+
+def test_v0_2_37_2_keepalive_default_is_30_seconds():
+    """v0.2.37.2:回退 v0.2.37 的 90s 改动,login keepalive 恢复 30s 默认
+    (用户反馈「只要 cookie 在线账号就没问题」,不需要延长 keepalive)。
+
+    验证三个入口点的默认值:
     LoginService 类型注解 + PlaywrightLoginRunner.__init__ 默认值。
     """
-    # LoginService 类型注解(检查 inspect.signature 默认)
     import inspect
 
     from doupool.login.service import LoginService
 
     sig = inspect.signature(LoginService.__init__)
     keepalive_param = sig.parameters["keepalive_seconds"]
-    assert keepalive_param.default == 90.0, (
-        f"LoginService.keepalive_seconds 默认必须 = 90.0;got {keepalive_param.default}"
+    assert keepalive_param.default == 30.0, (
+        f"LoginService.keepalive_seconds 默认必须 = 30.0;got {keepalive_param.default}"
     )
 
-    # PlaywrightLoginRunner.__init__ 默认值
     from doupool.login.browser import PlaywrightLoginRunner
 
     sig2 = inspect.signature(PlaywrightLoginRunner.__init__)
     keepalive_param2 = sig2.parameters["keepalive_seconds"]
-    assert keepalive_param2.default == 90.0, (
-        f"PlaywrightLoginRunner.keepalive_seconds 默认必须 = 90.0;got {keepalive_param2.default}"
+    assert keepalive_param2.default == 30.0, (
+        f"PlaywrightLoginRunner.keepalive_seconds 默认必须 = 30.0;got {keepalive_param2.default}"
     )
 
 

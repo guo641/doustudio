@@ -901,8 +901,13 @@ def create_app(
         """v0.2.17:启动 headless Playwright 访问 doubao.com/chat/ 让 WebMSSDK
         重新跑一次(产生新 msToken),然后再 extract_webmssdk_tokens 读新 bundle。
 
-        msToken 过期时用户点 UI 「刷新 token」按钮触发。同步跑 Playwright 会
-        阻塞 FastAPI 事件循环 ~5-10 秒,所以走 asyncio.to_thread 抛到 threadpool。
+        v0.2.37.2:简化实现 —— 不再等 18s 探 web_id 落盘(那条路径实测在生产环境
+        经常让用户等不到结果)。改成「打开浏览器 → 8s 等 WebMSSDK 初始化 →
+        调用 _save_doubao_cookies_to_disk 写 cookies.json → 关窗」,让
+        extract_webmssdk_tokens 通过 cookies.json 拿到当前真实登录态。
+
+        如果 web_id 没落地(用户从未在浏览器里访问过 chat/),extract 仍会抛
+        TokenBundleUnavailable,UI 提示「请在浏览器里手动访问 chat/ 主页」。
         """
         authorize(x_doupool_token, authorization)
         account = Account.get_or_none(Account.id == account_id)
@@ -911,9 +916,8 @@ def create_app(
         profile_dir = Path(account.profile_dir)
 
         def _refresh():
-            # headless=False 是必须的:WebMSSDK 会拒绝 headless 拉新 token。
-            # 但 refresh 端点不需要可视化 — 浏览器窗口弹个 1s 就关,不打扰用户。
             t0 = time.monotonic()
+            from doupool.login.browser import _save_doubao_cookies_to_disk
             with sync_playwright() as pw:
                 ctx = pw.chromium.launch_persistent_context(
                     str(profile_dir),
@@ -930,31 +934,10 @@ def create_app(
                         wait_until="domcontentloaded",
                         timeout=30_000,
                     )
-                    # v0.2.37:WebMSSDK 跑完整条链路(init → 拉 msToken → 写
-                    # __tea_cache_tokens_497858 → 写 samantha_web_web_id)
-                    # 实测冷启动 10-25s,8s 等不够 → 用户连续点 5 次还是
-                    # 抽不到 web_id。把 wait 提到 18s,并显式 wait_for_function
-                    # 探到 __tea_cache_tokens_497858 落盘就早退。
-                    web_id_ready = """
-                        () => {
-                            try {
-                                const t = JSON.parse(localStorage.getItem('__tea_cache_tokens_497858') || '{}');
-                                if (t && (t.web_id || t.user_unique_id)) return true;
-                            } catch (e) {}
-                            try {
-                                const s = JSON.parse(localStorage.getItem('samantha_web_web_id') || '{}');
-                                if (s && s.web_id) return true;
-                            } catch (e) {}
-                            return false;
-                        }
-                    """
-                    try:
-                        page.wait_for_function(web_id_ready, timeout=18_000)
-                    except Exception:
-                        # 18s 还是没等到 → 走兜底 wait_for_timeout 让进程
-                        # 自然 close,然后 extract 会用真实兜底 hint 提示
-                        # 用户「profile 损坏」或「web_id 没落地」。
-                        page.wait_for_timeout(2_000)
+                    # v0.2.37.2:8 秒等 SDK 初始化足够(主路径已经走 cookies.json
+                    # 优先,web_id 缺失也只是 web_id 字段为空,不影响登录态读取)。
+                    page.wait_for_timeout(8_000)
+                    _save_doubao_cookies_to_disk(ctx, profile_dir)
                 finally:
                     try:
                         ctx.close()
@@ -992,6 +975,78 @@ def create_app(
         return {
             **_token_bundle_dict(bundle, available=True),
             "hint": f"刷新成功,耗时 {elapsed:.1f}s",
+        }
+
+    # v0.2.37.2:「重新导出 cookies」专用端点 ——
+    # 跟 refresh-tokens 逻辑相同(打开浏览器 → 写 cookies.json → 关),但语义
+    # 更清楚:用户点击这个按钮时,目标是「让 cookies.json 重新可读」,跟
+    # 「让 WebMSSDK 跑一遍拿新 msToken」是两种不同诉求。如果 cookies.json
+    # 还在,或者 cookies.json 解析失败,这个按钮能让 Playwright 用最新 cookie
+    # 重写一份明文备份(避开 DPAPI 加密 / 文件损坏等问题)。
+    @app.post("/api/accounts/{account_id}/re-export-cookies", status_code=200)
+    async def re_export_cookies(
+        account_id: str,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        authorize(x_doupool_token, authorization)
+        account = Account.get_or_none(Account.id == account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        profile_dir = Path(account.profile_dir)
+
+        def _do():
+            from doupool.login.browser import _save_doubao_cookies_to_disk
+            t0 = time.monotonic()
+            with sync_playwright() as pw:
+                ctx = pw.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    headless=False,
+                    args=[
+                        "--window-position=-2400,-2400",
+                        "--window-size=900,650",
+                    ],
+                )
+                try:
+                    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                    page.goto(
+                        "https://www.doubao.com/chat/",
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                    page.wait_for_timeout(8_000)
+                    saved = _save_doubao_cookies_to_disk(ctx, profile_dir)
+                    return {
+                        "saved": saved,
+                        "elapsed": time.monotonic() - t0,
+                    }
+                finally:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+
+        try:
+            result = await asyncio.to_thread(_do)
+        except Exception as exc:
+            logging.getLogger("doupool.api").exception(
+                "重新导出 cookies 失败: account=%s", account_id
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=f"重新导出 cookies 失败:{exc}",
+            ) from exc
+        if not result["saved"]:
+            raise HTTPException(
+                status_code=400,
+                detail="重新导出失败:浏览器里读不到 doubao.com cookie,"
+                "可能账号已掉登录,请重新扫码登录。",
+            )
+        return {
+            "ok": True,
+            "saved": True,
+            "elapsed": round(result["elapsed"], 1),
+            "hint": f"已重新导出 cookies.json,耗时 {result['elapsed']:.1f}s",
         }
 
     # v0.2.20:「📂 打开浏览器」按钮 ——

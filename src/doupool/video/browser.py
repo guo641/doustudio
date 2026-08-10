@@ -96,20 +96,55 @@ class TokenBundle:
         return max(0.0, time.time() - self.fetched_at)
 
 
+def _read_cookies_from_json(profile_dir: Path) -> dict[str, str] | None:
+    """v0.2.37.2:读我们登录时主动导出的 cookies.json(首选数据源)。
+
+    为什么首选 cookies.json 而不是 Chromium SQLite:
+      - login/browser.py 在扫码登录成功时主动调用 `context.cookies()` 把
+        doubao.com 域 cookie 写到 profile_dir/cookies.json,这是**实时从
+        Chromium 进程里拉出的明文**,没有 DPAPI 加密问题。
+      - 之后任何时刻读 cookies.json 都能拿到当前的登录态。
+      - 而 `Default/Cookies` SQLite 在我们的 profile 里**根本不存在**(我们的
+        profile 是 Playwright 启动时按需创建的,正常情况下登录流程结束 context
+        关闭后 SQLite 才会落地;如果用户关掉软件太快或 process kill,SQLite
+        可能没刷盘)。
+
+    返回 {name: value} dict 或 None(文件不存在 / 解析失败 → 让上层走 SQLite fallback)。
+    """
+    target = profile_dir / "cookies.json"
+    if not target.exists():
+        return None
+    try:
+        raw = target.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        _LOGGER.warning("读 cookies.json 失败(%s): %s", target, exc)
+        return None
+    if not isinstance(data, list):
+        return None
+    out: dict[str, str] = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        value = entry.get("value")
+        if name and value:
+            out[str(name)] = str(value)
+    return out
+
+
 def _read_chromium_cookies(profile_dir: Path) -> dict[str, str]:
-    """v0.2.17:读 Chromium Cookies SQLite(Default/Cookies),key 是 cookie name。
+    """读 Chromium Cookies SQLite(Default/Cookies 或 Network/Cookies)。
 
     返回 {cookie_name: value},失败抛 TokenBundleUnavailable。Chromium 在 Windows
     下用 SQLite 存 cookie,内部 hosts 表里 doubao.com 一行一行都展开。lock 文件
     临时库 profile 锁住读不到 → 复制到 tmp 再读。
 
-    v0.2.37 兼容:Chromium v100+ 起 `value` 列在 Windows 下被 DPAPI 加密,SQLite
-    读出来是空字符串,真正值在 `encrypted_value` BLOB 里 —— 我们没有 WIN32 DPAPI
-    key(用户级别 OS 上下文),不能解密。所以路径变成:
-      1. 先尝试 SQLite 读 `value` 列(老 Chromium / 解密版本能拿到)
-      2. 如果一行 doubao.com 域的 cookie 都没有非空 `value`,标记 _needs_browser_fallback
-      3. 让 `extract_webmssdk_tokens` 调 Playwright `context.cookies()` 在浏览器进程
-         里直接读(已用 Chromium 的 OS 解密),结果 merge 回来
+    v0.2.37.2:这步现在是**次选**,首选走 `_read_cookies_from_json`(我们登录时
+    主动导出的明文备份)。如果 cookies.json 都没有,再尝试 SQLite 直读。
+    Chromium v100+ 在 Windows 上 `value` 列是 DPAPI 加密后的空串、真正值在
+    `encrypted_value` BLOB 里 —— 我们没有 DPAPI key 解不出来,这种情况就返回空
+    dict(让上层 hint "请点重新导出 cookies"让 Playwright 帮我们拉明文回写)。
     """
     candidates = [
         profile_dir / "Default" / "Cookies",
@@ -117,14 +152,12 @@ def _read_chromium_cookies(profile_dir: Path) -> dict[str, str]:
     ]
     db_path = next((p for p in candidates if p.exists()), None)
     if db_path is None:
-        # 文件不存在 → 可能是临时 profile 还没写入 Cookies,让上层走浏览器 fallback
-        return _BROWSER_FALLBACK_SENTINEL
+        return {}
 
     tmp = db_path.with_suffix(".doupool.read.tmp")
     # v0.2.36:Chromium 在用时 read_bytes / connect 可能抛 PermissionError /
     # DatabaseError / OperationalError(损坏文件 / 文件锁 / io error),全都归到
-    # TokenBundleUnavailable,让上层 endpoint 一处 catch 就能拿到真实原因
-    # 而不是 500 给前端一个「token 状态加载失败」的模糊兜底。
+    # TokenBundleUnavailable,让上层 endpoint 一处 catch 就能拿到真实原因。
     try:
         try:
             tmp.write_bytes(db_path.read_bytes())
@@ -135,23 +168,14 @@ def _read_chromium_cookies(profile_dir: Path) -> dict[str, str]:
             conn.execute("PRAGMA query_only = ON")
         try:
             cur = conn.cursor()
-            # v0.2.37:同时读 value + encrypted_value,以便后续判定是否需要
-            # 浏览器 in-process fallback(DPAPI 加密场景)
             cur.execute(
-                "SELECT name, value, encrypted_value, host_key FROM cookies "
+                "SELECT name, value, host_key FROM cookies "
                 "WHERE host_key LIKE '%doubao.com%'"
             )
             cookies: dict[str, str] = {}
-            any_doubao_row = False
-            for name, value, enc_value, host in cur.fetchall():
-                any_doubao_row = True
+            for name, value, host in cur.fetchall():
                 if name and value:
                     cookies[name] = value
-                # 注:encrypted_value 的 DPAPI 解密必须 Chromium 自己进程,这里只统计
-                # 是否有 doubao.com 行 — 后面 _needs_browser_fallback 用
-            if any_doubao_row and not cookies:
-                # 全是 encrypted_value,SQLite 这边取不到明文 → 返回 sentinel 触发 fallback
-                return _BROWSER_FALLBACK_SENTINEL
             return cookies
         finally:
             conn.close()
@@ -167,54 +191,18 @@ def _read_chromium_cookies(profile_dir: Path) -> dict[str, str]:
             pass
 
 
-# v0.2.37:marker object —— SQLite 拿不到明文时返回它,触发 Playwright fallback
-_BROWSER_FALLBACK_SENTINEL: dict[str, str] = {"__browser_fallback__": "1"}
-
-
-def _read_chromium_cookies_via_browser(profile_dir: Path) -> dict[str, str]:
-    """v0.2.37:用 Playwright 启动一个临时 persistent context,直接拿 cookies。
-
-    Chromium 启动后会用当前用户的 DPAPI key 解密 `encrypted_value` 列(系统
-    context 当前登录用户 = 我们的 service 进程用户 = 解密 key 持有者),
-    所以 `context.cookies()` 拿到的就是明文。这是 v100+ 唯一能拿到 cookie
-    明文的非注入路径(我们没 win32crypt.crypt_unprotect_data 的 key)。
-
-    调用方必须保证 profile_dir 当前没有 Chromium 锁(否则 launch_persistent_context
-    会卡住或冲突);refresh-tokens 端点刚好刚关掉自己的 context,这里接着用是安全的。
-    """
-    from playwright.sync_api import sync_playwright
-
-    try:
-        with sync_playwright() as pw:
-            ctx = pw.chromium.launch_persistent_context(
-                str(profile_dir),
-                headless=True,
-                args=["--no-sandbox"],
-            )
-            try:
-                cookies_raw = ctx.cookies()
-                cookies = {
-                    c.get("name", ""): c.get("value", "")
-                    for c in cookies_raw
-                    if "doubao.com" in (c.get("domain") or "")
-                }
-                return cookies
-            finally:
-                try:
-                    ctx.close()
-                except Exception:
-                    pass
-    except Exception as exc:
-        _LOGGER.warning("Playwright cookie fallback 失败: %s", exc)
-        return {}
-
-
 def _read_chromium_local_storage(profile_dir: Path) -> dict[str, str]:
-    """v0.2.17:读 Local Storage leveldb,挑出 web_id / device_id / tea_uuid。
+    """v0.2.37.2:读 Local Storage leveldb,挑出 web_id / tea_uuid / device_id。
 
-    leveldb 是二进制格式(每条记录 varint 头 + key + value),直接读 .log 文件
-    用正则扫 `__tea_cache_tokens_497858` / `samantha_web_web_id` 出现的 JSON。
-    实测这两个 key 在 Chromium 重启后会被压到 .log 文件(冷启动),足够用。
+    leveldb .log 是二进制格式,每条记录是 varint length + key + JSON value。
+    直接用正则扫 `__tea_cache_tokens_497858` / `samantha_web_web_id` 后面
+    跟着的 JSON 字串,挑出 web_id / user_unique_id 字段。
+
+    v0.2.37.2 修了 v0.2.17 的 bug: 之前 regex 用 `(.+?)</script>` 期待 HTML script
+    边界,但 leveldb .log 不是 HTML,根本不会有 `</script>` — 那个分支从未命中。
+    改成 `(\{[^{}]*?"web_id"[^{}]*?\})` 抓最近的 JSON object。
+
+    实测冷启动下 web_id 会被压到 .log 文件;如果没读到就用 cookies 兜底。
     """
     log_path = profile_dir / "Default" / "Local Storage" / "leveldb" / "000003.log"
     if not log_path.exists():
@@ -228,10 +216,17 @@ def _read_chromium_local_storage(profile_dir: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     # v0.2.36:把所有 raw decode + regex + json.loads 异常都吞掉(leveldb .log 可能
     # 在 Chromium 写入时被截断,读到半个 JSON → json.loads 抛 ValueError)。
-    # 让上层只通过 web_id 是否缺失来判定 TokenBundleUnavailable,而不是 500。
+    # v0.2.37.2:修了一个更老的 bug——之前 regex 是 `(.+?)</script>`,但 leveldb
+    # .log 文件不是 HTML,根本不会有 `</script>` → 那个分支永远不会命中,导致
+    # web_id 永远从 storage 拿不到,只能 fall back 到 cookies.samantha_web_web_id。
+    # 现在改用 `(\{[^{}]*?"web_id"[^{}]*?\})` 抓最近的 JSON object。
     try:
         # __tea_cache_tokens_497858 是一个 JSON 串:{user_unique_id, web_id, ...}
-        tea_match = re.search(rb'__tea_cache_tokens_497858(.+?)</script>', raw, re.DOTALL)
+        tea_match = re.search(
+            rb'__tea_cache_tokens_497858[^a-zA-Z0-9_]?(\{[^{}]{0,800}?"web_id"[^{}]{0,400}?\})',
+            raw,
+            re.DOTALL,
+        )
         if tea_match:
             try:
                 obj = json.loads(tea_match.group(1).decode("utf-8", errors="replace"))
@@ -243,7 +238,11 @@ def _read_chromium_local_storage(profile_dir: Path) -> dict[str, str]:
             except (ValueError, TypeError):
                 pass
         # samantha_web_web_id 是另一个 JSON:{web_id, ...}
-        sam_match = re.search(rb'samantha_web_web_id(.+?)</script>', raw, re.DOTALL)
+        sam_match = re.search(
+            rb'samantha_web_web_id[^a-zA-Z0-9_]?(\{[^{}]{0,800}?"web_id"[^{}]{0,400}?\})',
+            raw,
+            re.DOTALL,
+        )
         if sam_match:
             try:
                 obj = json.loads(sam_match.group(1).decode("utf-8", errors="replace"))
@@ -251,7 +250,7 @@ def _read_chromium_local_storage(profile_dir: Path) -> dict[str, str]:
                     out["device_id"] = str(obj["web_id"])
             except (ValueError, TypeError):
                 pass
-        # 备用:直接 regex 抓 web_id 的 string
+        # 备用:直接 regex 抓 web_id / user_unique_id 的 string value(最后兜底)
         if "web_id" not in out:
             m = re.search(r'"web_id"\s*:\s*"([A-Za-z0-9_\-]{8,80})"', text)
             if m:
@@ -267,29 +266,37 @@ def _read_chromium_local_storage(profile_dir: Path) -> dict[str, str]:
 
 
 def extract_webmssdk_tokens(profile_dir: Path) -> TokenBundle:
-    """v0.2.17:从登录后持久化的 Chromium profile 抽 WebMSSDK / TeaSDK 真实指纹。
+    """v0.2.37.2:从登录后持久化的 Chromium profile 抽 WebMSSDK / TeaSDK 真实指纹。
 
-    读 Default/Cookies(挑 doubao.com 域名的)+ Local Storage/leveldb/000003.log
-    拼出 TokenBundle。任意一个关键字段缺失 → 抛 TokenBundleUnavailable,
-    UI 引导用户「在浏览器里访问 doubao.com/chat/ 主页 5 秒后点刷新 token」。
+    数据源优先级:
+      1. cookies.json —— login 流程主动导出的明文 cookie 备份(首选,实时从
+         Chromium 进程拉取,无 DPAPI 加密问题)
+      2. Chromium SQLite(Default/Cookies) —— 兜底;v100+ Windows 下可能
+         被 DPAPI 加密导致 value 列为空,这种情况就拿不到明文
+      3. Local Storage/leveldb/000003.log —— 抽 web_id / tea_uuid (leveldb
+         二进制文件,正则扫 JSON 字段)
 
-    v0.2.37 兼容 Chromium v100+ DPAPI cookie 加密:
-      - SQLite `value` 列为空 + `encrypted_value` 有数据 → 走
-        `_read_chromium_cookies_via_browser` 让 Chromium 进程用当前
-        用户的 DPAPI key 给我们解出来明文
-      - 如果浏览器 fallback 也拿不到 cookies → 真正的「profile 损坏」场景
+    任意一个关键字段缺失 → 抛 TokenBundleUnavailable,UI 引导用户点「重新导出
+    cookies」按钮让 Playwright 重新拉一次 cookie 写回 cookies.json(自动刷新
+    整条链)。
     """
     profile_dir = Path(profile_dir)
-    cookies = _read_chromium_cookies(profile_dir)
-    # v0.2.37:DPAPI 加密触发 → Playwright in-process 读
-    if cookies is _BROWSER_FALLBACK_SENTINEL or (
-        not cookies
-        and (profile_dir / "Default" / "Cookies").exists()
-    ):
-        # 注意:not cookies 也可能是真的没 cookies(profile 还没主页访问),
-        # 所以只在 SQLite 文件存在 + 完全没读到 doubao 域 cookie 时才 fallback
-        _LOGGER.info("Cookies SQLite 拿不到明文(可能 DPAPI 加密),走 Playwright fallback")
-        cookies = _read_chromium_cookies_via_browser(profile_dir)
+
+    # 1) 首选:cookies.json(login 流程主动导出的明文)
+    cookies_from_json = _read_cookies_from_json(profile_dir)
+
+    # 2) 兜底:Chromium SQLite(可能是 DPAPI 加密 → 拿到空 dict,正常)
+    cookies_from_sqlite = _read_chromium_cookies(profile_dir)
+
+    cookies = cookies_from_json if cookies_from_json is not None else cookies_from_sqlite
+    if not cookies:
+        # 两个源都没拿到 doubao.com cookie —— profile 真的没数据,提示用户重新登录
+        cookies_json_exists = (profile_dir / "cookies.json").exists()
+        raise TokenBundleUnavailable(
+            "profile 里读不到 doubao.com cookie。"
+            + (" (cookies.json 存在但解析失败)" if cookies_json_exists else "")
+            + " 请点「重新导出 cookies」按钮,软件会重新打开浏览器拉一次当前 cookie。"
+        )
 
     storage = _read_chromium_local_storage(profile_dir)
 
@@ -299,35 +306,17 @@ def extract_webmssdk_tokens(profile_dir: Path) -> TokenBundle:
     device_id = storage.get("device_id", "") or cookies.get("s_v_web_id", "")
     tea_uuid = storage.get("tea_uuid", "") or cookies.get("user_unique_id", "")
 
-    # v0.2.37:区分两种 hint ——
-    #   A. leveldb 有 web_id/device_id 但 cookies 解不出来 → 「profile 损坏/加密层」
-    #   B. leveldb 什么都没有 → 「刚 login 没让 SDK 跑过」
-    missing = []
-    if not web_id:
-        missing.append("web_id")
-    if not device_id:
-        missing.append("device_id")
-
-    cookies_loaded = bool(ms_token) or bool(web_id_signature)
-    if missing and not cookies_loaded:
-        # 区分:storage 完全没数据 + cookies 也拿不到 —— 这是「刚 login 没访问 chat」
-        if not storage:
-            raise TokenBundleUnavailable(
-                "profile 里完全没有 web_id / device_id / msToken —— "
-                "请在浏览器里访问 https://www.doubao.com/chat/ 主页停留 10-20 秒, "
-                "等 WebMSSDK 跑完一轮再点「刷新 token」"
-            )
-        # 区分:storage 有部分但 cookies 也抽不到 → DPAPI / profile 损坏
+    # 必要字段都齐全才算成功。任何一个缺失 → 让上层走「重新导出 cookies」流程
+    if not (web_id and ms_token):
+        missing = []
+        if not web_id:
+            missing.append("web_id")
+        if not ms_token:
+            missing.append("ms_token")
         raise TokenBundleUnavailable(
-            f"profile 里 localStorage 有部分字段但 web_id/device_id/msToken 全部缺失;"
-            f"缺失字段: {missing}; 这通常是 Chromium 升级后 cookie 加密层变了,"
-            "建议:删除 profile 目录(<data>/profiles/<id>/)后重新登录"
-        )
-    if missing and not ms_token:
-        # 有 web_id 但 msToken 缺失 → 短期过期,直接刷新就好
-        raise TokenBundleUnavailable(
-            f"msToken 缺失;其他字段: {missing}; "
-            "请在浏览器里访问 https://www.doubao.com/chat/ 主页 5-10 秒后点「刷新 token」"
+            f"cookie 里缺少关键字段: {missing}。"
+            " 请点「重新导出 cookies」按钮重新拉一次,"
+            "或在浏览器里访问 https://www.doubao.com/chat/ 主页 5 秒后再点刷新。"
         )
 
     return TokenBundle(

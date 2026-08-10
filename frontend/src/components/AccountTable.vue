@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue';
-import { UsersRound, Plus, RefreshCw, Trash2, Globe2, Globe, RotateCcw } from '@lucide/vue';
+import { UsersRound, Plus, RefreshCw, Trash2, Globe2, Globe, RotateCcw, Cookie } from '@lucide/vue';
 import { DpBadge, DpButton, DpEmpty, DpPanel, DpSwitch, DpTable } from '@/ui';
 import {
   getWebMSSDKTokens,
   refreshWebMSSDKTokens,
+  reExportCookies,
   openAccountBrowser,
   closeAccountBrowser,
   getAccountBrowserStatus,
@@ -58,6 +59,14 @@ let browserPollTimer: number | null = null;
 const resetBusy = ref<Record<string, boolean>>({});
 const resetAllBusy = ref(false);
 const resetError = ref<string>('');
+
+// v0.2.37.2:重新导出 cookies 按钮 —— 行级,按 accountId 跟踪状态。
+// 用户点 → 后端打开 Chromium → 8s 等 WebMSSDK 初始化 → context.cookies()
+// 写回 profile_dir/cookies.json → 关窗。用来修「cookie 在线但 cookies.json
+// 解析失败 / 文件被删」的兜底场景。
+const reExportBusy = ref<Record<string, boolean>>({});
+const reExportError = ref<Record<string, string>>({});
+const reExportHint = ref<Record<string, string>>({});
 
 function remove(account: Account) {
   if (confirm(`确定删除账号“${account.display_name}”及其本地会话吗？`)) {
@@ -121,6 +130,36 @@ async function resetAll() {
     resetError.value = err instanceof Error ? err.message : '一键重置失败';
   } finally {
     resetAllBusy.value = false;
+  }
+}
+
+// v0.2.37.2:重新导出 cookies —— 行级按钮。打开浏览器 ~8 秒,用户能看到
+// 屏幕上冒一个 Chromium 窗口(在屏幕外偏移位置,不打扰),期间写 cookies.json。
+// 成功后自动 reload token 状态,失败显示具体原因。
+async function reExportOne(account: Account) {
+  const ok = confirm(
+    `确定重新导出账号「${account.display_name}」的 cookies?\n` +
+      `会让软件临时打开浏览器约 8 秒,期间请勿操作。\n` +
+      `(用于 cookie 在线但 cookies.json 解析失败 / 文件丢失的兜底场景)`,
+  );
+  if (!ok) return;
+  reExportBusy.value[account.id] = true;
+  reExportError.value[account.id] = '';
+  reExportHint.value[account.id] = '';
+  try {
+    const result = await reExportCookies(account.id);
+    reExportHint.value[account.id] = result.hint || '已重新导出';
+    // 重新拉 token 状态让 hint / available 立即反映新数据
+    try {
+      tokenStatus.value[account.id] = await getWebMSSDKTokens(account.id);
+    } catch (err) {
+      /* token 状态拉失败不影响主操作 */
+      reExportHint.value[account.id] += ` (token 状态刷新失败:${err})`;
+    }
+  } catch (err) {
+    reExportError.value[account.id] = err instanceof Error ? err.message : '重新导出失败';
+  } finally {
+    reExportBusy.value[account.id] = false;
   }
 }
 
@@ -434,6 +473,17 @@ watch(
                 <RefreshCw :size="12" :class="{ spinning: refreshing[account.id] }" />
                 {{ refreshing[account.id] ? '刷新中…' : '🔄 刷新 token' }}
               </DpButton>
+              <!-- v0.2.37.2:重新导出 cookies —— cookie 在线但 cookies.json
+                   解析失败 / 文件丢失时的兜底。confirm 防误触(会弹浏览器)。 -->
+              <DpButton
+                size="sm"
+                :disabled="!!reExportBusy[account.id]"
+                :aria-label="`重新导出 ${account.display_name} 的 cookies`"
+                @click="reExportOne(account)"
+              >
+                <Cookie :size="12" :class="{ spinning: reExportBusy[account.id] }" />
+                {{ reExportBusy[account.id] ? '导出中…' : '🍪 重新导出 cookies' }}
+              </DpButton>
               <!-- v0.2.29:行级重置额度 —— 跨日 cron 卡住时的兜底按钮。 -->
               <DpButton
                 size="sm"
@@ -456,6 +506,13 @@ watch(
             </div>
             <small v-if="browserError[account.id]" class="token-hint error">
               {{ browserError[account.id] }}
+            </small>
+            <!-- v0.2.37.2:重新导出 cookies 的成功提示 + 错误提示 -->
+            <small v-if="reExportHint[account.id]" class="token-hint">
+              {{ reExportHint[account.id] }}
+            </small>
+            <small v-if="reExportError[account.id]" class="token-hint error">
+              {{ reExportError[account.id] }}
             </small>
           </td>
         </tr>

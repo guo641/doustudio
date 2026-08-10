@@ -222,6 +222,23 @@ export async function refreshWebMSSDKTokens(accountId: string): Promise<WebMSSDK
   );
 }
 
+// v0.2.37.2:「重新导出 cookies」按钮 —— 让 Playwright 用账号 profile 重新打开
+// 浏览器,8 秒后把当前 doubao.com cookie 明文写到 profile_dir/cookies.json。
+// 跟 refresh-tokens(也写 cookies.json)区别:
+// - refresh-tokens 强调「让 WebMSSDK 跑一遍拿到最新 msToken」,返回完整 bundle。
+// - re-export-cookies 强调「让 cookies.json 重新可读」,返回更简单 ok/hint。
+export async function reExportCookies(
+  accountId: string,
+): Promise<{ ok: boolean; saved: boolean; elapsed: number; hint: string }> {
+  return json(
+    await fetch(`/api/accounts/${accountId}/re-export-cookies`, {
+      method: 'POST',
+      headers,
+    }),
+    '重新导出 cookies 失败',
+  );
+}
+
 // v0.2.20:「📂 打开浏览器」按钮 —— 复用账号已有 login profile
 // 拉起 Chromium 窗口。同 profile_dir 已有窗口时服务端返回 409。
 export async function openAccountBrowser(accountId: string): Promise<{ ok: boolean; message: string }> {
