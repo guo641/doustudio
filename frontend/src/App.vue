@@ -732,7 +732,7 @@ onBeforeUnmount(() => {
             id="video-prompt"
             v-model="prompt"
             :rows="7"
-            :maxlength="2000"
+            :maxlength="5000"
             autofocus
             :placeholder="
               imageFiles.length
@@ -742,7 +742,7 @@ onBeforeUnmount(() => {
           />
         </DpField>
         <div class="char-hint">
-          {{ prompt.length }} / 2000 ·
+          {{ prompt.length }} / 5000 ·
           {{ segmentCount }} 段(用「第一段」「第二段」分隔自动归组)
         </div>
 

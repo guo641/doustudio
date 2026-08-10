@@ -29,16 +29,8 @@ const api = vi.hoisted(() => ({
   }),
   saveSettings: vi.fn().mockImplementation(async value=>value),
   backupDatabase: vi.fn().mockResolvedValue({ path:'/tmp/backup.sqlite3' }),
-  // v0.2.17:AccountTable 在 onMounted/watch 时调这两个,默认给 "available=true" 兜底
-  // —— 老测试不关心 token 字段,但 mock 缺失会让组件初始 render 失败。
-  getWebMSSDKTokens: vi.fn().mockResolvedValue({
-    available: true, hint: '', ms_token_preview: '', web_id: 'wb', web_id_signature: '',
-    device_id: 'dev', tea_uuid: 'tu', pc_version: '3.27.4', fetched_at: 0, age_seconds: 0,
-  }),
-  refreshWebMSSDKTokens: vi.fn().mockResolvedValue({
-    available: true, hint: 'mock', ms_token_preview: '', web_id: 'wb', web_id_signature: '',
-    device_id: 'dev', tea_uuid: 'tu', pc_version: '3.27.4', fetched_at: 0, age_seconds: 0,
-  }),
+  // v0.2.37.3:AccountTable 不再展示 token 列,getWebMSSDKTokens / refreshWebMSSDKTokens
+  // 也从 AccountTable 调用链里删除 —— 老 mock 留着会误导读者以为组件还在用,直接清掉。
   // v0.2.28:Q2 批量下载 —— ResultsTable 点「保存到下载目录」时调。
   groupDownload: vi.fn().mockResolvedValue({ saved_dir: '/tmp/downloads/abcdef12_143022', file_count: 3 }),
   // v0.2.29:单账号 / 一键全部重置额度 —— 跨日 cron 卡住时的兜底按钮。
@@ -78,6 +70,10 @@ it('emits account toggle and confirmed delete', async () => {
   await fireEvent.click(screen.getByRole('button', { name:'删除 莲韵' }));
   expect(view.emitted('toggle')[0]).toEqual([{ id:'a1', enabled:false }]);
   expect(view.emitted('delete')[0]).toEqual(['a1']);
+  // v0.2.37.3:token 列 / 刷新 token 按钮已从表格下线,用户不应再看到
+  // 「cookie 里缺少关键字段」之类的兜底文案。重新挂上会立刻被这个回归挡下。
+  expect(screen.queryByText(/^Token$/)).toBeNull();
+  expect(screen.queryByRole('button', { name: /刷新.*token/i })).toBeNull();
 });
 
 // v0.2.29:行级重置按钮 —— confirm 后调 api.resetAccountQuota 并 emit refresh。

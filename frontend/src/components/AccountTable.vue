@@ -3,15 +3,12 @@ import { onMounted, onUnmounted, ref, watch } from 'vue';
 import { UsersRound, Plus, RefreshCw, Trash2, Globe2, Globe, RotateCcw, Cookie } from '@lucide/vue';
 import { DpBadge, DpButton, DpEmpty, DpPanel, DpSwitch, DpTable } from '@/ui';
 import {
-  getWebMSSDKTokens,
-  refreshWebMSSDKTokens,
   reExportCookies,
   openAccountBrowser,
   closeAccountBrowser,
   getAccountBrowserStatus,
   resetAccountQuota,
   resetAllQuotas,
-  type WebMSSDKTokensResponse,
 } from '@/api';
 
 type Account = {
@@ -40,10 +37,11 @@ const emit = defineEmits<{
   refresh: [];
 }>();
 
-// v0.2.17:token 状态。Record<accountId, bundle>,无 token 时 hint 引导用户去刷。
-const tokenStatus = ref<Record<string, WebMSSDKTokensResponse | null>>({});
-const refreshing = ref<Record<string, boolean>>({});
-const refreshError = ref<Record<string, string>>({});
+// v0.2.37.3:token 显示列 + 刷新按钮已删除。状态由后端内部 use,前端不展示
+// 详情;用户感知由「重新导出 cookies」按钮兜底(cookie 在线但 cookies.json
+// 损坏时一键修)。原本的 `tokenStatus / refreshing / refreshError` 三个 ref
+// 全部下线,对应的 onMounted / watch / `loadTokenStatus` / `refreshOne` /
+// `formatTokenAge` 也都跟着删。
 
 // v0.2.20:「📂 打开浏览器」按钮状态 —— 哪些账号当前有 Chromium 窗口打开。
 // 后端用 profile_dir 做 registry,前端用轮询(browser-status)跟住状态。
@@ -149,13 +147,6 @@ async function reExportOne(account: Account) {
   try {
     const result = await reExportCookies(account.id);
     reExportHint.value[account.id] = result.hint || '已重新导出';
-    // 重新拉 token 状态让 hint / available 立即反映新数据
-    try {
-      tokenStatus.value[account.id] = await getWebMSSDKTokens(account.id);
-    } catch (err) {
-      /* token 状态拉失败不影响主操作 */
-      reExportHint.value[account.id] += ` (token 状态刷新失败:${err})`;
-    }
   } catch (err) {
     reExportError.value[account.id] = err instanceof Error ? err.message : '重新导出失败';
   } finally {
@@ -166,52 +157,6 @@ async function reExportOne(account: Account) {
 function formatRecovery(value?: string) {
   if (!value) return '—';
   return new Date(value).toLocaleString('zh-CN');
-}
-
-// v0.2.17:把 msToken age 格式化成"12 分钟前"等人类可读。
-function formatTokenAge(bundle: WebMSSDKTokensResponse | null | undefined): string {
-  if (!bundle || bundle.age_seconds == null) return '从未';
-  const sec = bundle.age_seconds;
-  if (sec < 60) return `${Math.round(sec)} 秒前`;
-  if (sec < 3600) return `${Math.round(sec / 60)} 分钟前`;
-  if (sec < 86400) return `${Math.round(sec / 3600)} 小时前`;
-  return `${Math.round(sec / 86400)} 天前`;
-}
-
-async function loadTokenStatus(accounts: Account[]) {
-  // 并行拉所有账号的 token 状态。任一失败只影响那一行的 hint,不让整页崩。
-  await Promise.all(
-    accounts.map(async (acc) => {
-      try {
-        tokenStatus.value[acc.id] = await getWebMSSDKTokens(acc.id);
-      } catch (err) {
-        tokenStatus.value[acc.id] = {
-          available: false,
-          hint: String(err),
-          ms_token_preview: '',
-          web_id: '',
-          web_id_signature: '',
-          device_id: '',
-          tea_uuid: '',
-          pc_version: '',
-          fetched_at: 0,
-          age_seconds: null,
-        };
-      }
-    }),
-  );
-}
-
-async function refreshOne(account: Account) {
-  refreshing.value[account.id] = true;
-  refreshError.value[account.id] = '';
-  try {
-    tokenStatus.value[account.id] = await refreshWebMSSDKTokens(account.id);
-  } catch (err) {
-    refreshError.value[account.id] = String(err);
-  } finally {
-    refreshing.value[account.id] = false;
-  }
 }
 
 // v0.2.20:复用账号 profile 拉起 Chromium 窗口。
@@ -278,10 +223,6 @@ function startBrowserPolling() {
   browserPollTimer = window.setInterval(pollBrowserStatus, 3000);
 }
 
-onMounted(() => {
-  if (props.accounts?.length) loadTokenStatus(props.accounts);
-});
-
 // v0.2.20:页面挂载时拉一遍 baseline 状态,避免「之前打开过的窗口」按钮文案错。
 // (用户在前一个页面开过浏览器,跳回来应该看到按钮是「关闭」状态)
 onMounted(async () => {
@@ -305,13 +246,7 @@ onUnmounted(() => {
   }
 });
 
-// 父级换账号列表(添加 / 删除 / 刷新)时,重新拉 token 状态。
-watch(
-  () => props.accounts.map((a) => a.id).join(','),
-  () => {
-    if (props.accounts?.length) loadTokenStatus(props.accounts);
-  },
-);
+// v0.2.37.3:不再 watch props.accounts 重拉 token —— token 列已隐藏。
 </script>
 
 <template>
@@ -345,25 +280,24 @@ watch(
     <DpTable min-width="980px">
       <thead>
         <tr>
-          <th style="width: 22%">账号</th>
-          <th style="width: 11%">状态</th>
-          <th style="width: 22%">今日共享额度</th>
-          <th style="width: 14%">限额恢复</th>
-          <th style="width: 13%">Token</th>
+          <th style="width: 24%">账号</th>
+          <th style="width: 12%">状态</th>
+          <th style="width: 25%">今日共享额度</th>
+          <th style="width: 15%">限额恢复</th>
           <th style="width: 9%">参与调度</th>
-          <th style="width: 9%">操作</th>
+          <th style="width: 15%">操作</th>
         </tr>
       </thead>
       <tbody>
         <tr v-if="loading">
-          <td colspan="7">
+          <td colspan="6">
             <DpEmpty title="正在加载…">
               <template #icon><UsersRound :size="18" /></template>
             </DpEmpty>
           </td>
         </tr>
         <tr v-else-if="!accounts.length">
-          <td colspan="7">
+          <td colspan="6">
             <DpEmpty title="还没有账号" description="添加账号后即可进入自动调度，扫码登录信息仅保存在本机。">
               <template #icon><UsersRound :size="18" /></template>
             </DpEmpty>
@@ -411,28 +345,6 @@ watch(
           </td>
           <td class="muted">{{ formatRecovery(account.video_limited_until) }}</td>
           <td>
-            <div class="token-cell">
-              <div class="token-status">
-                <DpBadge
-                  :tone="tokenStatus[account.id]?.available ? 'active' : 'expired'"
-                  dot
-                >
-                  {{ tokenStatus[account.id]?.available ? '正常' : '缺失' }}
-                </DpBadge>
-                <small class="token-age muted">{{ formatTokenAge(tokenStatus[account.id]) }}</small>
-              </div>
-              <small
-                v-if="tokenStatus[account.id] && !tokenStatus[account.id]!.available"
-                class="token-hint"
-              >
-                {{ tokenStatus[account.id]!.hint }}
-              </small>
-              <small v-if="refreshError[account.id]" class="token-hint error">
-                {{ refreshError[account.id] }}
-              </small>
-            </div>
-          </td>
-          <td>
             <DpSwitch
               :on="account.enabled"
               :aria-label="`${account.enabled ? '停用' : '启用'} ${account.display_name}`"
@@ -463,15 +375,6 @@ watch(
                       ? '打开中…'
                       : '📂 打开浏览器'
                 }}
-              </DpButton>
-              <DpButton
-                size="sm"
-                :disabled="!!refreshing[account.id]"
-                :aria-label="`刷新 ${account.display_name} 的 token`"
-                @click="refreshOne(account)"
-              >
-                <RefreshCw :size="12" :class="{ spinning: refreshing[account.id] }" />
-                {{ refreshing[account.id] ? '刷新中…' : '🔄 刷新 token' }}
               </DpButton>
               <!-- v0.2.37.2:重新导出 cookies —— cookie 在线但 cookies.json
                    解析失败 / 文件丢失时的兜底。confirm 防误触(会弹浏览器)。 -->

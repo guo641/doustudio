@@ -141,6 +141,36 @@ class FakeVideoServicePartialRejected(FakeVideoService):
         return first_task, partial
 
 
+def test_create_video_task_body_rejects_prompt_over_5000_chars():
+    """v0.2.37.3:画面描述 2000→5000 字,单值 + 列表元素都按 5000 封顶。
+    直接构造 CreateVideoTaskBody 触发 Pydantic 校验,不走 HTTP。
+    """
+    from pydantic import ValidationError
+
+    from doupool.api.app import CreateVideoTaskBody
+
+    boundary_ok = CreateVideoTaskBody(prompt="a" * 5000)
+    assert len(boundary_ok.prompt) == 5000
+
+    over_by_one = {"prompt": "a" * 5001}
+    try:
+        CreateVideoTaskBody(**over_by_one)
+    except ValidationError as exc:
+        assert "prompt" in str(exc)
+    else:
+        raise AssertionError("5001-char prompt should fail validation")
+
+    # v0.2.37.3:`prompts` 列表中每个元素也按 5000 字封顶(field_validator 兜底)
+    CreateVideoTaskBody(prompts=["x" * 5000, "short"])
+    over_prompts = {"prompts": ["x" * 5001]}
+    try:
+        CreateVideoTaskBody(**over_prompts)
+    except ValidationError as exc:
+        assert "prompts" in str(exc)
+    else:
+        raise AssertionError("prompts element over 5000 chars should fail validation")
+
+
 def test_create_video_task_returns_partial_rejected_when_accounts_full(repository, tmp_path, temp_profile):
     """v0.2.35:跨账号凑余额 —— 200 OK + partial_rejected 包含被拒 prompt 信息。"""
     from doupool.db.models import Account

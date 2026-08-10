@@ -2,6 +2,39 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.2.37.3 - 2026-08-10
+
+两个用户反馈合并到一起修:
+
+### 修复 / 体验
+
+1. **隐藏账号列表里的 token 显示列 + 刷新 token 按钮** 用户截图反馈 token
+   列里显示「cookie 里缺少关键字段:['web_id', 'ms_token']」之类的兜底报错
+   —— 这是后端 `extract_webmssdk_tokens` 失败时给前端的内部 hint,不该让普通
+   用户看到。token 状态本来就是后端内部用的,前端展示出来反而制造焦虑。
+
+   - [frontend/src/components/AccountTable.vue](frontend/src/components/AccountTable.vue)
+     删掉 thead 里的 `Token` 列、tbody 里的 token badge / age / hint 三件套、
+     行末「🔄 刷新 token」按钮、配套的 `tokenStatus` / `refreshing` /
+     `refreshError` refs、`formatTokenAge` / `loadTokenStatus` / `refreshOne`
+     函数、以及 onMounted / watch 里的 token reload 调用。
+   - 兜底链路保留:cookie 在线但 cookies.json 解析失败 / 文件丢失时,用户仍然
+     可以点每行的「🍪 重新导出 cookies」一键修好(v0.2.37.2 已加)。
+   - 后端 `/api/accounts/{id}/webmssdk-tokens` 端点保留供内部使用,只是前端
+     不再展示数据。
+
+2. **画面描述上限 2000 → 5000 字** 用户反馈 2000 字太短,复杂场景描述经常
+   被截断导致生成结果跟预期不符。
+
+   - [frontend/src/App.vue](frontend/src/App.vue) `<DpTextarea>` 的
+     `:maxlength="2000"` 提到 5000,底部计数提示 `{{ prompt.length }} / 5000`。
+   - [src/doupool/api/app.py](src/doupool/api/app.py)
+     `CreateVideoTaskBody.prompt` 从 `str = ""` 改成
+     `Field(default="", max_length=5000)`。`prompts: list[str]` 加
+     `field_validator`,列表中每个元素也按 5000 字封顶(单段 prompt)。
+   - 新增 `tests/test_api.py::test_create_video_task_body_rejects_prompt_over_5000_chars`
+     守住 Pydantic 边界:5000 字 ok、5001 字抛 ValidationError。
+
 ## v0.2.37.2 - 2026-08-09
 
 v0.2.37 上线当天用户反馈:「只要 cookie 在线账号就没有问题」—— 软件读 cookie

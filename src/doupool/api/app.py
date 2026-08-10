@@ -17,7 +17,7 @@ from playwright.sync_api import sync_playwright
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from doupool.db.models import Account, LoginAttempt, utcnow
 from doupool.login.browser_sessions import (
@@ -38,7 +38,9 @@ class ImageAttachmentBody(BaseModel):
 
 
 class CreateVideoTaskBody(BaseModel):
-    prompt: str = ""
+    # v0.2.37.3:画面描述上限 2000→5000 字。用户反馈 2000 太短,复杂场景
+    # 描述常常被截断。`prompts` 列表中每个元素也按 5000 字封顶(单段 prompt)。
+    prompt: str = Field(default="", max_length=5000)
     prompts: list[str] = Field(default_factory=list, max_length=20)
     model: str = "seedance_v2.0_mini"
     ratio: str = "1:1"
@@ -54,6 +56,17 @@ class CreateVideoTaskBody(BaseModel):
     # 不会漏掉这条新任务。只在手动重试路径传,普通新建留 None 让
     # service 端按 prompt 数量决定是否打组。
     group_id: str | None = None
+
+    # v0.2.37.3:`prompts` 列表中每个元素也按 5000 字封顶(单段 prompt),跟
+    # 上面的 `prompt` 单值一致。`max_length=20` 是段数上限,这里再加单段字符
+    # 上限,避免有人写 5 万字一段触发模型限流。
+    @field_validator("prompts")
+    @classmethod
+    def _prompts_max_length(cls, value: list[str]) -> list[str]:
+        for idx, item in enumerate(value):
+            if len(item) > 5000:
+                raise ValueError(f"prompts[{idx}] exceeds 5000 characters")
+        return value
 
 
 class UpdateAccountBody(BaseModel):
