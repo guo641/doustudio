@@ -2,6 +2,156 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.3.2.5 - 2026-08-13
+
+**修复 shark_admin 风控弹滑块场景下浏览器被立即关闭:服务端拒绝后保留浏览器 → 等滑块 → 图鉴拖 → 同 prompt 重提。**
+
+### 为什么做
+
+v0.3.2.4 加了「提交前双拦截」(导航后 + paste 后)挡 POST 撞弹窗,但 **shark_admin
+服务端拒绝(`extra.decision.from == "shark_admin"`,`DoubaoRateLimited(is_risk_control=True)`)
+场景下,代码原本路径是**:`service.py` 拿到异常 → task 标 failed + 退额度 + 关闭浏览器;
+而 `run()` 的 `finally: await page.close()` 在 service 之前就已经把页面销毁了
+—— 滑块可能正在加载,浏览器就被关,用户看到「弹窗刚出现窗口就被自动关闭了」。
+
+用户原话(2026-08-13,verbatim):
+> 「还是滑块刚出现就被关掉了,我现在要求你修改一个审核逻辑,只要是识别到
+> 账号被风控拦截这个报错,就不能关闭浏览器,必须等滑块出来让图鉴识别
+> 再模拟拖动提交。我睡觉去了,你修改吧。」
+
+### 改动
+
+`src/doupool/video/browser.py`:
+
+- **`run()` 重试循环新增 `except DoubaoRateLimited` 分支**:
+  - **关键**:这条分支放在 `_submit_and_poll` 调用点的 `try` 里,**早于 service.py
+    看到异常 + 关闭浏览器**。也就是说服务端一拒,runner 立即接管,留住 page。
+  - `if not exc.is_risk_control: raise` —— 非风控限流(quota cap 等)仍冒泡
+    走原 service.py 处理路径(mark_account_limited + assign None + 回 queued),
+    行为不变
+  - `risk_attempt += 1; if risk_attempt > _MAX_RISK_RETRY: raise RuntimeError(...)` —
+    防止无脑循环刷接口封号。`_MAX_RISK_RETRY = 2`(模块级常量)
+  - `update(error_message="检测到风控拦截,正在保留浏览器等待滑块并自动解算(第 N/2 次)")`
+  - `solved = await _pre_submit_aegis_gate(page, profile_dir, update)` ——
+    复用 v0.3.2.4 阻塞式网关(等 6s + 探测 + 解 + 验证消失),**这个 helper 已经
+    会在 solver 失败 / 凭证关 / 异常时返 False**(防止降级放行撞风控)
+  - 网关返 False → `raise RuntimeError("账号被风控拦截,第 N 次自动解滑块失败...")`
+    退出循环,避免无限 retry
+  - 网关返 True → `update(error_message="滑块已通过,正在以原 prompt 重新提交...")`
+    + `continue` —— 同 prompt 复用,**不消耗拒绝改写预算**(那些是为内容合规
+    改写 prompt 用的,不应当被风控触发)
+- **模块级常量 `_MAX_RISK_RETRY = 2`** —— 上限 2 次 keepalive + 重提
+
+### 关键不变量
+
+- **`service.py` shark_admin 分支不动**:它仍然按原方式在「风控拒绝」最终确认时
+  标 failed + 退额度 + 文案。区别是现在这之前多了一道自动解滑块尝试。
+- **`parse_sse_ack` 3 字段契约不变** —— 服务端拒的时候根本没返 ack
+- **`_submit_and_poll` 内部契约不变** —— 还是返 ack dict 或 raise `DoubaoRateLimited`
+- **前端零改动** —— `error_message` 通道已存在,前端继续走原 toast
+- **图鉴 cooldown 仍共享**:同账号触发解滑块后 30 分钟不再尝试(同 v0.3.2.4 +
+  v0.3.1.2 一致)
+- **同 prompt 重提**:用户 prompt 没动,跟 v0.2.x revise_prompt 走的是两个独立循环,
+  不消耗 `max_reject_retries`
+
+### 与已有循环的对比
+
+| 场景 | 路径 | 改 prompt? | 限流 |
+|---|---|---|---|
+| 内容被拒(DoubaoContentRejected) | revise_prompt 改写 | 是 | max_reject_retries |
+| 风控 shark_admin(is_risk_control=True) | **本次新增** keepalive + 重提 | 否 | _MAX_RISK_RETRY = 2 |
+| 限流非风控(is_risk_control=False) | 冒泡 service.py | 否 | mark_account_limited |
+
+### 验证
+
+`tests/test_video_ui_submit.py` 新增 4 个 case:
+
+- `test_run_shark_admin_keepalive_solve_succeeds_then_retry_succeeds` —— 第一次
+  submit 抛 shark_admin + 网关返回 True + 第二次 submit 成功 → run() 正常返回
+- `test_run_shark_admin_keepalive_solve_failed_raises` —— 网关返回 False →
+  raise RuntimeError 阻止重试 + 1 次 submit + 1 次 gate
+- `test_run_shark_admin_retry_exhausted_raises` —— `_MAX_RISK_RETRY=2` +
+  每次 gate 都成功 + submit 始终抛 shark_admin → 3 次 submit(1 初始 + 2 retry)
+  + 2 次 gate + 最终 raise RuntimeError「连续 2 次自动解滑块均失败」
+- `test_run_non_risk_rate_limit_still_bubbles` —— `DoubaoRateLimited(is_risk_control=False)`
+  仍 raise 不走 keepalive 分支(防御:不能因为新代码吞 quota cap 限流)
+
+### 不做的事
+
+- ❌ 改 service.py shark_admin 最终失败处理路径(本次只让前置多一道自动解滑块)
+- ❌ 改 `_pre_submit_aegis_gate` 接口(v0.3.2.4 已就绪,直接复用)
+- ❌ 改 captcha/solver.py / login keepalive(已 OK)
+- ❌ 改 selector / `_submit_and_poll` 契约 / parse_sse_ack
+- ❌ 加 IP 切换 / 跨账号切换(留给以后,本次走 keepalive + 同账号重提)
+- ❌ 改前端 / SettingsPage / api.ts
+
+## v0.3.2.4 - 2026-08-12
+
+**修复 v0.3.2.3 漏掉的两个 race:step 6 弱兜底 + 网关失败时「降级放行」反而扣额度。**
+
+### 为什么做
+
+v0.3.2.3 用户复测反馈(2026-08-12,verbatim):
+> 「你真特么是个傻逼啊,你给我修复了个啥,还是刚才的问题,弹窗刚出现你就把窗口给我关掉了!」
+
+复测脚本(`tools/doubao_dom_probe`)逐步走真实 DOM 抓出两个根因:
+
+1. **race window**:`_pre_submit_aegis_gate` 在 step 2(导航后)调一次,但
+   用户的真实场景是 paste prompt 之后、点 submit 之前弹窗才出现。
+   v0.3.2.3 step 6 走的是 `_try_solve_captcha_in_video(wait_for_popup_seconds=0.0)`
+   —— 0 秒等待,弹窗刚渲染中就跳过,所以 paste 后弹窗完全错过拦截。
+2. **降级放行**:v0.3.2.3 `_pre_submit_aegis_gate` 在 solver 失败/凭证关/异常时
+   都返 True(让 submit 撞弹窗走原失败路径)—— 实测撞弹窗会被服务端
+   shark_admin 风控挡,直接 **扣视频额度 + 任务失败**。比直接 raise 更糟。
+
+### 改动
+
+`src/doupool/video/browser.py`:
+
+- **`_pre_submit_aegis_gate` 失败路径全部返 False**(原返 True):
+  - `AegisCaptchaDisabled`(凭证未配 / enabled=false)→ 返 False
+  - `AegisCaptchaFailed`(图鉴识别失败 / 余额不足)→ 返 False
+  - 通用 `Exception`(solver 内层炸了)→ 返 False
+  - 每条路径都 `captcha_mark_cooldown` + `update(error_message=...)` 告诉用户原因
+  - **核心原则:阻止 submit 比「降级放行」更安全** —— cooldown 30 分钟保护下次
+- **`submit_via_ui` step 6 替换弱兜底**:原来用 `wait_for_popup_seconds=0.0`
+  跑 `_try_solve_captcha_in_video`(0 秒等弹窗 = 不等),改成完整的
+  `_pre_submit_aegis_gate` 二次拦截:
+  - paste 之后、click send 之前,再阻塞 6s + 解 + 验证消失(同 step 2 逻辑)
+  - 网关返 False → raise RuntimeError「粘贴后再次检测到拖拽验证且未通过,
+    暂不提交任务以免触发服务端风控。请稍候 30s 重试,或确认图鉴打码平台账号配额。」,
+    阻止 mouse.down send button
+- **`step 2 + step 6` 双拦截**:导航后一次、paste 后一次,挡住所有 race
+
+### 契约
+
+- 网关返 False → `submit_via_ui` 立即 raise,不再走 step 3~5(不进 click send)
+- `parse_sse_ack` 3 字段契约不变(`{conversation_id, section_id, question_id}`)
+- `service.py:update(**ack)` 不破坏
+- CHAIN_SCRIPT / UPLOAD_IMAGE_SCRIPT 不动
+- 前端零改动
+- cooldown 仍共享 `account_key = str(profile_dir)`,与 login keepalive 自动共享
+
+### 验证
+
+- 后端测试(`tests/test_video_ui_submit.py`):
+  - 旧 case 5 改名 `test_pre_submit_aegis_gate_credentials_disabled_blocks_submit`,
+    断言 `allowed is False`(原 True)
+  - 新增 `test_pre_submit_aegis_gate_solver_failed_blocks_submit` —— `AegisCaptchaFailed` → False
+  - 新增 `test_pre_submit_aegis_gate_solver_exception_blocks_submit` —— 通用 Exception → False
+  - 新增 `test_submit_via_ui_step6_rechecks_aegis_after_paste` —— 验证 step 6 二次调用网关
+  - 更新 `test_submit_via_ui_raises_when_gate_blocks` —— 移除 `_try_solve_captcha_in_video` stub
+    (不再被 step 6 调用),改为验证 `gate.await_count == 1`(第一次返 False 直接 raise)
+- `fast_gate_constants` fixture 维持 0.2+0.2+0.05,单测不会真的等 10s
+
+### 不做的事
+
+- ❌ 改 selector / `_submit_and_poll` 契约 / `parse_sse_ack` / 前端
+- ❌ shark_admin 二次兜底(留给以后,本次 UI click + 双拦截已大幅降概率)
+- ❌ 改 login keepalive 的 aegis solver(已 OK)
+- ❌ 加 retry 队列 / 跨账号切换
+- ❌ 改 cooldown 30 分钟时长(同 login,已 OK)
+
 ## v0.3.2.3 - 2026-08-12
 
 **修复 v0.3.2.2 「aegis 弹窗刚出现窗口就被自动关闭」根因:提交前加阻塞式 aegis 网关,防止 POST 撞弹窗触发 shark_admin 拒绝。**

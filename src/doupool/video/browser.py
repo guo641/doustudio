@@ -31,6 +31,7 @@ from ..captcha.config import load_credentials as _load_captcha_credentials
 from .protocol import (
     EXTRA_CLIENT_META_KEYS,
     DoubaoContentRejected,
+    DoubaoRateLimited,
     build_completion_payload,
     find_creation_directory,
     find_video_node,
@@ -63,6 +64,11 @@ _UI_CAPTCHA_VERIFY_GONE_SECONDS = 4.0  # 解完后等弹窗彻底消失的轮询
 _UI_CAPTCHA_DETECT_POLL_INTERVAL = 0.5  # 弹窗轮询间隔
 # 拦截 /chat/completion 响应的最长时间,跟 click → POST → SSE 飞出去对齐
 _UI_ACK_WAIT_SECONDS = 30.0
+
+# v0.3.2.5:shark_admin 拒绝 → 不关浏览器 → 等滑块 → 图鉴拖 → 重提 的循环上限。
+# 用户实测触发后通常 1 次 solve + retry 就能过,但同一账号连续 2 次都过不了时
+# 应直接失败,免得无限循环浪费 token / 额度。2 次足够覆盖偶发网络抖动。
+_MAX_RISK_RETRY = 2
 
 # v0.2.22:模块级 logger,retry loop 用 warn 级记「revise 重试」事件
 _LOGGER = logging.getLogger(__name__)
@@ -870,9 +876,9 @@ async def _pre_submit_aegis_gate(
     profile_dir: Path,
     update: Callable[..., None],
 ) -> bool:
-    """v0.3.2.3:提交前的**阻塞式** aegis 网关。
+    """v0.3.2.4:提交前的**阻塞式** aegis 网关。
 
-    用户反馈(v0.3.2.2):
+    用户反馈(v0.3.2.3,v0.3.2.4):
       「提示词粘贴进去,刚提交,滑块弹窗刚出现,窗口就被自动关闭了。
        应该是软件把滑块认定为问题,直接关闭了窗口。」
 
@@ -889,15 +895,22 @@ async def _pre_submit_aegis_gate(
       2. 轮询 detect aegis 弹窗(每 0.5s 一次,最多 6s —— 用户实测窗口 3-5s)
       3. 探测到 → 调 `solve_aegis_captcha` 拖
       4. 解完后,**轮询确认弹窗彻底消失**(每 0.5s,最多 4s)
-      5. 弹窗仍在 → raise RuntimeError,**阻止** click send(防 POST + 弹窗撞车)
-      6. 探测期内始终无弹窗 → 放行(没有 captcha 是好事)
+      5. 弹窗仍在 / 解失败 / 异常 → 返 False,**阻止** click send
+         (防 POST + 弹窗撞车 → shark_admin 拒 → 浪费视频额度)
 
     返回 True = 放行(可以点 send)/ False = 网关拒绝(上层 raise 阻止 submit)。
 
-    注:实测中 aegis 弹窗有时**在 submit 之后**才出现(用户输入 prompt 时弹
-    窗还没起,点 send 触发 POST 的瞬间弹窗挂上)。本 helper 主要拦截「弹窗
-    在 submit 前已挂上」的情况;submit 后 aegis 仍走 `_submit_and_poll`
-    poll 路径的兜底(已就位弹窗会立即被解 → chain 请求能继续走)。
+    **v0.3.2.4 重要修正**:solver 失败 / 凭证关 / 异常统一返 False,**不**
+    再「降级放行让 submit 撞弹窗」。原因:
+      - 降级放行 = POST 撞弹窗 = shark_admin 拒 = 视频额度被扣 + 任务失败
+      - 阻止 submit = 30 分钟 cooldown 保护 + 任务标失败但**不退额度**
+        (用户没提交成功就不会进 chain poll,链上不会有扣费记录)
+      - 阻断告诉用户「拖拽未通过,稍后重试」比 shark_admin 莫大扣费更友好
+
+    **v0.3.2.4 第 2 处修正**:本 helper 现在**也用于 paste 之后** (submit_via_ui
+    step 6 替换为再次调本 helper,等 6s + 解 + 验证消失,而不是 fire-and-forget)。
+    实测中 aegis 弹窗有时在 submit 前没起,在 paste / click send 之间才挂上,
+    这种 case v0.3.2.3 的「step 2 单点拦截」覆盖不到,必须 step 6 再拦一次。
 
     cooldown 复用:`str(profile_dir)` 与 login 路径共享同一份 30min dict,
     login keepalive 刚解完 → video 路径立即放行。
@@ -941,13 +954,13 @@ async def _pre_submit_aegis_gate(
         client = _make_captcha_client(creds)
     except _AegisCaptchaDisabled as exc:
         _LOGGER.warning("aegis gate: solver disabled: %s", exc)
-        # 凭证关 — 不能拖,标 cooldown 防反复,放行让 submit 撞 aegis → 失败路径走起
+        # v0.3.2.4:凭证关也返 False — 别让 POST 撞弹窗浪费额度
         _captcha_mark_cooldown(account_key)
         try:
-            update(error_message=f"图鉴凭证未配置或已停用({exc}),滑块可能需要手动拖")
+            update(error_message=f"图鉴凭证未配置或已停用({exc}),暂不提交以免扣额度")
         except Exception:
             pass
-        return True
+        return False
 
     def _on_state(s: str) -> None:
         msg = {
@@ -970,16 +983,20 @@ async def _pre_submit_aegis_gate(
     except (_AegisCaptchaFailed, _AegisCaptchaDisabled) as exc:
         _LOGGER.warning("aegis gate solver failed: %s", exc)
         _captcha_mark_cooldown(account_key)
-        # 解失败 — 标 cooldown,放行(让 submit 撞 aegis → 走失败路径让用户看到)
+        # v0.3.2.4:解失败也返 False — 不再放行让 POST 撞弹窗
         try:
-            update(error_message=f"图鉴解算失败({exc}),提交可能被拦截")
+            update(error_message=f"图鉴解算失败({exc}),暂不提交以免扣额度")
         except Exception:
             pass
-        return True
+        return False
     except Exception:  # noqa: BLE001
         _LOGGER.exception("aegis gate solver unexpected error")
         _captcha_mark_cooldown(account_key)
-        return True
+        try:
+            update(error_message="图鉴解算异常,暂不提交以免扣额度")
+        except Exception:
+            pass
+        return False
 
     # Step 3:解完后轮询确认弹窗彻底消失(最多 4s)
     gone_deadline = time.monotonic() + _UI_CAPTCHA_VERIFY_GONE_SECONDS
@@ -1182,13 +1199,17 @@ async def submit_via_ui(
     await page.keyboard.press("Control+V")
     await page.wait_for_timeout(150)  # 等 ProseMirror 同步 internal state
 
-    # 6. 点 submit 前再探一次 aegis(用户输入期间弹窗可能又来)
-    await _try_solve_captcha_in_video(
-        page,
-        profile_dir,
-        update,
-        wait_for_popup_seconds=0.0,
-    )
+    # 6. v0.3.2.4:**再跑一次阻塞式 aegis 网关**(paste 后、click send 前)
+    # v0.3.2.3 这步用 _try_solve_captcha_in_video(wait=0) 仅 fire-and-forget,
+    # 用户实测中 aegis 弹窗常在 paste / click send 之间才挂上,前一次(step 2)
+    # 网关捕捉不到;step 6 用 wait=0 探测也来不及。修法:step 6 直接复用
+    # _pre_submit_aegis_gate(cooldown 自动跳过 30min 内已解过场景,
+    # 第 2 次跑跟第 1 次跑共享 cooldown)。
+    if not await _pre_submit_aegis_gate(page, profile_dir, update):
+        raise RuntimeError(
+            "粘贴后再次检测到拖拽验证且未通过,暂不提交任务以免触发服务端风控。"
+            "请稍候 30s 重试,或确认图鉴打码平台账号配额。"
+        )
     await try_click(page, (SEND_BTN_SEL, SEND_BTN_FALLBACK_SEL), timeout=5.0)
     await page.wait_for_timeout(500)  # 等 POST 真的飞出去
 
@@ -1500,6 +1521,7 @@ class PlaywrightVideoRunner:
             # 且有 quota_recorded 闸门只扣 1 次 —— 重试不重复扣。
             prompt_to_send = prompt
             attempt = 0
+            risk_attempt = 0  # v0.3.2.5:shark_admin 重试次数,独立于 reject 重试
             while True:
                 try:
                     return await self._submit_and_poll(
@@ -1517,6 +1539,86 @@ class PlaywrightVideoRunner:
                         profile_dir,
                         use_real_browser=True,  # v0.3.2:UI click 路径
                     )
+                except DoubaoRateLimited as exc:
+                    # v0.3.2.5:shark_admin 风控拦截 —— **不能**关浏览器。
+                    # 用户反馈(2026-08-13):「还是滑块刚出现就被关掉了,我现在要求
+                    # 你修改一个审核逻辑,只要是识别到账号被风控拦截这个报错,就
+                    # 不能关闭浏览器,必须等滑块出来让图鉴识别再模拟拖动提交。」
+                    #
+                    # 之前 v0.3.2.3/4 的实现:任何 submit 异常 → bubbles up 到
+                    # service.py → run() finally 块 page.close() → 滑块随页面
+                    # 一起被关。本分支**不让**它冒泡,保持 page 活着,在原页
+                    # 等 aegis 弹窗出现,然后调图鉴 solver 解,再用同一 prompt
+                    # 调一次 _submit_and_poll(即 submit_via_ui 再走一遍
+                    # navigate/click/type/submit 的完整流程)。
+                    #
+                    # 关键不变量:
+                    # - page 在整个 retry 期间不关(finally 块不会跑到,因为
+                    #   本分支既不 raise 也不 return)
+                    # - quota 已经在 service._run_inner.update("generating")
+                    #   时扣过,失败路径 service.py 会 refund,所以 retry 不
+                    #   重复扣
+                    # - prompt 不变(同账号同风控场景,改写 prompt 也救不了,
+                    #   shark_admin 是按账号 + IP + 请求指纹特征拦的)
+                    # - 最多 _MAX_RISK_RETRY 次,避免无限循环浪费 token
+                    if not exc.is_risk_control:
+                        # 非风控的 quota 限流:沿用原行为(交给 service.py 走
+                        # mark_account_limited + assign None + 任务回 queued)
+                        raise
+                    risk_attempt += 1
+                    if risk_attempt > _MAX_RISK_RETRY:
+                        _LOGGER.error(
+                            "event=video_risk_control_retry_exhausted attempts=%d",
+                            risk_attempt - 1,
+                        )
+                        # 用 reject 风格的 RuntimeError 抛出,让 service.py
+                        # 走「task failed + 退额度 + 不阻塞账号」路径
+                        raise RuntimeError(
+                            f"账号被风控拦截(shark_admin),连续 {risk_attempt - 1} 次"
+                            f"自动解滑块均失败,请稍后重试或换号"
+                        )
+                    _LOGGER.warning(
+                        "event=video_risk_control_keepalive attempt=%d/%d | %s",
+                        risk_attempt, _MAX_RISK_RETRY, exc,
+                    )
+                    try:
+                        update(
+                            error_message=(
+                                f"检测到风控拦截,正在保留浏览器等待滑块并自动"
+                                f"解算(第 {risk_attempt}/{_MAX_RISK_RETRY} 次)"
+                            )
+                        )
+                    except Exception:
+                        pass
+                    # 在原 page 上等 aegis 弹窗出现 → 图鉴解 → 验证消失。
+                    # _pre_submit_aegis_gate 返回 True = 放行(可继续 submit),
+                    # False = 解失败/超时(阻止 submit,本分支 raise 出去走失败路径)。
+                    solved = await _pre_submit_aegis_gate(
+                        page, profile_dir, update,
+                    )
+                    if not solved:
+                        _LOGGER.error(
+                            "event=video_risk_control_captcha_solve_failed attempt=%d",
+                            risk_attempt,
+                        )
+                        raise RuntimeError(
+                            f"账号被风控拦截(shark_admin),第 {risk_attempt} 次"
+                            f"自动解滑块失败,请稍后重试或确认图鉴凭证"
+                        )
+                    try:
+                        update(
+                            error_message=(
+                                f"滑块已通过,正在以原 prompt 重新提交"
+                                f"(第 {risk_attempt}/{_MAX_RISK_RETRY} 次)"
+                            )
+                        )
+                    except Exception:
+                        pass
+                    # continue → 重新跑 _submit_and_poll,submit_via_ui 会再
+                    # 走一次 create-image → 视频 tab → 清空 → type → send。
+                    # page 状态由 _pre_submit_aegis_gate 接管后是「弹窗消失」,
+                    # 再走 submit 不会立即撞弹窗。
+                    continue
                 except DoubaoContentRejected as exc:
                     attempt += 1
                     if max_reject_retries <= 0 or attempt > max_reject_retries:
