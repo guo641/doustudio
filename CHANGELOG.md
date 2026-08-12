@@ -2,6 +2,253 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.3.2.3 - 2026-08-12
+
+**修复 v0.3.2.2 「aegis 弹窗刚出现窗口就被自动关闭」根因:提交前加阻塞式 aegis 网关,防止 POST 撞弹窗触发 shark_admin 拒绝。**
+
+### 为什么做
+
+v0.3.2.2 用户反馈(2026-08-12,verbatim):
+> 「提示词粘贴进去,刚提交,滑块弹窗刚出现,窗口就被自动关闭了。
+>  还是这个报错!应该是软件把滑块认定为问题,直接关闭了窗口。
+>  这也导致了没有给滑块识别的时间,你认为呢?」
+
+**根因**:`submit_via_ui` step 2 之前用 `_UI_CAPTCHA_WAIT_SECONDS = 2.0s`
+等弹窗出现,实测 aegis 弹窗在 navigate 后 **3-5s** 才出现:
+
+```
+t=0s   page.goto(/chat/create-image) 完成
+t=0~2s 等待弹窗 — 没出现(此时 aegis 还在 CDN 加载 / 动画中)
+t=2s   step 6 → try_click(SEND_BTN_SEL) → POST /chat/completion 飞出去
+t=3~5s aegis 弹窗出现在 send 按钮上(挡住了后续 click,但 POST 已经飞了)
+       ↓
+       服务端 shark_admin 看到「非真人触发」(
+         sec-fetch-mode + request initiator + aegis 弹窗挂着
+         这种组合判定为机器人 POST + 弹窗并发
+       )
+       → 返回 `extra.decision.from == "shark_admin"` 拒绝
+       → aegis 弹窗超时自动收起 → 用户看到「弹窗刚出现窗口就被关闭」
+```
+
+**用户感受是「软件主动关了窗口」**,实际上是 **POST + 弹窗撞车** + 弹窗超时自动收起 + 风控拒绝。
+
+### 改动
+
+`src/doupool/video/browser.py`:
+
+- **新增模块级常量**(`_UI_CAPTCHA_*`):
+  - `_UI_CAPTCHA_WAIT_SECONDS = 6.0` —— 弹窗出现的最长时间(用户实测 3-5s,留缓冲)
+  - `_UI_CAPTCHA_VERIFY_GONE_SECONDS = 4.0` —— 解完后等弹窗彻底消失的窗口
+  - `_UI_CAPTCHA_DETECT_POLL_INTERVAL = 0.5` —— detect 间隔,人感知的轮询节奏
+- **新增 `_pre_submit_aegis_gate(page, profile_dir, update)` helper** —— 阻塞式网关:
+  1. cooldown 检查(复用 `str(profile_dir)`,与 login 路径共享 30min)
+  2. 轮询 detect aegis 弹窗(每 0.5s,最多 6s)
+  3. 探测到 → 调 `solve_aegis_captcha` 拖
+  4. 解完后 **轮询确认弹窗彻底消失**(每 0.5s,最多 4s)
+  5. 弹窗仍在 → **返 False**(阻止 click send,防 POST + 弹窗撞车)
+  6. 探测期内始终无弹窗 → 返 True(没有 captcha 是好事,直接放行)
+- **`submit_via_ui` step 2 改成调用网关**:网关返 False → raise RuntimeError
+  「aegis 拖拽验证未通过或弹窗未消失,暂不提交任务以免触发服务端风控。
+  请稍候 30s 重试,或确认图鉴打码平台账号配额。」,阻止 step 6 click send。
+- **step 6(click send 前的兜底探测)保留**:用户中途输入期间弹窗可能又来,
+  走原有 `_try_solve_captcha_in_video` 路径。
+
+### 契约
+
+- `_pre_submit_aegis_gate` 失败/凭证关/solver 抛错 → 一律 mark cooldown + update
+  提示,**不 raise**(不让图鉴故障挂掉已有路径);只是把弹窗挡路的情况拦截掉。
+- cooldown 共享 `account_key = str(profile_dir)`,与 login keepalive 自动共享。
+- 前端零改动(`update(error_message=...)` 是已有通道)。
+- `_submit_and_poll` poll 路径的 aegis 兜底不动(覆盖「submit 后才弹」的另一种场景)。
+
+### 验证
+
+- 后端测试:`tests/test_video_ui_submit.py` 22 个全过(新增 6 个:no popup /
+  in cooldown / popup solved+gone / popup persists / credentials disabled /
+  submit_via_ui raises_when_gate_blocks)。
+- 「弹窗持续存在」测试断言 `mouse.downs == 0`,防止代码被改回 fire-and-forget。
+- `fast_gate_constants` fixture 把 6s+4s 压短到 0.2+0.2,单测不会真的等 10s。
+
+### 不做的事
+
+- ❌ 改 selector / `_submit_and_poll` 契约 / `parse_sse_ack` / 前端
+- ❌ shark_admin 二次兜底(留给以后,本次 UI click + 阻塞网关已大幅降概率)
+- ❌ 改 login keepalive 的 aegis solver(已 OK)
+- ❌ 加 retry 队列 / 跨账号切换
+
+## v0.3.2.2 - 2026-08-12
+
+**v0.3.2.1 hotfix:Playwright `launch_persistent_context` 闪退 —— clipboard permission 名拼错。**
+
+### 为什么做
+
+v0.3.2.1 把 clipboard 权限写成 `"permissions": ["clipboard-read-write"]`,
+**不是 Playwright 接受的 permission 名**。Playwright 内部
+`coreBundle.js` 严格校验 permission map(只认 `clipboard-read` /
+`clipboard-write` 两条),launch 时立刻抛:
+
+```
+playwright._impl._api_types.Error: BrowserType.launch_persistent_context:
+Unknown permission: clipboard-read-write
+```
+
+后果:用户在「任务管理 → 启动任务」点提交 → 程序起 Playwright Chromium →
+立刻闪退 → 「任务浏览打开就关闭了,然后报错」(用户 2026-08-12 反馈)。
+**整条 login + submit 路径全部挂掉**,视频任务 0% 提交成功。
+
+### 改动
+
+- `src/doupool/video/browser.py`:`_build_launch_kwargs()` 把
+  `"permissions": ["clipboard-read-write"]` 拆成
+  `"permissions": ["clipboard-read", "clipboard-write"]`
+  两条独立 permission(Playwright 文档 + 源码 `coreBundle.js` 38061-38062
+  行均明确)。
+- `tests/test_video_ui_submit.py`:
+  `test_build_launch_kwargs_grants_clipboard_permission` 改断言
+  `clipboard-read` + `clipboard-write` 都在,`clipboard-read-write`
+  必须不在(防回归)。
+
+### 验证
+
+- 后端测试:`tests/test_video_ui_submit.py` 等 60 个通过
+- Playwright 文档 + 源码(本地 `driver/package/lib/coreBundle.js`)
+  验证 `clipboard-read` / `clipboard-write` 是合法 permission 名
+- 「不在列表里」断言确保 v0.3.2.1 那条错误拼写不会回归
+
+### 不做的事
+
+- ❌ 改 clipboard paste 路径(v0.3.2.1 的 writeText + Ctrl+V 是对的,
+  这次只是 launch kwargs 写错了 permission 名)
+- ❌ 改 selector / UI click 顺序 / aegis 兜底
+- ❌ 改前端
+
+## v0.3.2.1 - 2026-08-12
+
+**v0.3.2 hotfix:`submit_via_ui` 整段 prompt 改 clipboard paste(不是键盘逐字打)。**
+
+### 为什么做
+
+v0.3.2 把 `COMPLETION_SCRIPT`(`page.evaluate fetch /chat/completion`)换成
+真实 Playwright UI 点击流,绕过 shark_admin 对 `sec-fetch-mode` /
+`request initiator` 的「非真人触发」识别。但 step 5 输入 prompt 时用的是
+`page.keyboard.type(prompt, delay=20)` —— **一字一字打**,跟用户实际使用
+方式不符:
+
+- 用户把整段提示词(经常 200-500 字)一次给我,我应该**一次性贴入**
+  并提交,不是逐字敲出来。
+- 500 字 prompt 用 `delay=20ms` 要 ~10s 才打完,加上均匀延迟正好是
+  aegis 时序风控最爱的特征(真人 paste 间隔是 0ms 突刺,不是 20ms 均匀打)。
+- 真人的真实操作就是「复制 → 粘贴到输入框」,不是手敲。
+
+用户原话(2026-08-12):
+
+> 「输入框需要一次性把我给你的完整提示词粘贴进去然后提交生成,不是让你
+> 一句话提交一次,修改一下」
+
+### 改动
+
+- `src/doupool/video/browser.py`:
+  - `_build_launch_kwargs()` 加 `"permissions": ["clipboard-read-write"]`
+    —— `launch_persistent_context` 的 grant_permissions 在 context 创建时
+    一次性申请,`context.grant_permissions()` 后改 origin 不对(不是
+    `https://www.doubao.com`),所以只能走 launch kwargs。
+  - `submit_via_ui` step 5:`page.keyboard.type(prompt, delay=20)` →
+    `page.evaluate("(t) => navigator.clipboard.writeText(t)", prompt)` +
+    `page.wait_for_timeout(50)` + `page.keyboard.press("Control+V")` +
+    `page.wait_for_timeout(150)`(让 ProseMirror 同步 internal state)。
+    整段 prompt 走一次 writeText + 一次 Ctrl+V,无逐字符 type。
+- `tests/test_video_ui_submit.py`:
+  - 改 `test_submit_via_ui_clicks_video_tab_and_send_btn` 断言:
+    writeText 必含完整 prompt;`keyboard.types` 必为空;Control+V 必
+    press。
+  - 新增 `test_submit_via_ui_pastes_long_prompt_in_single_op`(>500 字
+    长 prompt,单次 writeText + 单次 Ctrl+V + 无 type)
+  - 新增 `test_build_launch_kwargs_grants_clipboard_permission`(两个
+    window_visible 分支都带 `clipboard-read-write`)
+
+### 契约不变
+
+- `protocol.py:parse_sse_ack` / `service.py:update(**ack)` 3 字段契约
+  仍然成立,UI click → writeText + Ctrl+V → submit 路径完全不变。
+- `use_real_browser=True / False` 双路径保留。
+- 前端零改动。
+
+### 不做的事
+
+- ❌ 改 selector / probe / UI click 顺序 / aegis 兜底
+- ❌ 改 `submit_via_ui` 其它 step
+- ❌ 加 retry-after-paste 兜底(aegis 检测失败仍走原路径)
+- ❌ 改 window_visible 行为(launch kwargs 两分支都加了 permission)
+
+## v0.3.2 - 2026-08-12
+
+**video runner 提交路径改为真实 UI click:绕过 shark_admin 风控对 page.evaluate fetch 的识别。**
+
+### 为什么做
+
+v0.3.1.4 把 aegis 弹窗提到了截图 + 拖拽的最前端,但 submit 还在用
+`page.evaluate(fetch /chat/completion, body)` —— 服务端 shark_admin 看
+`sec-fetch-mode` / `request initiator` / `navigation params` 就能识别
+「非真人点击触发」,返回 `extra.decision.from == "shark_admin"` 拒绝。
+复测:解了 aegis + 弹窗置顶后仍过不了。
+
+用户原话(2026-08-12):
+
+> 「点这个视频才会到下一步」 —— 截图 `/chat/create-image` 的「图像 /
+> 视频」toggle,点视频 tab 才是真实入口(toolbar「视频生成」chip 只开
+> chat conversation,不进入创作页)。
+
+### 改动
+
+- `src/doupool/video/browser.py`:
+  - 新增模块级常量:`VIDEO_TAB_SEL` / `EDITOR_SEL` / `SEND_BTN_SEL` /
+    `SEND_BTN_FALLBACK_SEL` / `CREATE_IMAGE_URL`(selector 实地由
+    `tools/doubao_dom_probe/probe_*.py` 验证)
+  - 新增 helper:`try_click(page, selectors)` —— locator.first +
+    bounding_box + mouse.move/down/up,真人节奏 50-130ms 抖动
+  - 新增 helper:`clear_prose_mirror(page)` —— Ctrl+A + Delete(不能用
+    innerHTML,ProseMirror internal state 会错乱)
+  - 新增 helper:`_ack_interceptor(page)` async context manager +
+    `_wait_for_ack(state)` —— page.on('response') 拦截 /chat/completion,
+    自动 remove_listener 防 leak
+  - 新增函数:`submit_via_ui(page, prompt)` —— 导航 → 点视频 tab →
+    清空 → type → 点 submit,前后两次 aegis 兜底
+  - 改 `_submit_and_poll` 加 `use_real_browser: bool = True` 参数,
+    True = UI click 路径,False = 原 fetch 路径保留为回滚 / 测试
+  - 改 `run()` 第 1180 行 `_submit_and_poll` 调用显式传
+    `use_real_browser=True`
+- 新增测试 `tests/test_video_ui_submit.py`:14 个测试覆盖 selector
+  常量 / try_click / clear_prose_mirror / submit_via_ui / 拦截器 leak /
+  _wait_for_ack / 3 字段 ack 契约(`service.py` `update(**ack)` 不破)
+
+### 契约不变
+
+- `protocol.py:parse_sse_ack` 不动 —— 返回 `{conversation_id,
+  section_id, question_id}` 3 字段全在
+- `service.py:update(**ack)` 解包契约不变 —— 缺字段即 KeyError,
+  本方案保持
+- `CHAIN_SCRIPT` poll 不动 —— 只改 submit 触发方式,chain 路径
+  完全相同
+- `UPLOAD_IMAGE_SCRIPT` 不动 —— i2v 图片上传保留 page.evaluate
+- 前端零改动 —— COMPLETION_SCRIPT 是浏览器内 page.evaluate,
+  前端代码看不到
+
+### 风险与回滚
+
+- selector 失效(豆包前端 React 重构改类名 / path)→
+  `use_real_browser=False` 回滚原 fetch 路径
+- aegis 弹窗时间窗:UI 路径用 2s(v0.3.1.4 fetch 路径 4s);实测 UI 视
+  角下弹窗 ~1s 出现,2s 够
+- prompt > 200 字 ProseMirror 可能挂 —— 沿用 v0.2.19 长度限制(未改)
+
+### 不做的事
+
+- 改 frontend / parse_sse_ack / CHAIN_SCRIPT / UPLOAD_IMAGE_SCRIPT
+- shark_admin 二次兜底 —— 留给以后,本次走 click 已大幅降概率
+- 加 v0.3.1.3 shark_admin 黑名单 / IP 切换 —— 本次 UI click 是成
+  本最低的解
+- 重写 aegis solver —— v0.3.1.4 已 OK
+
 ## v0.3.1.4 - 2026-08-12
 
 **aegis 弹窗在截图 + 拖拽前置顶 — 修视频路径 Element.screenshot 残图。**

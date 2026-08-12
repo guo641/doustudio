@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import mimetypes
@@ -45,6 +46,23 @@ _CAPTCHA_DETECT_WAIT_BEFORE_SUBMIT_SECONDS = 4.0
 # pre-submit hook 等 4s 经常空等,真正起作用的是 poll 期间的 hook;把后者挪到
 # chain 请求之前 + 去掉每 3 轮节流,改成每次 poll 都探。captcha 探本身是纯 DOM
 # 查询(几十 ms),不会拖慢 timeout。_CAPTCHA_DETECT_INTERVAL_POLLS 常量删除。
+
+# v0.3.2:UI click 路径 selector 常量。类名稳定优先,SVG path 兜底。
+# 视频 tab 用 a11y role + 文本(豆包前端 aria 标签就是「视频」)。
+VIDEO_TAB_SEL = "[role='tab']:has-text('视频')"
+EDITOR_SEL = "div[contenteditable='true']"
+SEND_BTN_SEL = ".send-btn-wrapper button"
+SEND_BTN_FALLBACK_SEL = "button:has(svg path[d^='M4.93934 10.2598'])"
+CREATE_IMAGE_URL = "https://www.doubao.com/chat/create-image"
+# v0.3.2.3:UI click 路径下的弹窗缓冲。**经验值**(用户在 v0.3.2.2 反馈):
+# 实测 aegis 弹窗在 navigate 后 3-5s 才会出现,v0.3.2.2 用的 2s 经常空等,
+# 然后 POST 立即飞出 + 弹窗刚好弹 → shark_admin 拒绝。所以 submit 前必须
+# 给弹窗足够的"出现窗口",而且必须确认弹窗消失后才能点 send。
+_UI_CAPTCHA_WAIT_SECONDS = 6.0  # 弹窗出现最长的等待(用户实测 3-5s)
+_UI_CAPTCHA_VERIFY_GONE_SECONDS = 4.0  # 解完后等弹窗彻底消失的轮询窗口
+_UI_CAPTCHA_DETECT_POLL_INTERVAL = 0.5  # 弹窗轮询间隔
+# 拦截 /chat/completion 响应的最长时间,跟 click → POST → SSE 飞出去对齐
+_UI_ACK_WAIT_SECONDS = 30.0
 
 # v0.2.22:模块级 logger,retry loop 用 warn 级记「revise 重试」事件
 _LOGGER = logging.getLogger(__name__)
@@ -703,6 +721,18 @@ def _build_launch_kwargs(*, window_visible: bool = False) -> dict:
         ],
         "locale": _BROWSER_LOCALE,
         "timezone_id": _BROWSER_TIMEZONE,
+        # v0.3.2.2:必须授 clipboard-read + clipboard-write,否则
+        # navigator.clipboard.writeText() 抛 NotAllowedError,prompt
+        # paste 路径整个挂掉。v0.3.2.1 写过 ["clipboard-read-write"]
+        # —— **错的**,Playwright 校验严格,launch 立刻抛
+        # `BrowserType.launch_persistent_context: Unknown permission:
+        # clipboard-read-write`,浏览器闪退。Playwright 只接受
+        # clipboard-read / clipboard-write 两个独立 permission(见
+        # playwright/driver/.../coreBundle.js 的 permission map),
+        # 所以这里必须拆成两条。
+        # grant_permissions 走 launch_persistent_context 而不是
+        # context.grant_permissions(后者的 origin 不是 https://www.doubao.com)。
+        "permissions": ["clipboard-read", "clipboard-write"],
         "extra_http_headers": {
             "Referer": "https://www.doubao.com/chat/",
             "Accept-Language": "zh-CN,zh;q=0.9",
@@ -833,6 +863,334 @@ async def _try_solve_captcha_in_video(
         except Exception:
             pass
         return True
+
+
+async def _pre_submit_aegis_gate(
+    page: Page,
+    profile_dir: Path,
+    update: Callable[..., None],
+) -> bool:
+    """v0.3.2.3:提交前的**阻塞式** aegis 网关。
+
+    用户反馈(v0.3.2.2):
+      「提示词粘贴进去,刚提交,滑块弹窗刚出现,窗口就被自动关闭了。
+       应该是软件把滑块认定为问题,直接关闭了窗口。」
+
+    根因:`submit_via_ui` step 2 用 `_UI_CAPTCHA_WAIT_SECONDS = 2.0s` 等弹窗。
+    实测 aegis 弹窗在 navigation 后 3-5s 才会出现,所以:
+      - 2s 等待期内没有弹窗 → step 6 直接点 send
+      - POST 飞出去 → 弹窗刚好在 POST 中出现
+      - 服务端 shark_admin 看到「非真人触发」(因为 aegis 弹窗挂在前面挡 submit)→ 拒绝
+      - 弹窗还在挂着 → 用户看到「弹窗刚出现就关」(其实是 aegis 超时自动收起)
+      - 用户感觉「软件主动关了窗口」
+
+    本 helper 改阻塞式轮询:
+      1. cooldown 检查:在冷却期直接放行(已解过别浪费)
+      2. 轮询 detect aegis 弹窗(每 0.5s 一次,最多 6s —— 用户实测窗口 3-5s)
+      3. 探测到 → 调 `solve_aegis_captcha` 拖
+      4. 解完后,**轮询确认弹窗彻底消失**(每 0.5s,最多 4s)
+      5. 弹窗仍在 → raise RuntimeError,**阻止** click send(防 POST + 弹窗撞车)
+      6. 探测期内始终无弹窗 → 放行(没有 captcha 是好事)
+
+    返回 True = 放行(可以点 send)/ False = 网关拒绝(上层 raise 阻止 submit)。
+
+    注:实测中 aegis 弹窗有时**在 submit 之后**才出现(用户输入 prompt 时弹
+    窗还没起,点 send 触发 POST 的瞬间弹窗挂上)。本 helper 主要拦截「弹窗
+    在 submit 前已挂上」的情况;submit 后 aegis 仍走 `_submit_and_poll`
+    poll 路径的兜底(已就位弹窗会立即被解 → chain 请求能继续走)。
+
+    cooldown 复用:`str(profile_dir)` 与 login 路径共享同一份 30min dict,
+    login keepalive 刚解完 → video 路径立即放行。
+    """
+    account_key = str(profile_dir)
+    if _captcha_is_in_cooldown(account_key):
+        # login / 上次 video 路径 30min 内已解过 — 直接放行
+        _LOGGER.debug("aegis gate: account=%s in cooldown, allow submit", account_key)
+        return True
+
+    # Step 1:轮询 detect aegis 弹窗(最多 6s,实测窗口 3-5s)
+    popup_present = False
+    deadline = time.monotonic() + _UI_CAPTCHA_WAIT_SECONDS
+    last_kind = None
+    while time.monotonic() < deadline:
+        try:
+            kind = await _detect_aegis_captcha(page)
+        except Exception as exc:
+            _LOGGER.debug("aegis gate detect failed: %s", exc)
+            kind = None
+        if kind is not None and kind.value != "unknown":
+            popup_present = True
+            last_kind = kind
+            break
+        await asyncio.sleep(_UI_CAPTCHA_DETECT_POLL_INTERVAL)
+
+    if not popup_present:
+        # 探测期内无弹窗 — 好事,放行
+        _LOGGER.debug("aegis gate: no popup within %.1fs, allow submit", _UI_CAPTCHA_WAIT_SECONDS)
+        return True
+
+    # Step 2:弹窗已挂上,调 solver 拖
+    _LOGGER.info("aegis gate: popup=%s detected, solving", last_kind)
+    try:
+        update(error_message="提交前检测到拖拽验证,正在通过图鉴打码平台识别")
+    except Exception:
+        pass
+
+    creds = _load_captcha_credentials()
+    try:
+        client = _make_captcha_client(creds)
+    except _AegisCaptchaDisabled as exc:
+        _LOGGER.warning("aegis gate: solver disabled: %s", exc)
+        # 凭证关 — 不能拖,标 cooldown 防反复,放行让 submit 撞 aegis → 失败路径走起
+        _captcha_mark_cooldown(account_key)
+        try:
+            update(error_message=f"图鉴凭证未配置或已停用({exc}),滑块可能需要手动拖")
+        except Exception:
+            pass
+        return True
+
+    def _on_state(s: str) -> None:
+        msg = {
+            "uploading": "图鉴正在识别拖拽图...",
+            "dragging": "图鉴正在拖动滑块...",
+            "verifying": "等待 aegis 校验拖拽结果...",
+            "ok": "拖拽已通过,等待弹窗消失",
+            "failed": "图鉴解算失败",
+        }.get(s, f"图鉴:{s}")
+        try:
+            update(error_message=msg)
+        except Exception:
+            pass
+
+    try:
+        try:
+            await _solve_aegis_captcha(page, client, on_state=_on_state)
+        finally:
+            client.close()
+    except (_AegisCaptchaFailed, _AegisCaptchaDisabled) as exc:
+        _LOGGER.warning("aegis gate solver failed: %s", exc)
+        _captcha_mark_cooldown(account_key)
+        # 解失败 — 标 cooldown,放行(让 submit 撞 aegis → 走失败路径让用户看到)
+        try:
+            update(error_message=f"图鉴解算失败({exc}),提交可能被拦截")
+        except Exception:
+            pass
+        return True
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception("aegis gate solver unexpected error")
+        _captcha_mark_cooldown(account_key)
+        return True
+
+    # Step 3:解完后轮询确认弹窗彻底消失(最多 4s)
+    gone_deadline = time.monotonic() + _UI_CAPTCHA_VERIFY_GONE_SECONDS
+    while time.monotonic() < gone_deadline:
+        try:
+            kind = await _detect_aegis_captcha(page)
+        except Exception:
+            kind = None
+        if kind is None or kind.value == "unknown":
+            # 弹窗消失 — 放行
+            _LOGGER.info(
+                "aegis gate: popup gone after %.2fs, allow submit",
+                _UI_CAPTCHA_VERIFY_GONE_SECONDS - (gone_deadline - time.monotonic()),
+            )
+            try:
+                update(error_message="拖拽验证已通过,正在提交任务")
+            except Exception:
+                pass
+            return True
+        await asyncio.sleep(_UI_CAPTCHA_DETECT_POLL_INTERVAL)
+
+    # Step 4:解完后 4s 弹窗仍在 — **不放行**(防止 POST + 弹窗撞车触发 shark_admin)
+    _LOGGER.error(
+        "aegis gate: popup still present after solve within %.1fs, blocking submit",
+        _UI_CAPTCHA_VERIFY_GONE_SECONDS,
+    )
+    try:
+        update(error_message="拖拽验证后弹窗未消失,暂不提交,稍后重试")
+    except Exception:
+        pass
+    return False
+
+
+# v0.3.2:真实 UI click 路径的核心 helper —— 替换掉 `page.evaluate(fetch /chat/completion)`。
+# 思路:打开 `/chat/create-image` → 点「视频」tab → type prompt → 点 submit 按钮,
+# 让豆包前端认为这是真实用户点击,绕过 shark_admin 服务端对 page.evaluate POST 的
+# 识别(`sec-fetch-mode` / `request initiator` / `navigation params`)。
+async def try_click(
+    page: Page,
+    selectors: tuple[str, ...],
+    *,
+    timeout: float = 10.0,
+) -> None:
+    """v0.3.2:按 selector 顺序试,首个可见 + 可点击的就点。
+
+    行为参考 captcha/solver.py 的 `_find_element_box` 模式:
+    locator().first.wait_for(state='visible') → bounding_box → mouse.move/down/up。
+    click 间隔用 random.randint(0, 80) 抖动 50-130ms,防止 aegis 时序风控
+    识别出「匀速间隔 = 自动化」。click 后再 wait_for_timeout(150) 让 React
+    处理完 click event,否则立刻读 ProseMirror 可能拿到旧节点。
+    """
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    for sel in selectors:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(
+                state="visible",
+                timeout=int((deadline - time.monotonic()) * 1000),
+            )
+            box = await loc.bounding_box()
+            if not box or box["width"] <= 0 or box["height"] <= 0:
+                continue
+            cx = box["x"] + box["width"] / 2
+            cy = box["y"] + box["height"] / 2
+            await page.mouse.move(cx, cy, steps=3)
+            await page.mouse.down()
+            await page.wait_for_timeout(50 + random.randint(0, 80))
+            await page.mouse.up()
+            await page.wait_for_timeout(150)
+            return
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise RuntimeError(
+        f"try_click all selectors failed: {selectors} (last={last_error})"
+    )
+
+
+async def clear_prose_mirror(page: Page) -> None:
+    """v0.3.2:清空 ProseMirror 输入框(retry 路径 revise 后用)。
+
+    不能用 page.evaluate("el => el.innerHTML = ''"):ProseMirror 是 transactional
+    编辑器,内部 model state 跟 DOM 同步靠 MutationObserver;直接改 innerHTML
+    会让 state 错乱,下次 type 不生效。改用真人操作流程:click → Ctrl+A → Delete。
+    """
+    loc = page.locator(EDITOR_SEL).first
+    await loc.click()
+    await page.keyboard.press("Control+A")
+    await page.keyboard.press("Delete")
+    await page.wait_for_timeout(100)
+
+
+@contextlib.asynccontextmanager
+async def _ack_interceptor(page: Page):
+    """v0.3.2:拦截 /chat/completion 响应的 async context manager。
+
+    进入:装 page.on('response', _on_response) 监听
+    退出:自动 remove_listener,避免 leak
+
+    为什么用 page.on 而不是 context.on:
+    - context.on 会拦截所有 page 的响应,跨 task 串台(同 account 多 task)
+    - 一次 submit 只对应一个 page 的 /chat/completion,page.on 更精准
+    - context manager 保证 listener 不 leak(每 task 独立,exit 时清理)
+    """
+    state: dict[str, object] = {}
+
+    async def _on_response(response):
+        url = response.url
+        if "/chat/completion" not in url:
+            return
+        try:
+            text = await response.text()
+        except Exception as exc:
+            _LOGGER.debug("ack interceptor read body failed: %s", exc)
+            return
+        state["text"] = text
+        state["ts"] = time.time()
+
+    page.on("response", _on_response)
+    try:
+        yield state
+    finally:
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:
+            pass
+
+
+async def _wait_for_ack(state: dict, *, timeout: float = _UI_ACK_WAIT_SECONDS) -> str:
+    """v0.3.2:等拦截器抓到 /chat/completion 响应原文,返给 parse_sse_ack。
+
+    3 字段契约(`conversation_id / section_id / question_id`)由 parse_sse_ack
+    保证,service.py `update(**ack)` 解包不变。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if "text" in state:
+            return str(state["text"])
+        await asyncio.sleep(0.1)
+    raise RuntimeError(f"等待 /chat/completion 响应超时 ({timeout}s)")
+
+
+async def submit_via_ui(
+    page: Page,
+    prompt: str,
+    *,
+    profile_dir: Path,
+    update: Callable[..., None],
+) -> None:
+    """v0.3.2:真实 UI click 提交 —— 导航 → 点视频 tab → 清空 → type → 点 submit。
+
+    整段在浏览器内执行,绕过 shark_admin 服务端对 page.evaluate POST 的识别。
+    前后两次 aegis 兜底(进入 tab 前 + click send 前),wait 2s / 0s;
+    cooldown 自动跳过(30min 复用 login 路径的同一份 _captcha_cooldown dict)。
+    """
+    # 1. 导航到 create-image 页(已在则 skip,避免重复跳转)
+    if not page.url.startswith(CREATE_IMAGE_URL):
+        await page.goto(CREATE_IMAGE_URL, wait_until="domcontentloaded", timeout=30_000)
+        await page.wait_for_timeout(1_000)  # 等 React mount 完成
+
+    # 2. v0.3.2.3:**阻塞式** aegis 网关 —— 取代 v0.3.2.2 的 fire-and-forget 探测
+    # 旧逻辑:`_UI_CAPTCHA_WAIT_SECONDS = 2.0s` 等弹窗,实测 aegis 3-5s 才出现,
+    # 经常空等 → step 6 点 send → POST 撞弹窗 → shark_admin 拒绝。
+    # 新逻辑:轮询 6s 探弹窗 → 解 → 验证消失(4s)→ 还在就**不点 send**。
+    if not await _pre_submit_aegis_gate(page, profile_dir, update):
+        # 弹窗 4s 内没消失 — 阻止 POST,告诉上层重试或换号
+        raise RuntimeError(
+            "aegis 拖拽验证未通过或弹窗未消失,暂不提交任务以免触发服务端风控。"
+            "请稍候 30s 重试,或确认图鉴打码平台账号配额。"
+        )
+
+    # 3. 点视频 tab(create-image 默认是图像 tab)
+    await try_click(page, (VIDEO_TAB_SEL,), timeout=5.0)
+    await page.wait_for_timeout(300)
+
+    # 4. 清空输入框 —— retry 路径 revise 后调用,这里幂等
+    await clear_prose_mirror(page)
+
+    # 5. 输入 prompt —— v0.3.2.1:改 clipboard paste(不是 keyboard.type)
+    # 原因:
+    # - 用户把整段提示词一次给我,需要"一次性贴入",不是一字一字打
+    # - keyboard.type(prompt, delay=20) 对 500 字 prompt 要 ~10s 跑完,
+    #   加上均匀 delay 是 aegis 时序风控最爱的特征(真人 paste 间隔是 0ms 突刺)
+    # - 用 navigator.clipboard.writeText + Ctrl+V = 真人从剪贴板贴长文,
+    #   ProseMirror 也正确收到 paste event 同步 internal model state
+    loc = page.locator(EDITOR_SEL).first
+    await loc.wait_for(state="visible", timeout=10_000)
+    await loc.click()
+    # writeText 走 page.evaluate —— 必须 launch_persistent_context 已 grant
+    # clipboard-read-write 权限(见 _build_launch_kwargs)
+    await page.evaluate(
+        "(text) => navigator.clipboard.writeText(text)",
+        prompt,
+    )
+    # 给 clipboard 写入一点点时间(MS Edge 偶发 readback 竞速)
+    await page.wait_for_timeout(50)
+    await page.keyboard.press("Control+V")
+    await page.wait_for_timeout(150)  # 等 ProseMirror 同步 internal state
+
+    # 6. 点 submit 前再探一次 aegis(用户输入期间弹窗可能又来)
+    await _try_solve_captcha_in_video(
+        page,
+        profile_dir,
+        update,
+        wait_for_popup_seconds=0.0,
+    )
+    await try_click(page, (SEND_BTN_SEL, SEND_BTN_FALLBACK_SEL), timeout=5.0)
+    await page.wait_for_timeout(500)  # 等 POST 真的飞出去
 
 
 class PlaywrightVideoRunner:
@@ -1157,6 +1515,7 @@ class PlaywrightVideoRunner:
                         update,
                         cancel_event,
                         profile_dir,
+                        use_real_browser=True,  # v0.3.2:UI click 路径
                     )
                 except DoubaoContentRejected as exc:
                     attempt += 1
@@ -1192,32 +1551,61 @@ class PlaywrightVideoRunner:
         update: Callable[..., None],
         cancel_event: threading.Event,
         profile_dir: Path,
+        *,
+        use_real_browser: bool = True,
     ) -> dict[str, str]:
-        """v0.2.22:run() 的 submit + poll 切片,被 retry loop 复用。
+        """v0.3.2:run() 的 submit + poll 切片,被 retry loop 复用。
 
-        与 run() 的差别:这里只管单次「payload 拼装 → COMPLETION_SCRIPT 提交
-        → CHAIN_SCRIPT 轮询 → _resolve_original_download」,不管 page
-        选择 / 上传图片 / page.close。run() 负责一次性搭好上下文 + 收尾。
+        use_real_browser 开关:
+        - True(默认)= 真实 UI click 路径(navigate → 点 视频 tab → type → 点 send)
+          用 page.on('response') 拦截 /chat/completion 响应,服务端口气不可见
+          「非 page.evaluate 触发」,绕过 shark_admin 风控。
+        - False = 原 page.evaluate fetch /chat/completion 路径完整保留
+          (selector 失效 / 测试 fixture / 老账号验证 fetch 行为)。
+
+        ack 解析契约不变(parse_sse_ack 不动,3 字段全在):只是 trigger
+        方式换了,响应体一致 → service.py **ack 解包不破坏。
         """
-        payload = build_completion_payload(
-            prompt,
-            model,
-            ratio,
-            duration,
-            fingerprint,
-            mode=mode,
-            images=uploaded_images or None,
-            # v0.2.17:WebMSSDK / TeaSDK 真实指纹(从登录 profile 抽)透传给
-            # payload.client_meta — 走 EXTRA_CLIENT_META_KEYS 白名单。
-            **token_bundle.to_client_meta(),
-        )
-        local_id = payload["client_meta"]["local_conversation_id"]
-        await page.evaluate("id => history.replaceState({}, '', '/chat/' + id)", local_id)
-        response = await page.evaluate(COMPLETION_SCRIPT, {"payload": payload})
-        if response["status"] != 200:
-            raise RuntimeError(f"豆包提交接口返回 HTTP {response['status']}")
-        ack = parse_sse_ack(response["text"])
-        update(status="generating", **ack)
+        if use_real_browser:
+            # v0.3.2:UI click → /chat/completion 响应 → parse_sse_ack。
+            # 拦截器在 context 内部拿 state,exit 时自动 remove_listener。
+            async with _ack_interceptor(page) as ack_state:
+                await submit_via_ui(
+                    page,
+                    prompt,
+                    profile_dir=profile_dir,
+                    update=update,
+                )
+                text = await _wait_for_ack(
+                    ack_state, timeout=_UI_ACK_WAIT_SECONDS,
+                )
+            ack = parse_sse_ack(text)
+            update(status="generating", **ack)
+        else:
+            # 原 fetch 路径完整保留 —— 测试 + 回滚兜底
+            payload = build_completion_payload(
+                prompt,
+                model,
+                ratio,
+                duration,
+                fingerprint,
+                mode=mode,
+                images=uploaded_images or None,
+                **token_bundle.to_client_meta(),
+            )
+            local_id = payload["client_meta"]["local_conversation_id"]
+            await page.evaluate(
+                "id => history.replaceState({}, '', '/chat/' + id)", local_id,
+            )
+            response = await page.evaluate(
+                COMPLETION_SCRIPT, {"payload": payload},
+            )
+            if response["status"] != 200:
+                raise RuntimeError(
+                    f"豆包提交接口返回 HTTP {response['status']}"
+                )
+            ack = parse_sse_ack(response["text"])
+            update(status="generating", **ack)
 
         deadline = time.monotonic() + self.timeout
         poll_log_every = max(5, int(self.timeout / 6))  # 默认 20min → 每 3min 一条;最短 5
