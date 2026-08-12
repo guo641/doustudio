@@ -41,9 +41,10 @@ from .protocol import (
 # v0.3.1.2:video runner 在 page.goto 之后、提交之前等弹窗出现的最长时间。
 # aegis 弹窗通常在 navigation 后 1-3s 渲染;4s 缓冲。
 _CAPTCHA_DETECT_WAIT_BEFORE_SUBMIT_SECONDS = 4.0
-# v0.3.1.2:poll 循环期间每 N 轮探测一次 —— default poll_interval=10s,
-# 3 轮 ≈ 30s,跟 login keepalive 的 2s 节流相比放宽(避免轮询期拖慢)。
-_CAPTCHA_DETECT_INTERVAL_POLLS = 3
+# v0.3.1.3(去掉):用户实测 aegis 实际在「开始生成视频时」弹,不在 page.goto 后。
+# pre-submit hook 等 4s 经常空等,真正起作用的是 poll 期间的 hook;把后者挪到
+# chain 请求之前 + 去掉每 3 轮节流,改成每次 poll 都探。captcha 探本身是纯 DOM
+# 查询(几十 ms),不会拖慢 timeout。_CAPTCHA_DETECT_INTERVAL_POLLS 常量删除。
 
 # v0.2.22:模块级 logger,retry loop 用 warn 级记「revise 重试」事件
 _LOGGER = logging.getLogger(__name__)
@@ -1224,6 +1225,18 @@ class PlaywrightVideoRunner:
         while time.monotonic() < deadline:
             if cancel_event.is_set():
                 raise RuntimeError("任务已取消")
+            # v0.3.1.3:每次 poll 都探 aegis,挪到 chain 请求之前 —— 用户实测
+            # aegis 在 submit 之后才弹,且弹窗会让 chain 接口返非 200。
+            # 探的时机必须在 chain 之前,否则 aegis 让 task 先挂掉,我们
+            # 永远走不到 captcha 解算。cooldown 自动跳过(30min 复用 login 路径
+            # 的同一份 _captcha_cooldown dict),helper 内部 wait=0(poll 路径
+            # 不重复等弹窗)。
+            await _try_solve_captcha_in_video(
+                page,
+                profile_dir,
+                update,
+                wait_for_popup_seconds=0.0,
+            )
             chain = await page.evaluate(CHAIN_SCRIPT, {"conversationId": ack["conversation_id"]})
             if chain["status"] != 200:
                 raise RuntimeError(f"豆包结果接口返回 HTTP {chain['status']}")
@@ -1232,16 +1245,6 @@ class PlaywrightVideoRunner:
                 update(status="resolving", **result)
                 return await self._resolve_original_download(page, result, cancel_event)
             poll_count += 1
-            # v0.3.1.2:poll 期间再探一次 aegis —— 冷启动已过但生成中途(5min
-            # 任务期间)偶发 aegis 弹窗,解完继续。cooldown 自动跳过;helper
-            # wait=0(poll 路径不重复等弹窗)。
-            if poll_count % _CAPTCHA_DETECT_INTERVAL_POLLS == 0:
-                await _try_solve_captcha_in_video(
-                    page,
-                    profile_dir,
-                    update,
-                    wait_for_popup_seconds=0.0,
-                )
             # v0.2.31:polling 期间节流打日志,避免之前「卡生成中」无任何输出,
             # 让用户能看到 chain 还在跑、还要等多久。DEBUG 级别,默认不打印;
             # 出问题用 `LOGURU_LEVEL=DEBUG` 起程序即可看到。

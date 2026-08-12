@@ -2,6 +2,57 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.3.1.3 - 2026-08-12
+
+**修正 v0.3.1.2 的接入时序错误 —— aegis 实际在 submit 之后才弹。**
+
+### 为什么做
+
+v0.3.1.2 接入点放错位置。我原本以为 aegis 在 page.goto(doubao.com/chat/)
+之后就弹,实测用户反馈:**aegis 实际在「开始生成视频的时候」才弹**(submit
+之后、poll 期间)。这意味着:
+
+1. **pre-submit hook(提交前等 4s + detect)等于白跑** —— aegis 那会儿还没
+   出现,helper 永远返 unknown,白白等 4 秒。
+2. **poll hook 的 `% 3` 节流不靠谱** —— aegis 一旦弹出,chain 接口可能
+   立刻返非 200,任务在 helper 跑之前就标 failed 了。代码顺序错了:
+
+   ```python
+   chain = await page.evaluate(CHAIN_SCRIPT, ...)
+   if chain["status"] != 200:
+       raise RuntimeError(...)           # ← aegis 弹窗让这里先挂
+   if poll_count % 3 == 0:
+       await _try_solve_captcha_in_video(...)   # ← 永远到不了
+   ```
+
+### 改动
+
+- `src/doupool/video/browser.py`:
+  - `_submit_and_poll` poll 循环:**每次 poll 都探 aegis**,且挪到
+    `CHAIN_SCRIPT` 请求**之前**(原顺序是先发 chain,失败就 raise,
+    captcha helper 永远到不了)
+  - 删除 `_CAPTCHA_DETECT_INTERVAL_POLLS` 常量(不再节流)
+  - pre-submit hook 保留不动 —— 极少数账号在 page.goto 之后立刻弹的
+    场景仍然能命中,但不是主路径
+- `tests/test_video_captcha_hook.py`:`test_module_constants_reasonable`
+  去掉对 `_CAPTCHA_DETECT_INTERVAL_POLLS` 的断言(常量已删)
+- 版本号 0.3.1.2 → 0.3.1.3
+
+### 不做的事
+
+- ❌ 不删 pre-submit hook —— 留着,1% 场景仍有用
+- ❌ 不改 captcha helper 内部逻辑 —— `cooldown` 复用 login 路径的,
+  30 分钟冷却自动跳过
+- ❌ 不把 `update(error_message=...)` 进度上报文案改了 —— v0.3.1.2 的
+  「正在通过图鉴打码平台识别拖拽验证」/「拖拽验证已通过」直接复用
+- ❌ shark_admin 路径仍留给后续 —— 服务端 SSE 拒绝,无 DOM 弹窗,
+  这次修正也救不了它
+
+### 性能影响
+
+每次 poll 多调一次 `detect_aegis_captcha`(纯 DOM 查询,几十 ms);
+默认 6s 间隔 = 一分钟多花 1 秒不到,可以忽略。
+
 ## v0.3.1.2 - 2026-08-12
 
 **video runner 接 aegis solver —— 让图鉴在视频生成路径上真正自动拖。**

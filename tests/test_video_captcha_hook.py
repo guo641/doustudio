@@ -35,7 +35,6 @@ from doupool.captcha.solver import (
 )
 from doupool.video import browser as video_browser
 from doupool.video.browser import (
-    _CAPTCHA_DETECT_INTERVAL_POLLS,
     _CAPTCHA_DETECT_WAIT_BEFORE_SUBMIT_SECONDS,
     _try_solve_captcha_in_video,
 )
@@ -457,8 +456,10 @@ async def test_cooldown_shared_with_login_path(profile_dir: Path):
 
 
 def test_module_constants_reasonable():
-    """提交前等 4s、poll 每 3 轮 —— 改动要慎重,单测盯住。"""
+    """提交前等 4s —— 改动要慎重,单测盯住。
+
+    v0.3.1.3:删掉了 _CAPTCHA_DETECT_INTERVAL_POLLS(poll 改每次都探,挪到
+    chain 之前)。所以这条单测只盯提交前等待时长。
+    """
     assert _CAPTCHA_DETECT_WAIT_BEFORE_SUBMIT_SECONDS >= 2.0
     assert _CAPTCHA_DETECT_WAIT_BEFORE_SUBMIT_SECONDS <= 10.0
-    assert _CAPTCHA_DETECT_INTERVAL_POLLS >= 2
-    assert _CAPTCHA_DETECT_INTERVAL_POLLS <= 10
