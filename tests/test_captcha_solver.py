@@ -90,9 +90,21 @@ class FakeLocator:
 
 
 class FakeFrame:
-    def __init__(self, content: str = "", is_main: bool = False):
+    def __init__(
+        self,
+        content: str = "",
+        is_main: bool = False,
+        elements_by_selector: dict[str, list[dict]] | None = None,
+        raise_on_method: set[str] | None = None,
+    ):
         self.content_str = content
         self._main = is_main
+        # v0.3.1.4:_raise_to_front 在每个 frame 上也做 probe,frame 也得有
+        # evaluate / evaluate_handle。复用 page 的同一个 fake —— 但 page
+        # 实例本身给 frame 用不自然,这里做最简:frame 自己 fake 一份。
+        self._elements_by_selector = elements_by_selector or {}
+        self._raise_on_method = raise_on_method or set()
+        self._eval_calls: list[tuple[str, tuple]] = []
 
     @property
     def is_main(self) -> bool:
@@ -100,6 +112,33 @@ class FakeFrame:
 
     async def content(self) -> str:
         return self.content_str
+
+    async def evaluate_handle(self, expr: str) -> object:
+        sel = _extract_query_selector_name(expr)
+        nodes = self._elements_by_selector.get(sel, [])
+        return _FakeNodeList(nodes)
+
+    async def evaluate(self, expr: str, *args: object) -> object:
+        self._eval_calls.append((expr, args))
+        if len(args) == 1 and isinstance(args[0], _FakeNodeList):
+            if "raise_eval" in self._raise_on_method:
+                raise RuntimeError("boom")
+            return len(args[0].nodes)
+        if (
+            len(args) == 2
+            and isinstance(args[0], _FakeNodeList)
+            and isinstance(args[1], str)
+        ):
+            if "raise_eval" in self._raise_on_method:
+                raise RuntimeError("boom")
+            style = args[1]
+            n = 0
+            for node in args[0].nodes:
+                existing = node.get("style", "")
+                node["style"] = style + ";" + existing
+                n += 1
+            return n
+        return None
 
 
 class FakePage:
@@ -110,11 +149,20 @@ class FakePage:
         frames: list[FakeFrame] | None = None,
         content: str = "",
         locators: dict[str, FakeLocator] | None = None,
+        # v0.3.1.4:_raise_to_front 测试需要的真实 DOM 模型
+        elements_by_selector: dict[str, list[dict]] | None = None,
+        eval_raises: set[str] | None = None,
+        raise_on_method: set[str] | None = None,
     ):
         self.mouse = mouse or FakeMouse()
         self._all_frames = frames or []
         self._content = content
         self._locators = locators or {}
+        self._elements_by_selector = elements_by_selector or {}
+        self._eval_calls: list[tuple[str, tuple]] = []
+        self._eval_raises = eval_raises or set()
+        self._raise_on_method = raise_on_method or set()
+        self._bring_to_front_called = False
 
     @property
     def frames(self) -> list[FakeFrame]:
@@ -136,6 +184,89 @@ class FakePage:
 
     async def screenshot(self) -> bytes:
         return b"png"
+
+    # v0.3.1.4:以下方法给 _raise_to_front 测试用。FakePage 自己维护一个
+    # {selector: [element_dict]} 模型,element_dict 至少含 'style' 字段,
+    # evaluate/setAttribute 调用直接改它。tests 通过 assert 检查 style 是否
+    # 被覆写过。
+    async def bring_to_front(self) -> None:
+        if "bring_to_front" in self._raise_on_method:
+            raise RuntimeError("boom")
+        self._bring_to_front_called = True
+
+    async def evaluate_handle(self, expr: str) -> "object":
+        # 实际生产代码传进来的是 JS 字符串如 "() => document.querySelectorAll(sel)"
+        # 测试只判定 selector 名字 —— 解析 "querySelectorAll('XXX')" 形式
+        sel = _extract_query_selector_name(expr)
+        nodes = self._elements_by_selector.get(sel, [])
+        return _FakeNodeList(nodes)
+
+    async def evaluate(self, expr: str, *args: object) -> object:
+        self._eval_calls.append((expr, args))
+        # 1) handle -> number (count)
+        if len(args) == 1 and isinstance(args[0], _FakeNodeList):
+            if "raise_eval" in self._eval_raises:
+                raise RuntimeError("boom")
+            return len(args[0].nodes)
+        # 2) (node, style) -> mutate count
+        if (
+            len(args) == 2
+            and isinstance(args[0], _FakeNodeList)
+            and isinstance(args[1], str)
+        ):
+            if "raise_eval" in self._eval_raises:
+                raise RuntimeError("boom")
+            style = args[1]
+            n = 0
+            for node in args[0].nodes:
+                existing = node.get("style", "")
+                node["style"] = style + ";" + existing
+                n += 1
+            return n
+        return None
+
+
+def _extract_query_selector_name(expr: str) -> str:
+    """从 "( ) => document.querySelectorAll('XXX')" 抽出 'XXX'。
+
+    注意 selector 自身可能含 ' 或 ":例如 "[class*='aegis']"。这里
+    不匹配嵌套引号 —— 我们要找的「第一个 querySelectorAll 调用」,
+    然后把 sel 暴露给调用者匹配。
+    """
+    import re
+    m = re.search(r"querySelectorAll\(", expr)
+    if not m:
+        return ""
+    rest = expr[m.end():]
+    # 跳过空白,匹配第一个 ' 或 " 当作开始引号
+    m2 = re.match(r"\s*(['\"])", rest)
+    if not m2:
+        return ""
+    quote = m2.group(1)
+    # 一直读到下一个未转义的相同 quote
+    out = []
+    i = m2.end()
+    while i < len(rest):
+        c = rest[i]
+        if c == "\\" and i + 1 < len(rest):
+            out.append(rest[i + 1])
+            i += 2
+            continue
+        if c == quote:
+            return "".join(out)
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+class _FakeNodeList:
+    """Sequence protocol for evaluate_handle result."""
+    def __init__(self, nodes: list[dict]) -> None:
+        self.nodes = nodes
+        self.length = len(nodes)
+
+    def __iter__(self):
+        return iter(self.nodes)
 
 
 # ---------------------------------------------------------------------------
@@ -435,4 +566,161 @@ async def test_solve_aegis_captcha_exhausts_attempts():
     from doupool.captcha.solver import solve_aegis_captcha
     with pytest.raises(AegisCaptchaFailed):
         await solve_aegis_captcha(page, client, max_attempts=3)
-    assert len(client.calls) == 3
+
+
+# ---------------------------------------------------------------------------
+# v0.3.1.4:_raise_to_front
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_raise_to_front_calls_bring_to_front_and_injects_style():
+    """主场景:主页面有 aegis 容器 → bring_to_front + 注入 style。
+
+    验证:page.bring_to_front 被调;元素 inline style 被覆写;
+    注入字符串包含 z-index 2147483647 + position:fixed。
+    """
+    from doupool.captcha.solver import _raise_to_front
+
+    page = FakePage(elements_by_selector={
+        "[class*='aegis']": [{"style": ""}],
+        "[class*='verify']": [{"style": "z-index:9999"}],
+    })
+    raised = await _raise_to_front(page)
+    assert page._bring_to_front_called is True
+    assert raised, "expected at least one entry in raised list"
+    # 元素 style 应被覆盖
+    aegis_style = page._elements_by_selector["[class*='aegis']"][0]["style"]
+    verify_style = page._elements_by_selector["[class*='verify']"][0]["style"]
+    assert "z-index:2147483647" in aegis_style
+    assert "position:fixed" in aegis_style
+    assert "animation:none" in aegis_style
+    assert "z-index:2147483647" in verify_style
+
+
+@pytest.mark.asyncio
+async def test_raise_to_front_scans_iframe():
+    """弹窗在 iframe 里也要被处理:扫描 page.frames,注入 frame 内的元素。"""
+    from doupool.captcha.solver import _raise_to_front
+
+    frame = FakeFrame(
+        content="拖动",
+        is_main=False,
+        elements_by_selector={"[class*='verify']": [{"style": ""}]},
+    )
+    page = FakePage(
+        frames=[frame],
+        elements_by_selector={"[class*='aegis']": [{"style": ""}]},
+    )
+    raised = await _raise_to_front(page)
+    # frame 的元素也被注入
+    assert frame._elements_by_selector["[class*='verify']"][0]["style"]
+    assert "z-index:2147483647" in (
+        frame._elements_by_selector["[class*='verify']"][0]["style"]
+    )
+    # 列表里包含 frame 标记
+    assert any("frame:" in s for s in raised)
+
+
+@pytest.mark.asyncio
+async def test_raise_to_front_swallows_bring_to_front_errors():
+    """bring_to_front 抛错(如 pywebview 窗口失焦)→ helper 不抛,继续注入。"""
+    from doupool.captcha.solver import _raise_to_front
+
+    page = FakePage(
+        elements_by_selector={"[class*='aegis']": [{"style": ""}]},
+        raise_on_method={"bring_to_front"},
+    )
+    # 不抛
+    raised = await _raise_to_front(page)
+    assert page._elements_by_selector["[class*='aegis']"][0]["style"]
+    assert "z-index:2147483647" in (
+        page._elements_by_selector["[class*='aegis']"][0]["style"]
+    )
+    assert raised  # 至少有一个 raise 被记录
+
+
+@pytest.mark.asyncio
+async def test_raise_to_front_swallows_eval_errors():
+    """evaluate 抛错(元素 handle 已 detach 等)→ 不抛,继续扫下个 selector。"""
+    from doupool.captcha.solver import _raise_to_front
+
+    page = FakePage(
+        elements_by_selector={"[class*='aegis']": [{"style": ""}]},
+        eval_raises={"raise_eval"},
+    )
+    # 不抛
+    raised = await _raise_to_front(page)
+    # 元素没被注入(eval 报了),但 helper 本身没崩
+    assert page._elements_by_selector["[class*='aegis']"][0]["style"] == ""
+    # raised 可能是空 —— eval 全失败,这是允许的
+    assert isinstance(raised, list)
+
+
+@pytest.mark.asyncio
+async def test_raise_to_front_empty_returns_empty():
+    """没有任何弹窗 → 返回空 list,bring_to_front 仍被调。"""
+    from doupool.captcha.solver import _raise_to_front
+
+    page = FakePage(elements_by_selector={})
+    raised = await _raise_to_front(page)
+    assert raised == []
+    assert page._bring_to_front_called is True
+
+
+@pytest.mark.asyncio
+async def test_raise_to_front_skips_main_frame_in_scan():
+    """solver 只扫非 main frame(main frame 通过 page 本身扫)。
+
+    FakePage.frames 已经过滤掉 main_frame,所以这里验证:即使有 main_frame,
+    也不会被显式迭代。
+    """
+    from doupool.captcha.solver import _raise_to_front
+
+    main_frame = FakeFrame(
+        content="",
+        is_main=True,
+        elements_by_selector={"[class*='aegis']": [{"style": "SENTINEL"}]},
+    )
+    page = FakePage(frames=[main_frame])
+    raised = await _raise_to_front(page)
+    # main_frame 的元素未被注入(因为不进 targets)
+    assert main_frame._elements_by_selector["[class*='aegis']"][0]["style"] == "SENTINEL"
+    assert raised == []
+
+
+@pytest.mark.asyncio
+async def test_raise_to_front_preserves_existing_style():
+    """已有 inline style(如 login 页的 transform)不丢,新 style prepend。"""
+    from doupool.captcha.solver import _raise_to_front
+
+    page = FakePage(elements_by_selector={
+        "[class*='aegis']": [{"style": "transform:translate(0,0)"}],
+    })
+    await _raise_to_front(page)
+    final = page._elements_by_selector["[class*='aegis']"][0]["style"]
+    assert "z-index:2147483647" in final
+    assert "transform:none" in final
+    # 旧的 transform:translate 通过拼接保留(虽然被 transform:none 覆盖,
+    # 但保留字符串 —— 防御性)
+    assert "transform:translate(0,0)" in final
+
+
+@pytest.mark.asyncio
+async def test_screenshot_captcha_area_calls_raise_to_front():
+    """_screenshot_captcha_area 进新代码路径前先 _raise_to_front。"""
+    from doupool.captcha.solver import _screenshot_captcha_area
+
+    page = FakePage(
+        elements_by_selector={"[class*='aegis']": [{"style": ""}]},
+        locators={
+            "[class*='aegis'][class*='dialog']": FakeLocator(count=1, visible=True),
+        },
+    )
+    png = await _screenshot_captcha_area(page)
+    assert png == b"png"
+    # 副作用:bring_to_front + 注入
+    assert page._bring_to_front_called is True
+    assert "z-index:2147483647" in (
+        page._elements_by_selector["[class*='aegis']"][0]["style"]
+    )

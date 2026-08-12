@@ -2,6 +2,61 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.3.1.4 - 2026-08-12
+
+**aegis 弹窗在截图 + 拖拽前置顶 — 修视频路径 Element.screenshot 残图。**
+
+### 为什么做
+
+v0.3.1.3 把 captcha hook 挪到 chain 之前之后,实测发现 video runner 路径
+下 aegis 弹窗经常**根本渲染不全**:`Element.screenshot()` 拿到的图是空白
+或残缺,图鉴识别失败 → 3 次重试都过不去。同样的 login keepalive 路径没
+这个问题,因为 login 是一个独立打开的 doubao.com/chat/ 页面,弹窗在主
+页面顶层;video runner 嵌在 doubao AI 创作 → 视频 tab 里,弹窗可能是
+iframe 里的 / 或者被父页 overflow:hidden 截掉。
+
+用户实战反馈(2026-08-12):
+
+> 「我这样做的目的,是为了让滑块UI可以显示在最前端,方便软件去识别
+> 然后截图给图鉴」
+>
+> 「我点击的目的不是让弹窗更容易触发,只是为了让拖拽窗口可以显示在前端UI」
+
+手工「打开浏览器 → AI 创作 → 视频 → 粘贴 → 提交」流程就是为这个效果
+—— 让 aegis 弹窗在主页面顶层渲染,而不是 chat 列表那个被 overflow 截
+掉的容器里。
+
+### 改动
+
+- `src/doupool/captcha/solver.py`:
+  - 新增 `_raise_to_front(page)` helper:扫主页面 + 每个 iframe,给
+    所有 aegis / verify / dialog / captcha / puzzle 容器注入 inline
+    `position:fixed; z-index:2147483647; transform:none; animation:none`
+    直接把弹窗踩到 stacking 最上面。同时 `page.bring_to_front()` 把
+    Chromium 窗口拉到 pywebview 之上,防止弹窗被 pywebview chrome 挡。
+  - `_screenshot_captcha_area()` 调用前先 `_raise_to_front()`
+  - `_drag_for_solve()` 调用前先 `_raise_to_front()` —— 鼠标事件打中
+    堆叠最上层,不会落到父页遮罩或被 iframe 边框吃掉
+  - 失败一律吞掉:helper 本身不能挂掉原 captcha 流程(已有兜底)
+- `tests/test_captcha_solver.py`:
+  - `FakePage` / `FakeFrame` 扩展 `evaluate` / `evaluate_handle` / `bring_to_front`
+  - 8 个新测试覆盖:bring_to_front 主路径 / iframe 注入 / bring_to_front 抛错吞掉
+    / evaluate 抛错吞掉 / 空场景 / main_frame 不被扫 / 旧 style 保留 /
+    `_screenshot_captcha_area` 副作用
+
+### shark_admin 继续不动
+
+shark_admin 是服务端 SSE 拒绝,无浏览器 DOM;图鉴截不到图。
+本次只让 aegis 弹窗路径在视频流程下也能正确截图。
+
+### 不做的事
+
+- ❌ 改 detect / drag / human_like_drag 行为 —— 拖拽轨迹逻辑已 OK
+- ❌ 给 raise_to_front 加 retry / 异步等待 —— 失败就放弃,下个 poll 还会试
+- ❌ 给每个 selector 都 scroll_into_view —— 截图本身是 element screenshot,
+  会自动滚到 viewport;只是要保证弹窗不在被 transform 推走的容器里
+- ❌ 改 solver 接口签名 — 不破坏现有 caller
+
 ## v0.3.1.3 - 2026-08-12
 
 **修正 v0.3.1.2 的接入时序错误 —— aegis 实际在 submit 之后才弹。**

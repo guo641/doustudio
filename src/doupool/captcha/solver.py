@@ -381,7 +381,13 @@ async def _screenshot_captcha_area(page: Page) -> bytes | None:
 
     用 Element.screenshot 而不是 page.screenshot,避免把整个浏览器窗口丢过去
     让图鉴在无关内容里找答案 —— 浪费钱。
+
+    v0.3.1.4:截图前先 _raise_to_front —— 弹窗若在 iframe 里或被父页
+    transform/overflow 遮挡,Element.screenshot 拿到的可能是空白或
+    部分图。让 aegis 容器自己 position:fixed + z-index 2147483647,
+    并 page.bring_to_front 把窗口提到 pywebview 之上,保证 capture 干净。
     """
+    await _raise_to_front(page)
     selectors = (
         "[class*='aegis'][class*='dialog']",
         "[class*='aegis'][class*='container']",
@@ -404,6 +410,94 @@ async def _screenshot_captcha_area(page: Page) -> bytes | None:
         return None
 
 
+# v0.3.1.4:置顶选择器 —— 比 _screenshot_captcha_area 的更宽,因为 iframe
+# 本身(dialog 包了一层)也值得置顶,免得被父页 transform 推到屏幕外。
+_RAISE_TO_FRONT_SELECTORS = (
+    "[class*='aegis']",
+    "[class*='verify']",
+    "iframe[src*='aegis']",
+    "div[class*='captcha']",
+    "div[class*='puzzle']",
+    "div[class*='dialog']",
+)
+# 2147483647 = 2^31-1,aegis 弹窗默认 z-index 一般 9999/2147483000,
+# 强制拉到 max int 把任何遮挡(包括字节自家弹窗)踩下去。
+# 用内联样式 + !important,覆盖 aegis 自己设置的 transform/animation。
+_RAISE_INJECT_STYLE = (
+    "position:fixed !important;z-index:2147483647 !important;"
+    "top:0 !important;left:0 !important;"
+    "transform:none !important;animation:none !important;"
+)
+
+
+async def _raise_to_front(page: Page) -> list[str]:
+    """v0.3.1.4:把 aegis 弹窗相关 DOM 拉到 stacking top + 浏览器窗口置顶。
+
+    用户的实战反馈:video runner 路径下,aegis 弹窗经常嵌在 iframe 里或
+    被父页 CSS 推到屏幕外,Element.screenshot 拿到的图是空 / 残缺,图鉴
+    识别失败。手工「打开浏览器 → AI 创作 → 视频 → 粘贴 → 提交」也是
+    同一个目的:让弹窗在主页面渲染而不是 chat 列表那个被 overflow:hidden
+    截掉的容器里。
+
+    这里是程序化实现:在每个 frame 里找 aegis/verify/dialog 容器,
+    注入 inline style,max z-index + 解除 transform + 强制 fixed。
+    最后 page.bring_to_front 把整个 Chromium 窗口拉到 pywebview 上层,
+    防止弹窗被 pywebview chrome 挡住。
+
+    失败一律忽略 —— 截图 / 拖拽逻辑有兜底,这里只是尽力优化。
+    """
+    raised: list[str] = []
+    try:
+        await page.bring_to_front()
+    except Exception as e:
+        logger.debug("aegis raise_to_front: page.bring_to_front failed: %s", e)
+
+    targets: list[tuple[object, str]] = [(page, "main")]
+    try:
+        for fr in page.frames:
+            if fr == page.main_frame:
+                continue
+            targets.append((fr, "frame"))
+    except Exception:
+        pass
+
+    for target, label in targets:
+        for sel in _RAISE_TO_FRONT_SELECTORS:
+            try:
+                # locator(...).all() ish —— evaluate_all 拿到 raw handles
+                handles = await target.evaluate_handle(
+                    f"() => document.querySelectorAll({sel!r})"
+                )
+                # evaluate to array of elements
+                count = await target.evaluate(
+                    "(node) => node ? node.length : 0", handles,
+                )
+                if not count:
+                    continue
+                # 用 evaluate 给每个元素写入 inline style
+                styled = await target.evaluate(
+                    """(node, style) => {
+                        let n = 0;
+                        for (const el of node) {
+                            const before = el.getAttribute('style') || '';
+                            el.setAttribute('style', style + ';' + before);
+                            n++;
+                        }
+                        return n;
+                    }""",
+                    handles, _RAISE_INJECT_STYLE,
+                )
+                if styled:
+                    raised.append(f"{label}:{sel}={styled}")
+            except Exception as e:
+                logger.debug("aegis raise_to_front: %s:%s failed: %s", label, sel, e)
+                continue
+
+    if raised:
+        logger.info("aegis raise_to_front applied: %s", raised)
+    return raised
+
+
 async def _drag_for_solve(page: Page, solve: TtshituSolve) -> bool:
     """根据图鉴返回的坐标 + 弹窗 DOM 定位,执行拟人拖拽。
 
@@ -413,7 +507,11 @@ async def _drag_for_solve(page: Page, solve: TtshituSolve) -> bool:
     typeid=33(单缺口):
       - points[0] 是缺口中心,直接拖到那
       - 拖动源默认是 [class*='slider']
+
+    v0.3.1.4:先 _raise_to_front —— 鼠标事件打中堆叠最上层,不会落到
+    父页遮罩或被 iframe 边框吃掉。
     """
+    await _raise_to_front(page)
     handle_box = await _find_element_box(page, _DRAG_HANDLE_SELECTORS)
     target_box = await _find_element_box(page, _TARGET_CENTER_SELECTORS)
     if handle_box is None:
