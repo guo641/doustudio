@@ -31,6 +31,9 @@ tools/license_keygen/developer_private.key.example
 src/doupool/license/verifier.c
 src/doupool/license/_license_verify*.pyd
 src/doupool/license/build/
+# setup.py path bug:Cython 产物误嵌到嵌套路径(Users/... 和 doupool/license/...)
+src/doupool/license/Users/
+src/doupool/license/doupool/
 
 # 本地 IDE / Claude 残留
 .vscode/
