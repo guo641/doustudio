@@ -246,7 +246,10 @@ def create_app(
         get_browser_sessions_registry().shutdown()
         if video_service is not None:
             await video_service.shutdown()
-        await login_service.shutdown()
+        # license verifier 单测里 create_app(..., login_service=None, ...),
+        # 退出时不能因为 None 调用 shutdown 而崩 —— 测试 fixture 跟生产路径都共用 lifespan。
+        if login_service is not None:
+            await login_service.shutdown()
 
     app = FastAPI(title="DouPool", docs_url=None, redoc_url=None, lifespan=lifespan)
     frontend_dir = Path(frontend_dir)
@@ -265,16 +268,117 @@ def create_app(
         if not candidate or not secrets.compare_digest(candidate, token):
             raise HTTPException(status_code=401, detail="invalid local token")
 
+    def authorize_with_license(
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        """v0.3.0:本地 token 校验 + 离线激活闸门。失败 401 / 403,前端走
+        ActivationDialog 而不是直接报错。
+
+        闸门状态:
+            'valid'        → 通过
+            'missing'      → 403(前端显示激活窗)
+            'expired'      → 403(前端显示「已过期」窗)
+            'uncompiled'   → 通过(开发机 / 测试场景;生产应走 .pyd)
+
+        为什么不强制 'uncompiled' 拒绝:开发者在 macOS / Linux 上跑测试,
+        _license_verify.pyd 没编但仍要能调 API。生产 PyInstaller onedir
+        打包一定会带 .pyd,这条 fallback 永远不命中。
+        """
+        authorize(x_doupool_token, authorization)
+        # 内部 import 避免模块加载顺序敏感
+        from doupool.license import get_activation_status
+        status = get_activation_status()
+        if status == "missing":
+            raise HTTPException(status_code=403, detail={"error": "license_missing"})
+        if status == "expired":
+            raise HTTPException(status_code=403, detail={"error": "license_expired"})
+
     @app.get("/api/health")
     def health():
-        return {"status": "ok", "version": current_version}
+        # v0.3.0:加 activated 字段,前端 health-check 时能立刻判定是否走激活窗
+        from doupool.license import get_activation_status
+        status = get_activation_status()
+        activated = status == "valid"
+        return {
+            "status": "ok" if activated else "degraded",
+            "version": current_version,
+            "activated": activated,
+            "license_status": status,
+        }
+
+    @app.get("/api/license/status")
+    def license_status():
+        """无授权检查 —— 前端在未激活时也要能调。
+
+        Returns:
+            {status: 'valid'|'expired'|'missing'|'uncompiled',
+             fingerprint: str, customer: str, expires_at: int|null}
+        """
+        from doupool.license import current_fingerprint, get_activation_status
+        from doupool.license.storage import read_token
+        status = get_activation_status()
+        fingerprint = current_fingerprint()
+        customer = ""
+        expires_at = 0
+        if status == "valid":
+            blob = read_token()
+            if blob:
+                # 解码 payload 取 customer / expires_at(轻量,verifier 已有
+                # decode 路径,这里复用)
+                try:
+                    from doupool.license import _license_verify as _v
+                    if _v is not None:
+                        _, payload, _ = _v.verify_token(blob)
+                        if payload:
+                            customer = str(payload.get("customer", ""))
+                            expires_at = int(payload.get("expires_at", 0))
+                except Exception:
+                    pass
+        return {
+            "status": status,
+            "fingerprint": fingerprint,
+            "customer": customer,
+            "expires_at": expires_at if expires_at > 0 else None,
+        }
+
+    @app.post("/api/license/activate")
+    def license_activate(body: dict):
+        """无授权检查 —— 用户的「首次激活」路径。
+
+        Body: {code: str}
+        Returns: {ok: True} 或 400 + 中文错误
+        """
+        code = str(body.get("code", "")).strip()
+        if not code:
+            raise HTTPException(status_code=400, detail="激活码不能为空")
+        from doupool.license import activate as _activate
+        success, err = _activate(code)
+        if not success:
+            raise HTTPException(status_code=400, detail=err)
+        return {"ok": True}
+
+    @app.post("/api/license/quit")
+    def license_quit():
+        """强杀进程 —— webview 窗口随之关闭,用户在激活窗点「退出」触发。
+
+        不用 raise SystemExit —— uvicorn 还会捕获,导致 webview 窗留
+        着。直接 os._exit(0) 跳过所有 hook,关得干净。
+        """
+        import os as _os
+        # 起个 200ms 计时器让响应先发出去
+        import threading
+        def _kill():
+            _os._exit(0)
+        threading.Timer(0.2, _kill).start()
+        return {"ok": True}
 
     @app.get("/api/update-check")
     async def update_check(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         info = await check_for_update(current_version)
         return {
             "current_version": info.current_version,
@@ -290,7 +394,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
         return [_account_dict(item, quotas) for item in repository.list_accounts()]
 
@@ -299,7 +403,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         try:
             attempt = login_service.start()
         except LoginAlreadyRunning as exc:
@@ -312,7 +416,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         attempt = LoginAttempt.get_or_none(LoginAttempt.id == attempt_id)
         if not attempt:
             raise HTTPException(status_code=404, detail="login attempt not found")
@@ -346,7 +450,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         account = Account.get_or_none(Account.id == account_id)
         if not account:
             raise HTTPException(status_code=404, detail="account not found")
@@ -363,7 +467,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         account = Account.get_or_none(Account.id == account_id)
         if not account:
             raise HTTPException(status_code=404, detail="account not found")
@@ -385,7 +489,7 @@ def create_app(
 
         账号不存在返 404,清成功返 {reset_count:1, reset_at}。幂等。
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         # 用 quota_window 算出业务日,跟 reset_daily_quotas 口径一致(避免
         # quota_reset_time > now 时业务日跨天的 corner case)。
         reset_value = settings_service.get().get("quota_reset_time", "00:00") if settings_service else "00:00"
@@ -408,7 +512,7 @@ def create_app(
 
         disabled 账号不动(用户显式关掉的不要自动清)。
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         reset_value = settings_service.get().get("quota_reset_time", "00:00") if settings_service else "00:00"
         business_date, _ = quota_window(utcnow(), reset_value)
         reset_count = repository.reset_all_quotas(business_date)
@@ -422,7 +526,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if settings_service:
             repository.prune_logs(int(settings_service.get()["log_retention_days"]))
         return [{"id": row.id, "level": row.level, "module": row.module,
@@ -434,7 +538,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         repository.clear_logs()
 
     @app.get("/api/settings")
@@ -442,7 +546,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if settings_service is None:
             raise HTTPException(status_code=503, detail="设置服务未启动")
         return settings_service.get()
@@ -453,7 +557,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if settings_service is None:
             raise HTTPException(status_code=503, detail="设置服务未启动")
         try:
@@ -468,7 +572,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if settings_service is None:
             raise HTTPException(status_code=503, detail="设置服务未启动")
         try:
@@ -482,7 +586,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
         return [_video_task_dict(task, quotas["shared"]) for task in repository.list_video_tasks()]
 
@@ -493,7 +597,7 @@ def create_app(
         authorization: str | None = Header(default=None),
     ):
         """按 group_id 聚合返回最近的任务组(每个组首条 + 任务数)"""
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         return repository.list_task_groups(limit=limit)
 
     @app.get("/api/video-task-groups/{group_id}")
@@ -503,7 +607,7 @@ def create_app(
         authorization: str | None = Header(default=None),
     ):
         """返回某 group 下所有任务,按 group_index 排序"""
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         quotas = settings_service.get_daily_quotas() if settings_service else {"shared": 50}
         return [_video_task_dict(t, quotas["shared"]) for t in repository.list_tasks_by_group(group_id)]
 
@@ -513,7 +617,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if video_service is None:
             raise HTTPException(status_code=503, detail="视频服务未启动")
         try:
@@ -562,7 +666,7 @@ def create_app(
           - 409:缺少 conversation_id / 原账号不可用 / 已有 retry 在跑
           - 503:video_service 未启动
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if video_service is None:
             raise HTTPException(status_code=503, detail="视频服务未启动")
         try:
@@ -601,7 +705,7 @@ def create_app(
            已有 retry 在跑 / 重解析超时
           - 503:video_service 未启动
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if video_service is None:
             raise HTTPException(status_code=503, detail="视频服务未启动")
         try:
@@ -644,7 +748,7 @@ def create_app(
             download_dir
           - 503:video_service 未启动 或 settings_service 缺失
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if video_service is None:
             raise HTTPException(status_code=503, detail="视频服务未启动")
         if settings_service is None:
@@ -754,7 +858,7 @@ def create_app(
           - 409:任务正在生成中(状态 starting / generating / resolving),不能删
           - 503:video_service 未启动
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if video_service is None:
             raise HTTPException(status_code=503, detail="视频服务未启动")
         try:
@@ -779,7 +883,7 @@ def create_app(
 
         返回:{"deleted_count": int}
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if video_service is None:
             raise HTTPException(status_code=503, detail="视频服务未启动")
         deleted = video_service.clear_tasks("completed")
@@ -794,7 +898,7 @@ def create_app(
 
         同上:预扣额度在删除前退。返回 {"deleted_count": int}。
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if video_service is None:
             raise HTTPException(status_code=503, detail="视频服务未启动")
         deleted = video_service.clear_tasks("queued")
@@ -810,7 +914,7 @@ def create_app(
         succeeded 状态 —— 豆包已结算额度,无需退额度。只删 DB row,本地文件保留。
         返回 {"deleted_count": int}。
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if video_service is None:
             raise HTTPException(status_code=503, detail="视频服务未启动")
         deleted = video_service.clear_results(downloaded_only=True)
@@ -825,7 +929,7 @@ def create_app(
 
         同上:本地文件保留,DB row 物理删。返回 {"deleted_count": int}。
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         if video_service is None:
             raise HTTPException(status_code=503, detail="视频服务未启动")
         deleted = video_service.clear_results(downloaded_only=False)
@@ -861,7 +965,7 @@ def create_app(
         字段缺失(典型:刚 login 没让主页跑过 WebMSSDK)→ 200 但 available=False
         + hint 引导用户去浏览器访问主页后再调一次。
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         account = Account.get_or_none(Account.id == account_id)
         if not account:
             raise HTTPException(status_code=404, detail="account not found")
@@ -922,7 +1026,7 @@ def create_app(
         如果 web_id 没落地(用户从未在浏览器里访问过 chat/),extract 仍会抛
         TokenBundleUnavailable,UI 提示「请在浏览器里手动访问 chat/ 主页」。
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         account = Account.get_or_none(Account.id == account_id)
         if not account:
             raise HTTPException(status_code=404, detail="account not found")
@@ -1002,7 +1106,7 @@ def create_app(
         x_doupool_token: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         account = Account.get_or_none(Account.id == account_id)
         if not account:
             raise HTTPException(status_code=404, detail="account not found")
@@ -1177,7 +1281,7 @@ def create_app(
         同 profile_dir 已有窗口时返回 409。线程结束(cancel / 用户关窗口 /
         context 异常)后 registry 自动 unregister。
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         account = Account.get_or_none(Account.id == account_id)
         if not account:
             raise HTTPException(status_code=404, detail="account not found")
@@ -1217,7 +1321,7 @@ def create_app(
         cancel event set 之后 Playwright runner 会在下一个 wait_for_timeout
         切片检测到并 close context,thread 自然退出,registry 自动 unregister。
         """
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         registry = get_browser_sessions_registry()
         sent = registry.request_cancel(account_id)
         return {
@@ -1235,7 +1339,7 @@ def create_app(
     ):
         """v0.2.20:前端轮询当前账号的「打开浏览器」状态,以决定按钮显示
         「打开」还是「关闭」。"""
-        authorize(x_doupool_token, authorization)
+        authorize_with_license(x_doupool_token, authorization)
         registry = get_browser_sessions_registry()
         return {"account_id": account_id, "open": registry.is_open(account_id)}
 

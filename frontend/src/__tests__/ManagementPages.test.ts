@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/vue';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
 const api = vi.hoisted(() => ({
   listLogs: vi.fn().mockResolvedValue([{ id:1, level:'ERROR', module:'doupool.video', event:'failed', message:'rate limited', created_at:'2026-07-13T12:00:00' }]),
@@ -26,6 +26,11 @@ const api = vi.hoisted(() => ({
     default_timeout_minutes: 7,
     // v0.2.34:并发任务间隔(秒)—— SettingsPage 新增字段。
     task_interval_seconds: 0,
+    // v0.3.1.1:图鉴打码平台凭证字段 —— 之前 SettingsPage 没暴露,solver
+    // 拿不到,aegis 弹窗挂着没人解。补上后前端能输入,后端 solver 才能用。
+    ttshitu_username: '',
+    ttshitu_password: '',
+    ttshitu_enabled: false,
   }),
   saveSettings: vi.fn().mockImplementation(async value=>value),
   backupDatabase: vi.fn().mockResolvedValue({ path:'/tmp/backup.sqlite3' }),
@@ -46,7 +51,25 @@ import LogsPage from '../components/LogsPage.vue';
 import ResultsTable from '../components/ResultsTable.vue';
 import SettingsPage from '../components/SettingsPage.vue';
 
-afterEach(cleanup);
+// v0.3.0:重置每个 test 的 stub global —— 之前 vi.stubGlobal('confirm', ...) 不收尾,
+// 后一个 test 拿到前一个的 mock 状态(确认→假),导致 'does not reset when cancelled'
+// 看到 resetAccountQuota 被调用了 1 次。同时清空 api mock 的 call history,
+// 避免前一 test 的 resetAccountQuota('a2') 漏到这个 test 的 not.toHaveBeenCalled 断言。
+beforeEach(() => {
+  vi.unstubAllGlobals();
+  api.resetAccountQuota.mockClear();
+  api.resetAllQuotas.mockClear();
+  api.saveSettings.mockClear();
+  api.backupDatabase.mockClear();
+  api.listLogs.mockClear();
+  api.clearLogs.mockClear();
+  api.groupDownload.mockClear();
+  api.getAccountBrowserStatus.mockClear();
+});
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 it('emits account toggle and confirmed delete', async () => {
   vi.stubGlobal('confirm', vi.fn().mockReturnValue(true));
@@ -200,4 +223,26 @@ it('uses 4..10 second number input and exposes 50 concurrency cap', async () => 
 
   const concurrencyInput = (await screen.findByLabelText('全局并发数')) as HTMLInputElement;
   expect(concurrencyInput.max).toBe('50');
+});
+
+// v0.3.1.1:图鉴打码平台凭证 —— 后端 solver 已就绪,但前端从未暴露入口,
+// 补 UI 后 solver 才能拿凭证解开 aegis 弹窗。
+it('enables ttshitu solver from SettingsPage', async () => {
+  render(SettingsPage);
+  const enabledBox = (await screen.findByLabelText('启用图鉴打码')) as HTMLInputElement;
+  const usernameBox = (await screen.findByLabelText('图鉴用户名')) as HTMLInputElement;
+  const passwordBox = (await screen.findByLabelText('图鉴密码')) as HTMLInputElement;
+  expect(enabledBox.type).toBe('checkbox');
+  expect(enabledBox.checked).toBe(false);
+  expect(passwordBox.type).toBe('password');
+
+  await fireEvent.click(enabledBox);
+  await fireEvent.update(usernameBox, 'demo-user');
+  await fireEvent.update(passwordBox, 'demo-pass');
+  await fireEvent.click(screen.getByRole('button', { name:'保存设置' }));
+  await waitFor(()=>expect(api.saveSettings).toHaveBeenCalledWith(expect.objectContaining({
+    ttshitu_enabled: true,
+    ttshitu_username: 'demo-user',
+    ttshitu_password: 'demo-pass',
+  })));
 });

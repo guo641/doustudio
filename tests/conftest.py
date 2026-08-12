@@ -51,3 +51,31 @@ def temp_profile(tmp_path: Path) -> str:
     path.mkdir()
     return str(path)
 
+
+@pytest.fixture(autouse=True)
+def _auto_activate_for_non_license_tests(monkeypatch, request):
+    """v0.3.0:让所有非 license 测试自动通过授权闸门。
+
+    离线激活闸门(`authorize_with_license`)会读 activated.bin → 返 status;
+    没有 activated.bin 时返 'missing' → 403,前端拿不到 API。
+
+    测试用的 tmp_path 没有 activated.bin,本来应该每个测试都 seed 一个,
+    那样要改 50+ 个测试。改用 monkeypatch 注入:'valid' 表示授权通过。
+
+    例外:
+      - tests/test_license_*.py:本身就是 license 行为测试,不能 mock
+      - 单个测试需要真实 status 时,加 `@pytest.mark.real_license` 标记
+    """
+    test_path = str(request.fspath)
+    if "test_license_" in test_path:
+        return
+    if "test_license_verifier" in test_path:
+        return
+    if request.node.get_closest_marker("real_license"):
+        return
+
+    # 默认 mock 为 'valid'(已激活),让现有 API 测试无需感知 license。
+    from doupool import license as _lic
+    monkeypatch.setattr(_lic, "get_activation_status", lambda: "valid")
+    monkeypatch.setattr(_lic, "current_fingerprint", lambda: "0" * 64)
+

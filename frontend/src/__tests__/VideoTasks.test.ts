@@ -13,6 +13,13 @@ vi.mock('../api', () => ({
   createVideoTask,
   startLogin: vi.fn(),
   loginEvents: vi.fn(),
+  // v0.3.0:激活闸门 mock —— 不写的话 App.onMounted 卡在 loading,sidebar 永不出现。
+  getLicenseStatus: vi.fn().mockResolvedValue({
+    status: 'valid',
+    fingerprint: 'a'.repeat(64),
+    customer: '测试',
+    expires_at: Math.floor(Date.now() / 1000) + 86400,
+  }),
 }));
 
 import App from '../App.vue';
@@ -25,7 +32,8 @@ afterEach(cleanup);
 
 it('creates a text-to-video task from the video task page', async () => {
   render(App);
-  await fireEvent.click(screen.getByText(/视频任务/));
+  // v0.3.0:激活闸门先于 sidebar 渲染 → 用 findByText 等闸门切到 'valid' 后再点。
+  await fireEvent.click(await screen.findByText(/视频任务/));
   await fireEvent.click(screen.getByRole('button', { name: '＋ 添加任务' }));
   expect(screen.getByRole('dialog', { name: '添加视频任务' })).toBeTruthy();
   await fireEvent.update(screen.getByLabelText('画面描述'), '一只猫在草地上行走');
@@ -48,7 +56,8 @@ it('retries a failed task with its original parameters', async () => {
   }]);
 
   render(App);
-  await fireEvent.click(screen.getByText(/视频任务/));
+  // 同上:findByText 等闸门切到 'valid' + sidebar 渲染完。
+  await fireEvent.click(await screen.findByText(/视频任务/));
   await screen.findByText('小狗跳舞');
   await fireEvent.click(screen.getByRole('button', { name: '重试任务 failed-1' }));
 

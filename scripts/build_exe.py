@@ -103,6 +103,88 @@ def _run(cmd: list[str], cwd: Path, what: str) -> None:
         ) from exc
 
 
+def compile_cython_extensions() -> None:
+    """
+    v0.3.0:编译 verifier.pyx → _license_verify.cp312-win_amd64.pyd。
+    必须在 PyInstaller 之前跑,因为 spec 依赖 _license_verify 存在(否则 hiddenimports 落空)。
+    - 如果 .pyd 已存在 + 比 .pyx 新,跳过(本地开发 iter 提速)
+    - 否则调 setup.py build_ext --inplace
+    - 编译失败(常见原因:MSVC 没装)→ 退到 _license_verify.py 纯 Python 兜底,
+      Python 模块查找顺序 (.pyd → .py) 保证优先用 .pyd;没 .pyd 就用 .py。
+      安全保证跟 .pyd 路径一致:签发仍需私钥 → 兜底只是「源可见 vs 二进制不可见」的差别。
+    """
+    pyx = REPO_ROOT / "src" / "doupool" / "license" / "verifier.pyx"
+    if not pyx.exists():
+        raise RuntimeError(f"找不到 {pyx},请确认仓库结构")
+    # 找最新生成的 .pyd(支持 cp312 / cp311 等)
+    pyd_candidates = list((pyx.parent).glob("_license_verify.*.pyd"))
+    if pyd_candidates and all(p.stat().st_mtime > pyx.stat().st_mtime for p in pyd_candidates):
+        newest = max(pyd_candidates, key=lambda p: p.stat().st_mtime)
+        print(f"[cython] .pyd 已存在且比 .pyx 新,跳过编译 -> {newest.name}")
+        return
+    setup_py = REPO_ROOT / "setup.py"
+    if not setup_py.exists():
+        raise RuntimeError(f"找不到 {setup_py},请确认仓库根有 setup.py(Cython 编译入口)")
+    print(f"[cython] 编译 {pyx.name} ...")
+    try:
+        _run(
+            [sys.executable, str(setup_py), "build_ext", "--inplace"],
+            cwd=REPO_ROOT,
+            what="Cython build_ext --inplace",
+        )
+    except RuntimeError as exc:
+        fallback_py = REPO_ROOT / "src" / "doupool" / "license" / "_license_verify.py"
+        if not fallback_py.exists():
+            raise RuntimeError(
+                f"Cython 编译失败,且 {fallback_py} 也不存在 —— 无 fallback 可用\n"
+                f"  原错误: {exc}"
+            ) from exc
+        print(
+            f"[cython] ⚠ Cython 编译失败(常见原因:MSVC Build Tools 未安装),"
+            f"退到纯 Python fallback: {fallback_py.name}\n"
+            f"  激活流程仍可用 —— Python 模块查找顺序(.pyd → .py)在 .pyd 缺失时"
+            f"会加载 _license_verify.py。\n"
+            f"  想拿到二进制加固版,装 MSVC Build Tools 后重跑 build_exe。"
+        )
+        return
+    pyd_after = list((pyx.parent).glob("_license_verify.*.pyd"))
+    if not pyd_after:
+        raise RuntimeError(
+            f"Cython 编译跑完但 {pyx.parent}/_license_verify.*.pyd 不存在,"
+            "常见原因:MSVC Build Tools 没装,或者 setup.py compiler_directives 配置错"
+        )
+    print(f"[cython] ok -> {pyd_after[0].name}")
+
+
+def build_keygen() -> Path:
+    """
+    v0.3.0:构建独立 LicenseKeygen.exe(给开发者签发激活码用)。
+    走 tools/license_keygen/keygen.spec,产物在 dist/LicenseKeygen/。
+    """
+    spec = REPO_ROOT / "tools" / "license_keygen" / "keygen.spec"
+    if not spec.exists():
+        raise RuntimeError(f"找不到 {spec},请确认仓库结构")
+    print(f"[keygen] mode=keygen, platform={_detect_platform()}")
+    cmd = [
+        sys.executable, "-m", "PyInstaller",
+        "--noconfirm",
+        "--clean",
+        str(spec),
+    ]
+    try:
+        subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"keygen PyInstaller 失败: returncode={exc.returncode}\n"
+            f"  cmd: {' '.join(cmd)}"
+        ) from exc
+    dist = REPO_ROOT / "dist" / "LicenseKeygen"
+    if not dist.exists():
+        raise RuntimeError(f"keygen build finished but {dist} missing")
+    print(f"[keygen] ok -> {dist}")
+    return dist
+
+
 def build_frontend() -> None:
     """
     在 PyInstaller 之前重建 frontend/dist。
@@ -358,9 +440,28 @@ def main() -> int:
         help="跳过前端 npm run build(默认会自动跑)。spec 只读 frontend/dist,"
         "不重建会打包进陈旧的 UI(就是 v0.2.34 '字段不见了' 的根因)",
     )
+    ap.add_argument(
+        "--skip-cython",
+        action="store_true",
+        help="跳过 Cython .pyd 编译(默认会自动跑)。如果 .pyd 已是最新,本步会自动跳过",
+    )
+    ap.add_argument(
+        "--keygen",
+        action="store_true",
+        help="只构建 LicenseKeygen.exe(给开发者签发激活码的工具),不构建主程序",
+    )
     args = ap.parse_args()
 
     version = args.version or os.environ.get("GITHUB_REF_NAME", "dev")
+    if args.keygen:
+        # keygen 不需要 verifier(只签发不验签),所以不跑 cython 编译 —— 这
+        # 跟主程序分开,避免没 MSVC 的开发者卡在这里。打 keygen 时只需要
+        # cryptography 能正常 import 即可。
+        dist = build_keygen()
+        print("[done] keygen 产物:")
+        print(f"  - {dist}")
+        return 0
+
     if args.upload_only:
         plat = _detect_platform()
         zip_path = REPO_ROOT / "dist" / f"DouStudio-{version}-{plat}.zip"
@@ -369,6 +470,8 @@ def main() -> int:
             raise SystemExit(f"--upload-only 需要 {zip_path} 与 {sha_path} 存在")
         print(f"[upload-only] 跳过 build,直接用 {zip_path.name} ({zip_path.stat().st_size // 1024} KB)")
     else:
+        if not args.skip_cython:
+            compile_cython_extensions()
         if not args.skip_frontend_build:
             build_frontend()
         dist = build(args.mode)

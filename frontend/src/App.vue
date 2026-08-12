@@ -8,16 +8,20 @@ import {
   deleteAccount,
   deleteVideoTask,
   fileToBase64,
+  getLicenseStatus,
   getSettings,
   listAccounts,
   listVideoTasks,
   loginEvents,
+  quitApp,
   refreshResultUrl,
   startLogin,
   updateAccount,
+  type LicenseState,
 } from './api';
 import { splitBySegmentMarkers } from './utils/promptParser';
 import AccountTable from './components/AccountTable.vue';
+import ActivationDialog from './components/ActivationDialog.vue';
 import LogsPage from './components/LogsPage.vue';
 import ResultsTable from './components/ResultsTable.vue';
 import SettingsPage from './components/SettingsPage.vue';
@@ -87,6 +91,15 @@ const state = ref('');
 const message = ref('');
 const prompt = ref('');
 const model = ref('seedance_v2.0_mini');
+
+// v0.3.0:激活闸门 —— 'loading' 是首屏瞬间;'valid' 渲染主 UI;
+// 'needs-activation' / 'expired' 渲染 ActivationDialog。
+// licenseInfo 缓存 fingerprint + expires_at 给 dialog 显示。
+const licenseState = ref<LicenseState>('loading');
+const licenseInfo = ref<{ fingerprint: string; expires_at: number | null }>({
+  fingerprint: '',
+  expires_at: null,
+});
 const ratio = ref('1:1');
 const duration = ref(5);
 const imageFiles = ref<File[]>([]);
@@ -530,7 +543,42 @@ async function onClearResults(downloadedOnly: boolean) {
   }
 }
 
+// v0.3.0:激活闸门刷新 —— onMounted 第一件事就拉一次。
+// 后端不强制要求授权,所以 fetch 不会 401。
+async function refreshLicense() {
+  try {
+    const status = await getLicenseStatus();
+    licenseInfo.value = {
+      fingerprint: status.fingerprint,
+      expires_at: status.expires_at,
+    };
+    if (status.status === 'valid') {
+      licenseState.value = 'valid';
+    } else if (status.status === 'expired') {
+      licenseState.value = 'expired';
+    } else {
+      // 'missing' / 'uncompiled'(开发态) → 都要求激活
+      licenseState.value = 'needs-activation';
+    }
+  } catch {
+    // 网络断了 / 后端崩了 —— 让用户看到激活窗 + 「请重试」提示
+    licenseState.value = 'needs-activation';
+  }
+}
+
+function onLicenseActivated() {
+  // 重新查一次 → 200 + status=valid → 切到主 UI
+  void refreshLicense();
+}
+
+async function onLicenseQuit() {
+  await quitApp();
+}
+
 onMounted(async () => {
+  // 闸门最优先 —— 未激活就不去拉账号/任务,减少无意义请求 + 防止 race
+  await refreshLicense();
+  if (licenseState.value !== 'valid') return;
   await refreshAccounts();
   try {
     applyDefaults(await getSettings());
@@ -551,7 +599,10 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="app">
-    <aside class="sidebar">
+    <!-- v0.3.0:激活闸门 —— 'valid' 时渲染主 UI,其他态渲染 ActivationDialog。
+         未激活状态下整个 sidebar + workspace 都不挂载,用户看不到主功能入口。
+         license 状态由 onMounted → refreshLicense() 拉取。 -->
+    <aside v-if="licenseState === 'valid'" class="sidebar">
       <div class="brand">
         <span class="brand-mark">D</span>
         <div class="brand-text">
@@ -598,7 +649,7 @@ onBeforeUnmount(() => {
       </div>
     </aside>
 
-    <main class="workspace">
+    <main v-if="licenseState === 'valid'" class="workspace">
       <header class="topbar">
         <strong class="topbar-title">{{ pageMeta[page][0] }}</strong>
         <span class="topbar-sep">/</span>
@@ -695,6 +746,15 @@ onBeforeUnmount(() => {
         <SettingsPage v-else @saved="applyDefaults" />
       </section>
     </main>
+
+    <ActivationDialog
+      v-if="licenseState !== 'valid'"
+      :state="licenseState"
+      :fingerprint="licenseInfo.fingerprint"
+      :expires_at="licenseInfo.expires_at"
+      @activated="onLicenseActivated"
+      @quit="onLicenseQuit"
+    />
 
     <DpDialog
       :open="showTaskDialog"

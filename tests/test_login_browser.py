@@ -14,6 +14,7 @@ from pathlib import Path
 
 from doupool.login.browser import (
     LOGGED_OUT_KEYWORDS,
+    _MIN_LOOP_SECONDS_BEFORE_IDENTITY,
     _context_doubao_cookie_count,
     _extract_user_id_from_cookies,
     _has_valid_sessionid,
@@ -25,6 +26,7 @@ from doupool.login.browser import (
     _try_rescue_for_fallback,
     wait_for_identity,
 )
+import doupool.login.browser as browser_module
 from doupool.login.detector import DoubaoIdentity
 from doupool.login.service import _verify_from_disk
 from playwright.sync_api import Error as PlaywrightError
@@ -37,7 +39,15 @@ from playwright.sync_api import Error as PlaywrightError
 
 class FakePage:
     """v0.2.7 FakePage:支持 evaluate_queue(按 evaluate 调用顺序返回不同值),
-    因为新主循环对同一 page 调两次 evaluate(一次 DOM,一次 localStorage)。"""
+    因为新主循环对同一 page 调两次 evaluate(一次 DOM,一次 localStorage)。
+
+    v0.3.0 加 evaluate_mapping —— 主循环可能 N 次调 evaluate(loop 不退,
+    cookie 有了之后每轮都跑 DOM 探针),evaluate_queue 会被耗光。改用按
+    script 内容匹配:匹配 "__tea_cache_tokens" 走 localStorage 队列,
+    匹配 "document.body.innerText" 走 DOM 队列,各自 FIFO;空了就用
+    evaluate_payload 兜底。这样 wait_for_identity 主循环能持续稳定地
+    返回正确值,gate 通过后顺利命中 identity。
+    """
 
     def __init__(
         self,
@@ -45,11 +55,15 @@ class FakePage:
         evaluate_payload=None,
         evaluate_raises=None,
         evaluate_queue=None,
+        evaluate_mapping=None,
     ):
         self._alive = alive
         self._evaluate_payload = evaluate_payload
         self._evaluate_raises = evaluate_raises
         self._evaluate_queue = list(evaluate_queue) if evaluate_queue else None
+        self._evaluate_mapping = {
+            k: list(v) for k, v in (evaluate_mapping or {}).items()
+        }
         self._evaluate_calls: list[str] = []
         self.url = "https://www.doubao.com/"
 
@@ -62,6 +76,15 @@ class FakePage:
         self._evaluate_calls.append(script)
         if self._evaluate_raises and "evaluate" in self._evaluate_raises:
             raise self._evaluate_raises["evaluate"]
+        # v0.3.0:按 script 内容路由到不同 queue —— 主循环会反复调
+        # evaluate,evaluate_queue 单一 FIFO 会耗光。mapping 模式按
+        # 关键字区分(DOM 探针 / localStorage 探针),各自 FIFO,
+        # 耗尽后回退到 _evaluate_payload(老语义)。
+        if self._evaluate_mapping:
+            for marker, q in self._evaluate_mapping.items():
+                if marker in script and q:
+                    return q.pop(0)
+            return self._evaluate_payload
         if self._evaluate_queue:
             try:
                 return self._evaluate_queue.pop(0)
@@ -604,21 +627,31 @@ def test_wait_identity_returns_via_cookie_dom_localstorage():
         "value": "deadbeef" * 4,  # 32 chars hex
         "domain": ".doubao.com",
     }]
-    # evaluate_queue 第一次返 DOM 文本(无登录关键词),第二次返 user_unique_id。
+    # v0.3.0:主循环会反复调 evaluate —— DOM 探针每次都跑,localStorage
+    # 探针要 gate 通过后才跑。用 evaluate_mapping 按 script 内容路由到
+    # 各自 FIFO queue;各自 queue 各只放一项,后续轮次沿用同一 payload。
     # 注意 LOGGED_OUT_KEYWORDS 含 "登录" 兜底词,DOM payload 必须避开这两个字。
     page = FakePage(
         alive=True,
-        evaluate_queue=[
-            "欢迎使用豆包 AI,这是对话列表页面",  # DOM 探测
-            {"ok": True, "value": "u-from-tea"},     # localStorage 探测
-        ],
+        evaluate_mapping={
+            "document.body.innerText": ["欢迎使用豆包 AI,这是对话列表页面"],
+            "__tea_cache_tokens_497858": [{"ok": True, "value": "u-from-tea"}],
+        },
     )
     ctx = FakeContext(alive=True, cookies=cookies, pages=[page])
 
-    identity = wait_for_identity(
-        lambda: [page], ready, identities, threading.Event(),
-        context=ctx,
-    )
+    # v0.3.0:测试里把最小冷却压到 0 —— wait_for_timeout 是 pass no-op,
+    # 真实时间不会推进;不改 gate 测试会无限循环。真生产路径的 3 秒门
+    # 由 test_wait_identity_requires_minimum_elapsed_time 单独验证。
+    original = browser_module._MIN_LOOP_SECONDS_BEFORE_IDENTITY
+    browser_module._MIN_LOOP_SECONDS_BEFORE_IDENTITY = 0.0
+    try:
+        identity = wait_for_identity(
+            lambda: [page], ready, identities, threading.Event(),
+            context=ctx,
+        )
+    finally:
+        browser_module._MIN_LOOP_SECONDS_BEFORE_IDENTITY = original
     assert identity.user_id == "u-from-tea"
     assert identity.nickname is None
 

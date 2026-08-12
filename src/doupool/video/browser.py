@@ -17,6 +17,16 @@ from pathlib import Path
 from playwright.async_api import BrowserContext, Page, async_playwright
 
 from ..prompt_reviser import classify_failure, revise_prompt
+from ..captcha.solver import (
+    AegisCaptchaDisabled as _AegisCaptchaDisabled,
+    AegisCaptchaFailed as _AegisCaptchaFailed,
+    detect_aegis_captcha as _detect_aegis_captcha,
+    is_in_cooldown as _captcha_is_in_cooldown,
+    make_client as _make_captcha_client,
+    mark_cooldown as _captcha_mark_cooldown,
+    solve_aegis_captcha as _solve_aegis_captcha,
+)
+from ..captcha.config import load_credentials as _load_captcha_credentials
 from .protocol import (
     EXTRA_CLIENT_META_KEYS,
     DoubaoContentRejected,
@@ -27,6 +37,13 @@ from .protocol import (
     parse_download_info,
     parse_sse_ack,
 )
+
+# v0.3.1.2:video runner 在 page.goto 之后、提交之前等弹窗出现的最长时间。
+# aegis 弹窗通常在 navigation 后 1-3s 渲染;4s 缓冲。
+_CAPTCHA_DETECT_WAIT_BEFORE_SUBMIT_SECONDS = 4.0
+# v0.3.1.2:poll 循环期间每 N 轮探测一次 —— default poll_interval=10s,
+# 3 轮 ≈ 30s,跟 login keepalive 的 2s 节流相比放宽(避免轮询期拖慢)。
+_CAPTCHA_DETECT_INTERVAL_POLLS = 3
 
 # v0.2.22:模块级 logger,retry loop 用 warn 级记「revise 重试」事件
 _LOGGER = logging.getLogger(__name__)
@@ -714,6 +731,109 @@ def load_image_base64(path: Path) -> tuple[str, str, str]:
     return path.name, mime, base64.b64encode(data).decode("ascii")
 
 
+async def _try_solve_captcha_in_video(
+    page: Page,
+    profile_dir: Path,
+    update: Callable[..., None],
+    *,
+    wait_for_popup_seconds: float = 0.0,
+) -> bool:
+    """v0.3.1.2:video runner 路径的 captcha hook —— 与 login 的
+    `_try_solve_captcha_if_needed` 不同,这里是 async,跑在 video runner
+    的事件循环里。**不能**套 `asyncio.run`(login 那样),否则会
+    "asyncio.run() cannot be called from a running event loop"。
+
+    `wait_for_popup_seconds`:
+      - 0 = poll 路径,弹窗已在(刚 detect 到)就解
+      - > 0 = 提交前,先等 N 秒让弹窗出现再 detect
+
+    返回 True = 本次调用尝试解过(无论成败),False = cooldown/无弹窗。
+    **失败/异常一律吞掉不 raise** —— 让 task 继续走原有失败路径。
+    aegis 弹窗还在 / 图鉴坏了 / 凭证关掉 / 网络挂了,都不会挂掉 task,
+    只是把 cooldown 标上,防止短时间内反复调图鉴 API 浪费钱。
+
+    account_key = `str(profile_dir)`,与 login 路径用同一份,共享 30 分钟
+    cooldown —— login keepalive 刚解完 / video 刚解完,两边都自动跳过。
+    """
+    account_key = str(profile_dir)
+    if _captcha_is_in_cooldown(account_key):
+        return False
+
+    if wait_for_popup_seconds > 0:
+        try:
+            await asyncio.sleep(wait_for_popup_seconds)
+        except Exception:
+            return False
+
+    try:
+        kind = await _detect_aegis_captcha(page)
+    except Exception as exc:
+        _LOGGER.debug("aegis detect failed: %s", exc)
+        return False
+    if kind.value == "unknown":
+        return False
+
+    creds = _load_captcha_credentials()
+    try:
+        client = _make_captcha_client(creds)
+    except _AegisCaptchaDisabled as exc:
+        _LOGGER.info("aegis detected but captcha disabled: %s", exc)
+        _captcha_mark_cooldown(account_key)
+        try:
+            update(error_message=f"检测到拖拽验证,但图鉴打码未启用或凭证缺失,任务将按豆包原流程处理({exc})")
+        except Exception:
+            pass
+        return True
+
+    def _on_state(s: str) -> None:
+        msg = {
+            "uploading": "正在通过图鉴打码平台识别拖拽验证",
+            "dragging": "正在拟人拖拽通过验证",
+            "verifying": "等待 aegis 校验结果",
+            "ok": "拖拽验证已通过,继续提交任务",
+            "failed": "拖拽验证未通过,任务将按豆包原流程处理",
+        }.get(s, f"图鉴解算:{s}")
+        _LOGGER.info("video captcha state: %s", s)
+        try:
+            update(error_message=msg)
+        except Exception:
+            pass
+
+    try:
+        try:
+            await _solve_aegis_captcha(page, client, on_state=_on_state)
+        finally:
+            client.close()
+    except _AegisCaptchaFailed as exc:
+        _LOGGER.warning("aegis solver failed in video path: %s", exc)
+        _captcha_mark_cooldown(account_key)
+        try:
+            update(error_message=f"图鉴自动解算失败({exc}),任务将按豆包原流程处理")
+        except Exception:
+            pass
+        return True
+    except _AegisCaptchaDisabled as exc:
+        _LOGGER.warning("aegis solver disabled mid-run: %s", exc)
+        _captcha_mark_cooldown(account_key)
+        try:
+            update(error_message=f"图鉴打码平台凭证失效({exc})")
+        except Exception:
+            pass
+        return True
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception("aegis solver unexpected error in video path")
+        _captcha_mark_cooldown(account_key)
+        return True
+    else:
+        _LOGGER.info("aegis solved for video account=%s, marking cooldown", account_key)
+        _captcha_mark_cooldown(account_key)
+        try:
+            update(error_message="拖拽验证已通过,继续提交任务")
+        except Exception:
+            pass
+        return True
+
+
 class PlaywrightVideoRunner:
     """v0.2.19:async Playwright + per-profile_dir BrowserContext 共享。
 
@@ -979,6 +1099,18 @@ class PlaywrightVideoRunner:
                     timeout=30_000,
                 )
                 await page.wait_for_timeout(1_500)
+
+            # v0.3.1.2:提交前探 aegis 弹窗 —— 弹窗通常在 navigation 后 1-3s
+            # 渲染,等 4s 后再 detect + solve。失败/凭证关一律吞 + mark cooldown,
+            # 不挂 task。helper 内部 update(error_message=...) 上报进度,前端
+            # 看到「正在通过图鉴打码平台识别拖拽验证」之类提示。
+            await _try_solve_captcha_in_video(
+                page,
+                profile_dir,
+                update,
+                wait_for_popup_seconds=_CAPTCHA_DETECT_WAIT_BEFORE_SUBMIT_SECONDS,
+            )
+
             fingerprint = token_bundle.device_id or token_bundle.web_id
 
             # i2v 图片上传一次性完成,retry 不重复上传(豆包图片上传有独立
@@ -1023,6 +1155,7 @@ class PlaywrightVideoRunner:
                         uploaded_images,
                         update,
                         cancel_event,
+                        profile_dir,
                     )
                 except DoubaoContentRejected as exc:
                     attempt += 1
@@ -1057,6 +1190,7 @@ class PlaywrightVideoRunner:
         uploaded_images: list[dict],
         update: Callable[..., None],
         cancel_event: threading.Event,
+        profile_dir: Path,
     ) -> dict[str, str]:
         """v0.2.22:run() 的 submit + poll 切片,被 retry loop 复用。
 
@@ -1098,6 +1232,16 @@ class PlaywrightVideoRunner:
                 update(status="resolving", **result)
                 return await self._resolve_original_download(page, result, cancel_event)
             poll_count += 1
+            # v0.3.1.2:poll 期间再探一次 aegis —— 冷启动已过但生成中途(5min
+            # 任务期间)偶发 aegis 弹窗,解完继续。cooldown 自动跳过;helper
+            # wait=0(poll 路径不重复等弹窗)。
+            if poll_count % _CAPTCHA_DETECT_INTERVAL_POLLS == 0:
+                await _try_solve_captcha_in_video(
+                    page,
+                    profile_dir,
+                    update,
+                    wait_for_popup_seconds=0.0,
+                )
             # v0.2.31:polling 期间节流打日志,避免之前「卡生成中」无任何输出,
             # 让用户能看到 chain 还在跑、还要等多久。DEBUG 级别,默认不打印;
             # 出问题用 `LOGURU_LEVEL=DEBUG` 起程序即可看到。

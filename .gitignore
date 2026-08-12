@@ -21,6 +21,16 @@ ms-playwright/
 
 # DoubaoManager 上游带的 Windows uv 嵌入(我们用 pip 即可)
 tools/
+# 但 v0.3.0 离线激活签发工具源码要入仓
+!tools/license_keygen/
+# 开发者私钥 / 公钥 / 临时嵌入产物(不入仓)
+tools/license_keygen/developer_private.key
+tools/license_keygen/developer_public.key
+tools/license_keygen/developer_private.key.example
+# Cython 编译产物(verifier.pyx 在,verifier.c / .pyd 重新生成)
+src/doupool/license/verifier.c
+src/doupool/license/_license_verify*.pyd
+src/doupool/license/build/
 
 # 本地 IDE / Claude 残留
 .vscode/

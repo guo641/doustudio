@@ -21,6 +21,17 @@ frontend_dist = root / "frontend" / "dist"
 if frontend_dist.exists():
     datas.append((str(frontend_dist), "frontend/dist"))
 
+# v0.3.1.1 兜底:_license_verify 是 Cython .pyd,优先级最高,会遮蔽同目录
+# __init__.py,导致 license/__init__.py 里的 monkey-patch 兜底逻辑拿不到模块对象
+# 加载。显式把 __init__.py 拷到 onedir 里的同位置(.pyd 旁),让 Python import
+# 时优先加载 .py(因为 .py 比 .pyd 名字不完全匹配,但同目录 + 同模块名时
+# Python 实际行为是按 sys.path 顺序找 —— 这里 .pyd 是 _license_verify 模块,
+# __init__.py 是 license 包,两者不同名不冲突)。
+datas.append((
+    str(root / "src" / "doupool" / "license" / "__init__.py"),
+    "doupool/license",
+))
+
 # Package data / submodules that PyInstaller may miss
 for package in ("uvicorn", "fastapi", "starlette", "anyio", "httpx", "peewee", "webview", "playwright"):
     try:
@@ -47,6 +58,15 @@ hiddenimports += [
     "doupool.watermark.zhuceka",
     "doupool.watermark",
     "doupool.prompt_reviser",
+    # v0.3.0:离线激活闸门 —— Cython 编译的 verifier 是 .pyd,必须显式列出
+    # 否则 PyInstaller 静态分析扫不到,启动时 _license_verify 模块不存在。
+    # 此外 fingerprint._decoded_pubkey() 在 import 时引用 doupool.license._embedded_pubkey
+    # (XOR 编码的公钥常量,_ 前缀模块静态分析默认不收)。collect_submodules 收整个
+    # 子树是最稳的写法,避免下次有人加新的 _helper 又漏列 hiddenimports →
+    # 主程序静默崩。同样的修法见 tools/license_keygen/keygen.spec。
+    "doupool._license_verify",
+    *collect_submodules("doupool.license"),
+    "doupool.license.verify_at_import",
     "uvicorn.logging",
     "uvicorn.loops",
     "uvicorn.loops.auto",

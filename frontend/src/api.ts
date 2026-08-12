@@ -336,3 +336,52 @@ export function fileToBase64(file: File): Promise<string> {
     reader.readAsDataURL(file);
   });
 }
+
+// v0.3.0:离线激活闸门 —— 三个端点都不带 X-DouPool-Token(未激活时也要能调)。
+//
+// /api/license/status 和 /api/license/activate 后端刻意放在
+// authorize_with_license 之外;前端在未激活态也能正常调用。
+//
+// /api/license/quit 后端走 os._exit(0) 强杀进程 —— webview 随之关。
+// 前端 fire-and-forget:fetch 不一定能拿到响应。
+export type LicenseStatus = {
+  status: 'valid' | 'expired' | 'missing' | 'uncompiled';
+  fingerprint: string;
+  customer: string;
+  expires_at: number | null;
+};
+
+// v0.3.0:前端激活闸门状态 —— App.vue 用它决定渲染 ActivationDialog 还是主 UI。
+// 'loading':刚启动,等 /api/license/status 返回
+// 'valid':已激活,渲染主 UI
+// 'needs-activation':未激活,渲染激活窗 (state=needs-activation 输入框可用)
+// 'expired':已过期,渲染激活窗 (state=expired 输入框禁用)
+export type LicenseState = 'loading' | 'valid' | 'needs-activation' | 'expired';
+
+const licenseHeaders = { 'Content-Type': 'application/json' };
+
+export async function getLicenseStatus(): Promise<LicenseStatus> {
+  return json(
+    await fetch('/api/license/status', { headers: licenseHeaders }),
+    '激活状态加载失败',
+  );
+}
+
+export async function activateLicense(code: string): Promise<{ ok: true }> {
+  return json(
+    await fetch('/api/license/activate', {
+      method: 'POST',
+      headers: licenseHeaders,
+      body: JSON.stringify({ code }),
+    }),
+    '激活失败',
+  );
+}
+
+export async function quitApp(): Promise<void> {
+  try {
+    await fetch('/api/license/quit', { method: 'POST', headers: licenseHeaders });
+  } catch {
+    // 后端立刻 os._exit,fetch 不一定拿得到响应 —— 静默吞掉
+  }
+}

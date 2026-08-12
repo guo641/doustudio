@@ -57,11 +57,22 @@ def test_create_login_attempt_runs_inside_event_loop(repository, tmp_path):
 
 
 def test_health_is_available_without_token(repository, tmp_path):
+    import pytest
+
     service = LoginService(repository, IdleRunner(), tmp_path / "profiles")
     client = TestClient(create_app("secret", tmp_path / "missing", repository, service))
-    data = client.get("/api/health").json()
-    assert data["status"] == "ok"
+    # v0.3.0:这条测试检查「无激活」分支,需要绕过 conftest 的自动 mock。
+    from doupool import license as _lic
+    real_status = _lic.get_activation_status
+    _lic.get_activation_status = lambda: "missing"
+    try:
+        data = client.get("/api/health").json()
+    finally:
+        _lic.get_activation_status = real_status
+    assert data["status"] == "degraded"
     assert "version" in data  # 启动时回填的 DouStudio 版本号
+    assert data["activated"] is False
+    assert "license_status" in data
 
 
 def test_spa_injects_token_when_index_has_no_head(repository, tmp_path):

@@ -55,6 +55,13 @@ class SettingsService:
         # 抢 _global_semaphore 之前 sleep 这个时长,避免同 IP 多账号同时操作
         # 触发豆包风控。默认 0 = 不间隔(沿用 v0.2.33 行为)。
         "task_interval_seconds": 0,
+        # v0.3.0:图鉴打码平台凭证(同账号 cooldown 见 captcha_solver.COOLDOWN)。
+        # env var DOUSTUDIO_TTSHITU_USERNAME/_PASSWORD 优先(测试用),否则读
+        # 这三个 SQLite 字段。enabled=False 时 captcha solver 抛 AegisCaptchaDisabled
+        # 让任务 fail 而不是无限循环。
+        "ttshitu_username": "",
+        "ttshitu_password": "",
+        "ttshitu_enabled": False,
         # v0.2.17:浏览器 PC 端版本号,被 video/browser.py 读取塞到
         # payload.client_meta.pc_version。不暴露前端(17-b 时一起加 UI),
         # 升级时只需改这里 + 重启服务。

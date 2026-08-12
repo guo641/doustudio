@@ -2,6 +2,225 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.3.1.2 - 2026-08-12
+
+**video runner 接 aegis solver —— 让图鉴在视频生成路径上真正自动拖。**
+
+### 为什么做
+
+v0.3.0 接了图鉴 + aegis solver,v0.3.1.1 加了 SettingsPage 凭证 UI,
+但 **视频任务路径根本没接 solver**。用户加图鉴账号就是希望「提交任务
+后不弹拼图,或者弹了也不用手动拖」,但 `runner.run()` 之前不会等 aegis
+弹窗,导致:
+- 弹窗在 submit 之前没出现 → 豆包风控挡 → STREAM_ERROR → fail
+- 弹窗在 submit 中出现 → 拖到一半卡住 → 用户只能手动关 UI
+
+用户原话(2026-08-12):
+> 「哪个方向可以让图鉴发挥作用,我加入图鉴不就是为了让用户不用手动
+> 拖拽吗?」
+
+### 改动
+
+- `src/doupool/video/browser.py`:
+  - 新增模块级 async helper `_try_solve_captcha_in_video`(跑在 video
+    异步事件循环里,与 login 的 sync wrapper 互不复用)
+  - `run()` 在 `page.goto(doubao.com/chat/)` + `wait_for_timeout(1_500)`
+    之后调用 helper(等 4s 让 aegis 弹窗出现,再 detect + solve)
+  - `_submit_and_poll()` 的 poll 循环每 3 轮再调一次(防止生成中途
+    aegis 偶发;helper 内部 cooldown 检查即时返,不影响轮询性能)
+  - 失败/凭证关/solver 异常 → 一律 `mark_cooldown` + `update(error_message=...)`
+    进度文案,**不 raise** —— 让 task 继续走原有失败路径,不让图鉴故障
+    把已有流程干挂
+- `src/doupool/video/service.py`:**不动** shark_admin 失败路径(留给
+  v0.3.1.3 —— shark_admin 是服务端拦截,无浏览器 DOM,图鉴截不到图)
+- `tests/test_video_captcha_hook.py`(新):13 个 helper 单测覆盖 —
+  cooldown 跳过 / 无弹窗 / detect 异常吞 / happy path / wait/poll 时长
+  / 凭证缺失 / solver 失败 / mid-run disabled / 任意异常 / update 通道
+  异常 / login↔video cooldown 共享 / 模块常量合理区间
+- 版本号 0.3.1.1 → 0.3.1.2(`__init__.py` + `config.py` 2 处 +
+  `pyproject.toml`)
+
+### cooldown 共享:`account_key = str(profile_dir)`
+
+login keepalive 路径(v0.3.0)与 video runner 路径(v0.3.1.2)用同一个 key
+调 `is_in_cooldown / mark_cooldown`,内部就是 `captcha/solver.py` 的模块级
+`_captcha_cooldown` dict。**两边自动共享 30 分钟冷却** —— login 刚解完,
+video 路径 30 分钟内不会再解,反之亦然。`test_cooldown_shared_with_login_path`
+单测盯死这个约定。
+
+### 前端零改动
+
+`update(error_message=...)` 是已有通道(「正在上传图片 1/3」「豆包拒绝
+(第 1/2 次改写重试中)」都用它)。前端不需要任何 UI 改动就能看到「正在
+通过图鉴打码平台识别拖拽验证」「正在拟人拖拽通过验证」「拖拽验证已通过,
+继续提交任务」等进度。
+
+### shark_admin 留给 v0.3.1.3
+
+`extra.decision.from == "shark_admin"` 是服务端 SSE 拒绝,**无浏览器 DOM
+弹窗** —— 图鉴截不到图、拖不到,本次维持 v0.2.16 的 fail-fast(标 failed +
+退额度 + 「稍后重试或换号」)不变。后续候选方向:
+- 「waiting_for_captcha」状态 + 手动换号 UI
+- 自动换 IP / 重新拨号
+- 调用独立三方服务绕过(shark_admin 拼图)
+
+## v0.3.1.1 - 2026-08-12
+
+**修复 v0.3.0/v0.3.1 漏掉的图鉴打码平台凭证入口。**
+
+### 为什么做
+
+v0.3.0 引入了 aegis 人机验证 solver(对接图鉴 ttshitu 打码平台)与 login
+keepalive 集成,但**前端 SettingsPage 没有提供凭证输入入口**。后端
+`CaptchaCredentials` / `SettingsService.DEFAULTS` 早就有 `ttshitu_username /
+_password / _enabled` 三字段,`SettingsService.update()` 也已接受;只是 UI
+从来没暴露。
+
+用户实际场景:豆包弹 aegis 拖拽验证 → 后端 `load_credentials()` 返回空 →
+solver 抛 `AegisCaptchaDisabled` → 30min cooldown → 弹窗一直挂着 → 用户手
+动关 UI → 误以为软件 bug(反馈原文:"任务浏览打开就关闭了,然后报错")。
+
+### 改动
+
+- `frontend/src/components/SettingsPage.vue` 新增「验证码(图鉴 ttshitu)」卡:
+  启用开关 + 图鉴用户名 + 图鉴密码 + 行为说明 hint(放在「去水印」与
+  「文件与日志」之间,跟 zhuceka 卡同款模式)
+- `frontend/src/__tests__/ManagementPages.test.ts` 加 3 个 mock 字段 +
+  `it('enables ttshitu solver from SettingsPage')` UI 行为测试
+- 版本号 0.3.1 → 0.3.1.1
+
+### 后端、solver、login keepalive 无改动
+
+solver 也不会主动关 UI(`page.goto/close` 调用 0 处,弹窗会一直挂着等
+solver 拖完),所以这次唯一缺的就是 UI 入口。
+
+## v0.3.1 - 2026-08-11
+
+**重大变更:v0.3.0 离线激活升级为「半在线心跳」。** 防离线激活码被截图扩散。
+
+### 为什么做
+
+v0.3.0 完全离线 = 一次性激活码拍照就能复制给任何人。v0.3.1 每次启动 + 每 24h
+后台 daemon 必联服务器校时 + 拿新 fresh_until(7 天)。离线 + 修本地时间最多撑 7 天。
+
+### 设计要点
+
+- **启动握手**:`main.py` import-time 后、`create_app` 前同步调
+  `bootstrap.run_startup_handshake()`。失败只 log + 用本地 grace 7d 兜底,
+  **绝不阻塞 UI**。
+- **后台 daemon**:守护线程,默认 24h 一次。`CTRL_C_EVENT` / `CTRL_BREAK_EVENT`
+  / `atexit` 三路停。
+- **Ed25519 双向验签**:client 用激活码里嵌入的 priv 签请求,server 用 KMS 私钥
+  签响应;client 用 XOR 编码嵌入的 server pubkey 验响应(防 fake server)。
+- **DSA1 schema**:activated.bin = `[4B magic 'DSA1'][32B priv][32B pub][8B
+  fresh_until][4B clock_offset_ms][4B last_server_sync]`。升级读 v0.3.0 旧格式
+  失败 → 视为未激活。
+- **wire blob 升级**:`[32B priv seed][32B pub][payload][64B dev_sig]`(原 v0.3.0
+  是 `<base32(payload)>.<base32(sig)>`)。
+- **clock_offset_ms**:用 server_timestamp 校正本地时钟漂移,防用户改本地时间
+  绕过 grace。
+
+### 新增/修改
+
+- 新增:`src/doupool/license/bootstrap.py`(启动握手)
+- 新增:`src/doupool/license/heartbeat.py`(perform_handshake + 4-tuple verify_token)
+- 新增:`src/doupool/license/heartbeat_daemon.py`(后台守护线程)
+- 新增:`src/doupool/license/_embedded_server_pubkey.py`(XOR 编码的 server 公钥)
+- 扩展:`verifier.pyx` 升级到 v0.3.1 schema(DSA1 持久化 priv + fresh_until)
+- 扩展:`storage.py` 支持 read/write_token_v031 + 自动迁移
+- 扩展:`verify_at_import.py` 加 fresh_until 检查 → expired 仍允许 grace 7d
+- 修改:`src/doupool/main.py` 接入启动握手 + daemon
+- 新增:`tests/test_license_e2e_handshake.py`(真 round-trip pytest,5 用例)
+
+### 服务端(独立 `server/` 子项目,KMS 签名)
+
+- `POST /api/heartbeat` — 验签 license_token + 验 client_sig + 签 fresh_until
+- Ed25519 KMS 适配器:Aliyun KMS(生产)/ 本地 .pem(开发)
+- HMAC-fingerprint 存库,prefix 撤销列表
+- 测试用 TestClient in-process ASGI,无网络依赖
+
+### 升级注意
+
+- **所有 v0.3.0 激活码已失效**:v0.3.1 wire 格式改了,旧码验签 schema 不兼容。
+  现有用户需重新签发 v0.3.1 license_token(开发者私钥相同,新增 priv seed)。
+- **首次握手会改 activated.bin schema**:升级时旧文件仍在
+  `DouStudio/DouStudio/license/`,新版启动握手会写新 schema。
+
+## v0.3.0 - 2026-08-10
+
+**重大变更:引入离线激活系统 + 独立签发工具。** 解决软件分发失控问题。
+
+### 强制激活门
+
+没输入有效激活码 → 用户看不到主功能界面(连 sidebar 都不可见)。后台
+`/api/accounts` 等所有业务端点 403。激活窗唯一可点出口是「退出软件」。
+
+### 设计要点
+
+- **Ed25519 离线签名**:私钥只在开发者手里,公钥 XOR 编码后嵌入 Cython 编译
+  的 `_license_verify.cp312-win_amd64.pyd`。
+- **机器指纹 HMAC**:Windows 硬件(SMBIOS UUID + 主板序列号 + CPU ProcessorId)
+  → `HMAC-SHA256(embedded_pubkey, raw)` → 64-hex。**签发时绑一个指纹,换主板
+  / 换硬盘即失效**。指纹不存明文,防泄露。
+- **激活码格式**:base32(payload_json).base32(signature_64),无 padding,
+  用户粘贴时前端自动去空白/dash。
+- **过期自动退出**:`now > expires_at` 直接 `sys.exit(7)`(无 UI),
+  过期态用户在激活窗只能「退出」或「复制机器码找开发者续期」。
+- **反调试威慑**:`IsDebuggerPresent` / `CheckRemoteDebuggerPresent` /
+  `NtQueryInformationProcess(ProcessDebugPort)` ctypes 调用,与过期统一映射
+  为同一响应,无信息泄露。
+- **import-time 闸门**:`src/doupool/main.py` 顶部 `import doupool.license.verify_at_import`。
+  即便 patch 掉 `main()` 函数体,这行 import 仍触发 `sys.exit(7)`。
+
+### 新增端点
+
+- `GET /api/license/status` — 不需要鉴权,返 `{status, fingerprint, customer, expires_at}`
+- `POST /api/license/activate` — 不需要鉴权,body `{code}`,200 ok 或 400 错误消息
+- `POST /api/license/quit` — 强杀进程,激活窗「退出」按钮用
+- `/api/health` 改为返 `{status: "ok"|"degraded", version, activated: bool}`
+- 所有业务端点加 `authorize_with_license` 依赖(替代原 `authorize`)
+
+### 独立签发工具 `LicenseKeygen.exe`
+
+- `python scripts/build_exe.py --keygen` 出独立 exe
+- 复用 `doupool.license.crypto` / `doupool.license.fingerprint` 主程序代码
+- 三个端点:`POST /api/generate` / `GET /api/fingerprint-self-test` / `GET /api/version`
+- 私钥路径通过环境变量 `LICENSE_KEYGEN_PRIVATE_KEY` 配置,默认
+  `tools/license_keygen/developer_private.key`,**不入仓**
+
+### 新增文件
+
+- `src/doupool/license/` — `crypto.py` / `fingerprint.py` / `storage.py` /
+  `storage_path.py` / `anti_debug.py` / `verifier.pyx` / `__init__.py` /
+  `verify_at_import.py` / `_embedded_pubkey.py`(git 提交)
+- `tools/license_keygen/` — `main.py` / `app.py` / `index.html` / `keygen.spec` /
+  `README.md` / `scripts/embed_pubkey.py` / `developer_private.key`(不入仓)
+- `setup.py`(新) — `Cython.Build.cythonize` 编译 `verifier.pyx`
+- `packaging/hooks/hook-doupool.license.py` — `collect_dynamic_libs` 把 .pyd 打进 COLLECT
+
+### 修改文件
+
+- `pyproject.toml` 加 `cryptography>=43,<46` 运行时依赖 + `Cython>=3.0,<4` 构建依赖
+- `src/doupool/main.py` import-time 闸门 + `--print-fingerprint` CLI 子命令
+- `src/doupool/api/app.py` 新增三个端点 + `authorize_with_license` + `/api/health` 改造
+- `frontend/src/App.vue` mount 时决定渲染激活窗还是主壳
+- `frontend/src/components/ActivationDialog.vue`(新)激活窗组件
+- `frontend/src/api.ts` 加 `LicenseState` / `LicenseStatus` 类型 + 三个 export
+- `frontend/src/__tests__/App.test.ts` 加 3 个激活闸门测试
+- `packaging/doubao_manager.spec` hiddenimports 加 `doupool._license_verify` 等
+- `scripts/build_exe.py` 加 `compile_cython_extensions()` + `--keygen` flag
+- `src/doupool/__init__.py` + `config.py` 版本号 0.2.37.3 → 0.3.0
+
+### 安全限制(写入 README)
+
+1. Python + PyInstaller 本质可逆向 —— 本方案把成本从「几分钟」提到「几小时」,
+   不阻挡高手。**目标:挡住脚本小子。**
+2. 虚拟机指纹独立 —— 每台 VM 单独激活。
+3. 硬件更换失效 —— 换主板 / 换硬盘 → 用户须联系开发者重发码(激活窗 hint 写明)。
+4. `activated.bin` 就是凭证 —— 靠 Ed25519 签名 + HMAC fingerprint 绑定。
+5. 反调试只是威慑 —— ScyllaHide 可绕过,已记录限制。
+6. `developer_private.key` 单点失效 —— 泄露 = 任何机器都能签码,像 TLS 私钥一样对待。
+
 ## v0.2.37.3 - 2026-08-10
 
 两个用户反馈合并到一起修:

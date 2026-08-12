@@ -1,6 +1,6 @@
 [project]
 name = "doupool"
-version = "0.2.19"
+version = "0.3.1.2"
 description = "Local Doubao multi-account video manager (DoubaoManager)"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,6 +11,8 @@ dependencies = [
   "playwright>=1.54,<2",
   "peewee>=3.18,<4",
   "platformdirs>=4.3,<5",
+  # v0.3.0:离线激活闸门 — 验签 + fingerprint HMAC(见 src/doupool/license/)
+  "cryptography>=43,<46",
   # tzdata: Windows Python 通常没有系统 IANA 时区数据库,
   # 没有这个包的话 ZoneInfo("Asia/Shanghai") 在干净 Windows 上会
   # 抛 ZoneInfoNotFoundError,第一个视频任务就崩。
@@ -23,10 +25,12 @@ dev = [
   "pytest-asyncio>=1.1,<2",
   "httpx>=0.28,<1",
   "pyinstaller>=6.12,<7",
+  # v0.3.0:编译 verifier.pyx → _license_verify.cp312-win_amd64.pyd
+  "Cython>=3.0,<4",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "Cython>=3.0,<4", "setuptools>=68"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

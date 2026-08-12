@@ -147,6 +147,38 @@ DouStudio/
 
 ---
 
+## 离线激活(v0.3.0+)
+
+DouStudio 自 v0.3.0 起**强制要求激活码**才能进入主界面。用户首次启动会看到激活窗:
+
+- **机器码**:64 位 HMAC,绑定本机硬件(主板 / CPU / UUID),换主板或换硬盘后变化。
+- **激活码**:base32(payload).base32(signature) 一段字符串,从开发者处获取。
+- **续期**:到期后激活窗只显示「退出软件」+「复制机器码」,联系开发者发新码。
+
+### 签发激活码(开发者)
+
+详见 [tools/license_keygen/README.md](tools/license_keygen/README.md):
+
+```bash
+# 一次性:生成密钥对 + 公钥嵌入主程序 + 编译 Cython .pyd
+openssl genpkey -algorithm Ed25519 -outform PEM -out tools/license_keygen/developer_private.key
+openssl pkey -in tools/license_keygen/developer_private.key -pubout -out tools/license_keygen/developer_public.key
+python tools/license_keygen/scripts/embed_pubkey.py
+python setup.py build_ext --inplace
+
+# 日常:给用户签发
+python scripts/build_exe.py --keygen   # 出独立 LicenseKeygen.exe
+```
+
+### 安全限制
+
+1. 激活码 = Ed25519 签名 + HMAC fingerprint 绑定,签发者离线持私钥。
+2. 私钥泄露 = 任何机器都能签码,务必像 TLS 私钥一样对待(USB 盘 + 离线备份)。
+3. 反调试 + Cython .pyd 是威慑而非绝对安全 —— **目标:挡住脚本小子,不是 NSA。**
+4. 硬件更换 = 重新签发,激活窗会提示用户把新机器码发给开发者。
+
+---
+
 ## 注意事项
 
 1. 依赖豆包网页协议,页面改版可能导致接口失效,需重新抓包适配。
