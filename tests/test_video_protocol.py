@@ -843,8 +843,8 @@ def test_parse_creation_result_logs_warning_on_drift_fallthrough(caplog, monkeyp
 
     assert result is not None
     assert result["vid"] == "v-A1"
-    # v0.3.5 WARNING 标识(取代 v0.3.4.1 的标识)
-    assert "v0.3.5.2 race 防御兜底" in caplog.text
+    # v0.3.5.3 WARNING 标识(取代 v0.3.4.1 / v0.3.5 的标识)
+    assert "v0.3.5.3 race 防御兜底" in caplog.text
     assert "drift_vid=v-A1" in caplog.text
     assert "drift_creation_id=task-A1" in caplog.text
     assert "drift_envelope_ids=['msg-A1']" in caplog.text
@@ -866,10 +866,14 @@ from doupool.video import protocol as _protocol_module
 
 @pytest.fixture(autouse=False)
 def _reset_v035_seen():
-    """v0.3.5.2:per-call 局部 dedup 不再需要 module-level state 隔离。
-    保留 fixture 是为了维持 test signature 不变(测试用例继续显式声明依赖)。
+    """v0.3.5.3:fixture 清空 module-level `_candidate_first_seen`(cooldown
+    计时 dict)。`_seen_remote_task_ids` 已删除(dedup 在 v0.3.5.3 是 per-call
+    局部,无需清空)。
+    不加 autouse=True —— 只对 v0.3.5+ 测试显式请求,避免影响其他测试。
     """
+    _protocol_module._candidate_first_seen.clear()
     yield
+    _protocol_module._candidate_first_seen.clear()
 
 
 def test_parse_creation_result_prefers_remote_id_over_local_envelope(_reset_v035_seen):
@@ -954,12 +958,12 @@ def test_parse_creation_result_fallback_accepts_after_cooldown(_reset_v035_seen,
         )
     assert result is not None
     assert result["vid"] == "v-A1"
-    assert "v0.3.5.2 race 防御兜底" in caplog.text
+    assert "v0.3.5.3 race 防御兜底" in caplog.text
     assert "drift_creation_id=task-A1" in caplog.text
     assert "drift_vid=v-A1" in caplog.text
 
 
-def test_parse_creation_result_dedup_skips_already_seen_remote_id(monkeypatch):
+def test_parse_creation_result_dedup_skips_already_seen_remote_id(_reset_v035_seen, monkeypatch):
     """v0.3.5.2 per-call dedup:同一次 parse_creation_result 调用内,同一个
     creation.id 被接受过,继续循环时跳过 —— 防止 fallback 路径在同一 call 内
     重复 deliver 同一视频。v0.3.5.2 关键差异:跨调用不 dedup,所以这里用
@@ -996,7 +1000,7 @@ def test_parse_creation_result_dedup_skips_already_seen_remote_id(monkeypatch):
     assert result["remote_task_id"] == "task-A1"
 
 
-def test_parse_creation_result_remote_id_match_dedups_after_accept():
+def test_parse_creation_result_remote_id_match_dedups_after_accept(_reset_v035_seen):
     """v0.3.5.2:优先级 1(remote id)命中后,per-call 内 dedup 已记录 id,
     同一 call 内 fallback 路径 candidates 即使包含同一 id 也会被跳过。
     验证方式:构造同 call 内含 matches_remote + candidates(同 id) → 只返
@@ -1053,7 +1057,7 @@ def test_parse_creation_result_no_expected_args_skips_all_defenses():
     assert result is not None
     assert result["vid"] == "v-A1"
     # 旧行为下,WARNING 路径不触发(candidates cooldown 路径未启用)
-    # 不打 v0.3.5.2 race 防御兜底 WARNING
+    # 不打 v0.3.5.3 race 防御兜底 WARNING
     assert "race 防御兜底" not in caplog.text if False else True  # noqa
 
 
@@ -1167,14 +1171,15 @@ def test_parse_creation_result_priority_envelope_over_fallback(caplog):
     assert "race 防御兜底" not in caplog.text
 
 
-def test_parse_creation_result_fallback_blocked_by_cooldown(monkeypatch):
-    """v0.3.5.2 兜底 cooldown:candidates 出现 <5s → 不接受,返 None。
+def test_parse_creation_result_fallback_blocked_by_cooldown(_reset_v035_seen, monkeypatch):
+    """v0.3.5.3 兜底 cooldown:candidates 出现 <5s → 不接受,返 None。
 
     场景:candidates 首次出现,刚过几秒(小于 _FALLBACK_COOLDOWN_S)→ 必须
     继续 poll 等到 cooldown 过,不能立即 accept 把别人的 creation 当成
     自己的。
 
-    v0.3.5.2:`_FALLBACK_COOLDOWN_S` 改为 5s,first_seen 改为 per-call 局部。
+    v0.3.5.3:`_FALLBACK_COOLDOWN_S = 5s`,first_seen 用 module-level dict
+    (`_candidate_first_seen`)per-cid 跨 run 累计冷却时长。
     """
     a_other = {
         "id": "task-other",
@@ -1201,17 +1206,16 @@ def test_parse_creation_result_fallback_blocked_by_cooldown(monkeypatch):
     )
     # cooldown 未过 → 返 None(继续 poll)
     assert result is None
+    # _candidate_first_seen 记录了首次出现时间戳(module-level)
+    assert "task-other" in protocol_module._candidate_first_seen
 
 
-def test_parse_creation_result_fallback_accepted_after_cooldown(caplog, monkeypatch):
-    """v0.3.5.2 兜底 cooldown:candidates cooldown 已过 → 接受,打 WARNING。
+def test_parse_creation_result_fallback_accepted_after_cooldown(_reset_v035_seen, caplog, monkeypatch):
+    """v0.3.5.3 兜底 cooldown:candidates cooldown 已过 → 接受,打 WARNING。
 
-    v0.3.5.2:cooldown 从 30s 改为 5s(`_FALLBACK_COOLDOWN_S=5.0`);first_seen
-    改为 per-call 局部 dict,测试改用 monkeypatch 把 cooldown 设为 0,
-    让 candidates 立即可 accept,验证 WARNING 文案 + 返回值正确。
-
-    dedup 行为在 v0.3.5.2 改为 per-call 局部,跨 call 不持久,所以这里不再
-    断言 module-level state。
+    v0.3.5.3:`_FALLBACK_COOLDOWN_S = 5s`,first_seen 用 module-level dict
+    `_candidate_first_seen`(per-cid 跨 run 累计)。测试把 cooldown 设为 0,
+    让 candidates 立即可 accept。
     """
     a_other = {
         "id": "task-other",
@@ -1237,11 +1241,11 @@ def test_parse_creation_result_fallback_accepted_after_cooldown(caplog, monkeypa
         )
     assert result is not None
     assert result["remote_task_id"] == "task-other"
-    assert "v0.3.5.2 race 防御兜底" in caplog.text
+    assert "v0.3.5.3 race 防御兜底" in caplog.text
     assert "cooldown_elapsed=" in caplog.text
 
 
-def test_parse_creation_result_dedup_skips_already_seen(monkeypatch):
+def test_parse_creation_result_dedup_skips_already_seen(_reset_v035_seen, monkeypatch):
     """v0.3.5.2 per-call dedup:同一次 parse_creation_result call 内,同一个
     cid 出现在多个 candidates 里,第一个 accept 后,后续同 cid 跳过 —— 防
     fallback 路径在同一 call 内重复 deliver 同一视频。

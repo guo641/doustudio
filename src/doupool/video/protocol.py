@@ -15,20 +15,34 @@ from doupool.prompt_reviser import _POLICY_PATTERNS
 _LOGGER = logging.getLogger(__name__)
 
 
-# v0.3.5.2:取消 v0.3.5 的 module-level `_seen_remote_task_ids` /
-# `_candidate_first_seen`。原因:实测同账号并发场景下,字节 /im/chain/single
-# 会把 A1 的 creation 反复塞给 A2 的 chain response,A2 的 candidates
-# 列表里永远是 A1 的 cid。如果 A1 的 cid 在前面某次 task accept 时写入
-# module-level dedup,A2 永远 dedup 跳过 → 7min timeout。改用 per-call
-# 局部 dedup + per-call 局部 first_seen dict(同一次 parse_creation_result
-# 调用内有效,跨调用不共享),保留同 run 内不重复 accept 的行为。
+# v0.3.5.3:在 v0.3.5.2 基础上修复 candidates cooldown 永远等不到的 bug。
+#
+# v0.3.5.2 把 `_seen_remote_task_ids`(dedup)和 `_candidate_first_seen`
+# (cooldown 计时)都改成 per-call 局部。问题:cooldown 是「同一个 cid 在
+# chain response 里首次出现后等 5s 才 accept」的语义,first_seen 必须是
+# per-cid 跨多次 poll 累计冷却时长。如果 per-call,每轮 first_seen 重置成
+# `now`,cooldown 永远等不到 5s → candidates 兜底路径永远不会 accept →
+# 4 任务全部 7min timeout(实测 v0.3.5.2 用户反馈「4 个全部卡生成中」)。
+#
+# v0.3.5.3 设计:dedup 和 first_seen 是两个独立维度,必须解耦:
+# - dedup `_seen_remote_task_ids` → **per-call 局部**(同一次 run 内不
+#   重复 accept 同一 cid;跨 run 不 dedup)。原因:v0.3.5 module-level
+#   dedup 在同账号并发下把 A1 的 cid 永久写入全局 set,A2 永远跳过 →
+#   7min timeout。
+# - first_seen `_candidate_first_seen` → **保留 module-level dict**
+#   (per-cid 跨 run 累计冷却时长)。cooldown 必须用「进程级首次出现」
+#   时间戳,否则永远等不到 5s。
+# 两者解耦是 v0.3.5.3 的设计核心。
 
-# v0.3.5.2:实测 5s cooldown 已经能让 race defense 兜底 elapsed 12.6s
-# (v0.3.5.1 跑出来),再压到 0s 风险是:同账号并发 submit 后,A1 还没拿到自己
-# creation 时 chain response 已有别人刚 submit 的 creation,A1 立刻 accept
-# 错。把 cooldown 设 0 但保留 dedup 还是有保护 —— 但 v0.3.5.2 取消全局
-# dedup,所以 cooldown 不能为 0。保留 5s,允许 candidates 兜底正常 accept。
+# v0.3.5.3:保留 5s cooldown。v0.3.5.1 验证过 5s 足够 elapsed 12.6s。
 _FALLBACK_COOLDOWN_S = 5.0
+
+
+# v0.3.5.3:保留 module-level `_candidate_first_seen` —— per-cid 累计冷却时长。
+# key=cid(str),value=该 cid 在本进程 chain response 里首次出现的 monotonic
+# 时间戳。注意:这个 dict 只服务 candidates cooldown,不参与 dedup。
+# dedup 在 v0.3.5.3 是 per-call 局部(local_seen_remote_ids)。
+_candidate_first_seen: dict[str, float] = {}
 
 
 MODELS = {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}
@@ -522,14 +536,16 @@ def parse_creation_result(
         envelope 也没匹配 expected_local_message_ids
     - 兜底 cooldown 5s:candidates 必须存在 ≥ 5s 才允许 accept,避免
       早返回把别人刚 submit 的 creation 当成我们自己的。
-    - v0.3.5.2:**取消 v0.3.5 全局模块级 `_seen_remote_task_ids` dedup**。
-      v0.3.5 设计假设"每任务 unique creation.id",实测同账号并发场景下
-      字节 /im/chain/single 会把 A1 的 creation 反复塞给 A2 的 chain
-      response(v0.3.5.2 DEBUG 日志证实),导致 A2 的 candidates 列表里
-      始终是 A1 的 cid,而 A1 的 cid 在某次其它 task 的兜底 accept 时已
-      写入 `_seen_remote_task_ids` → A2 永久跳过 → 7min timeout。改成
-      per-poll-call 局部 dedup:同一次 run 的 poll 循环内不重复 accept
-      同一 cid,跨 run 不 dedup。
+    - v0.3.5.3:**dedup 改为 per-call 局部** + **first_seen 保留
+      module-level**(两个维度解耦):
+      * `_seen_remote_task_ids` → per-call 局部,同一次 run 内不重复
+        accept 同一 cid,跨 run 不 dedup。原因:v0.3.5 module-level
+        dedup 在同账号并发下把 A1 的 cid 永久写入全局 set,A2 永远跳过
+        → 7min timeout。
+      * `_candidate_first_seen` → 保留 module-level dict,per-cid 跨 run
+        累计冷却时长。原因:cooldown 必须用「进程级首次出现」时间戳,
+        否则 v0.3.5.2(两个都 per-call)所有 first_seen 每轮重置成 `now`,
+        cooldown 永远等不到 5s → 所有 task 全部 7min timeout。
     - 优先级 1 > 优先级 2 > 兜底(cooldown 后)。
     """
     messages = response.get("downlink_body", {}).get("pull_singe_chain_downlink_body", {}).get("messages", [])
@@ -613,13 +629,14 @@ def parse_creation_result(
                 else:
                     candidates.append((envelope_ids, payload))
 
-    # v0.3.5.2 DEBUG:打印三层分类结果,定位"生成完毕但 UI 卡生成中"。
-    # 用户报 v0.3.5.1 跑下来 1 个 task 一直显示"生成中",DB 不动。
+    # v0.3.5.3 DEBUG:打印三层分类结果,定位"生成完毕但 UI 卡生成中"。
+    # 用户报 v0.3.5.1 跑下来 1 个 task 一直显示"生成中",DB 不动;
+    # v0.3.5.2 全员卡死(cooldown 永远等不到)。
     # 把三层数 + accepted/candidates cooldown 状态打出来,复现一次即可
     # 知道是优先级 1/2 没命中,还是 candidates cooldown 没到,还是 dedup
     # 把这个 creation.id 永久跳过。
     _LOGGER.info(
-        "[v0.3.5.2 DEBUG parse_creation_result] matches_remote=%d matches_local=%d "
+        "[v0.3.5.3 DEBUG parse_creation_result] matches_remote=%d matches_local=%d "
         "candidates=%d expected_remote=%s expected_local=%s",
         len(matches_remote),
         len(matches_local),
@@ -628,12 +645,14 @@ def parse_creation_result(
         sorted(expected_local_message_ids) if expected_local_message_ids else "None",
     )
 
-    # v0.3.5.2:per-call 局部 dedup —— 同一次 run 的 poll 循环内不重复 accept
+    # v0.3.5.3:per-call 局部 dedup —— 同一次 run 的 poll 循环内不重复 accept
     # 同一 cid,跨 run 不 dedup。完全替换 v0.3.5 的 module-level
     # `_seen_remote_task_ids`(实测有 bug:同账号并发场景下字节
     # /im/chain/single 会把 A1 的 creation 反复塞给 A2 的 chain response,
     # A2 的 candidates 列表里永远是 A1 的 cid,而 A1 的 cid 已经在前面某次
     # task accept 时写入全局 dedup → A2 永久跳过 → 7min timeout)。
+    # 注:first_seen 仍用 module-level `_candidate_first_seen`(per-cid
+    # 跨 run 累计冷却时长),不然 cooldown 永远等不到 5s。
     local_seen_remote_ids: set[str] = set()
 
     # v0.3.5:优先级 1 命中 → 直接 return,不打 WARNING(强证据)。
@@ -656,7 +675,10 @@ def parse_creation_result(
                 local_seen_remote_ids.add(m["remote_task_id"])
         return matches_local[0]
 
-    # v0.3.5.2:兜底 candidates —— 5s cooldown + per-call dedup。
+    # v0.3.5.3:兜底 candidates —— 5s cooldown(per-cid 跨 run 累计计时)
+    # + per-call dedup。first_seen 必须 module-level(否则 cooldown 永远等
+    # 不到 5s,这是 v0.3.5.2 出过的问题);dedup 必须 per-call(否则 cid 永
+    # 久跳过,这是 v0.3.5 出过的问题)。两者解耦是 v0.3.5.3 的设计核心。
     if candidates and (
         expected_remote_task_ids is not None
         or expected_local_message_ids is not None
@@ -667,18 +689,19 @@ def parse_creation_result(
         # 跟踪 cooldown 最早出现的 candidate 时间(用于打 WARNING 时记录
         # 实际等多久才接受)。
         earliest_first_seen = now
-        # v0.3.5.2:cooldown 时间戳也改为 per-call 局部,避免 module-level
-        # `_candidate_first_seen` 在跨 run 时被陈旧 first_seen 卡死。
-        local_candidate_first_seen: dict[str, float] = {}
+        # v0.3.5.3:first_seen 用 module-level `_candidate_first_seen`(per-cid
+        # 跨 run 累计冷却时长),不是 per-call 局部 dict。v0.3.5.2 用 per-call
+        # 局部导致 first_seen 每轮重置为 `now`,cooldown 永远等不到 5s。
         for envelope_ids, payload in candidates:
             cid = payload["remote_task_id"]
-            first_seen = local_candidate_first_seen.setdefault(cid, now)
+            first_seen = _candidate_first_seen.setdefault(cid, now)
             earliest_first_seen = min(earliest_first_seen, first_seen)
-            # v0.3.5.2 DEBUG:candidates 遍历时把每个 cid + 是否在 dedup + cooldown
-            # 剩余秒数打出来。dedup 命中 = 这个 cid 之前 accept 过,新 task 永远
-            # 拿不到。cooldown 未到 = 候选存在但还在 5s 兜底窗口内。
+            # v0.3.5.3 DEBUG:candidates 遍历时把每个 cid + 是否在 dedup +
+            # cooldown 剩余秒数打出来。dedup 命中 = 这个 cid 在本 call 内已
+            # accept 过(per-call 局部,跨 call 不共享)。cooldown 未到 =
+            # 候选存在但 first_seen 还在 5s 窗口内。
             _LOGGER.info(
-                "[v0.3.5.2 DEBUG candidates loop] cid=%s in_dedup=%s "
+                "[v0.3.5.3 DEBUG candidates loop] cid=%s in_dedup=%s "
                 "first_seen_age=%.2fs cooldown_left=%.2fs",
                 cid,
                 cid in local_seen_remote_ids,
@@ -686,7 +709,7 @@ def parse_creation_result(
                 max(0.0, _FALLBACK_COOLDOWN_S - (now - first_seen)),
             )
             if cid in local_seen_remote_ids:
-                # 已接受过,跳过(防止重复 deliver 同一视频)
+                # 本 call 内已接受过,跳过(防止重复 deliver 同一视频)
                 continue
             if now - first_seen < _FALLBACK_COOLDOWN_S:
                 # 还没过 5s,等下一轮 poll
@@ -698,7 +721,7 @@ def parse_creation_result(
         if accepted_payload is not None:
             local_seen_remote_ids.add(accepted_payload["remote_task_id"])
             _LOGGER.warning(
-                "v0.3.5.2 race 防御兜底:5s cooldown 后仍未命中 expected_remote_task_ids "
+                "v0.3.5.3 race 防御兜底:5s cooldown 后仍未命中 expected_remote_task_ids "
                 "/ expected_local_message_ids, accept candidates[0]。candidates=%d, "
                 "expected_remote=%d, expected_local=%d, drift_envelope_ids=%s, "
                 "drift_creation_id=%s, drift_vid=%s, cooldown_elapsed=%.1fs",
