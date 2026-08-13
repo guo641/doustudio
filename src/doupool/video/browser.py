@@ -1392,6 +1392,16 @@ async def submit_via_ui(
     loc = page.locator(EDITOR_SEL).first
     await loc.wait_for(state="visible", timeout=10_000)
     await loc.click()
+    # v0.3.5.2 DEBUG:把实际写到 clipboard 的 prompt 前 80 字符打到日志,
+    # 排查"DB 写对但豆包收到错"的 prompt 错位 bug —— 用户报 4 段提示词
+    # 一组提交,豆包 conversation 页只收到 3 条且 30-37 那段缺失,先确认
+    # 究竟是 Python 侧 paste 就贴错了,还是 React app 抢 state 把对的
+    # prompt 替成错的。复现一次后即可定位,定位完撤掉这行。
+    _LOGGER.info(
+        "[v0.3.5.2 DEBUG submit_via_ui] page.url=%s prompt[:80]=%r",
+        page.url,
+        prompt[:80],
+    )
     # writeText 走 page.evaluate —— 必须 launch_persistent_context 已 grant
     # clipboard-read-write 权限(见 _build_launch_kwargs)
     await page.evaluate(

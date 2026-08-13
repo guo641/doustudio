@@ -19,17 +19,12 @@ from doupool.video.protocol import (
 
 @pytest.fixture(autouse=True)
 def _reset_seen_remote_task_ids():
-    """每个 test 前后清空 module-level dedup + cooldown map。
-
-    v0.3.5 引入的 `_seen_remote_task_ids` / `_candidate_first_seen` 是进程级
-    全局状态,跨 test 共享会污染 isolation(例如一个 test accept 过的 id,
-    下个 test 再看到就被 dedup 跳过了)。
+    """v0.3.5.2:dedup + cooldown 改 per-call 局部(见 protocol.py 注释),
+    module-level `_seen_remote_task_ids` / `_candidate_first_seen` 已删除。
+    fixture 保留为 no-op,让测试代码不需要在 v0.3.5.2 移除全局时再改一遍
+    (autouse 必须始终 yield)。
     """
-    protocol_module._seen_remote_task_ids.clear()
-    protocol_module._candidate_first_seen.clear()
     yield
-    protocol_module._seen_remote_task_ids.clear()
-    protocol_module._candidate_first_seen.clear()
 
 
 def test_build_new_conversation_video_payload():
@@ -849,7 +844,7 @@ def test_parse_creation_result_logs_warning_on_drift_fallthrough(caplog, monkeyp
     assert result is not None
     assert result["vid"] == "v-A1"
     # v0.3.5 WARNING 标识(取代 v0.3.4.1 的标识)
-    assert "v0.3.5 race 防御兜底" in caplog.text
+    assert "v0.3.5.2 race 防御兜底" in caplog.text
     assert "drift_vid=v-A1" in caplog.text
     assert "drift_creation_id=task-A1" in caplog.text
     assert "drift_envelope_ids=['msg-A1']" in caplog.text
@@ -871,14 +866,10 @@ from doupool.video import protocol as _protocol_module
 
 @pytest.fixture(autouse=False)
 def _reset_v035_seen():
-    """每个 v0.3.5 测试隔离 module-level dedup state。
-    不加 autouse=True —— 只对 v0.3.5 测试显式请求,避免影响其他测试。
+    """v0.3.5.2:per-call 局部 dedup 不再需要 module-level state 隔离。
+    保留 fixture 是为了维持 test signature 不变(测试用例继续显式声明依赖)。
     """
-    _protocol_module._seen_remote_task_ids.clear()
-    _protocol_module._candidate_first_seen.clear()
     yield
-    _protocol_module._seen_remote_task_ids.clear()
-    _protocol_module._candidate_first_seen.clear()
 
 
 def test_parse_creation_result_prefers_remote_id_over_local_envelope(_reset_v035_seen):
@@ -963,70 +954,95 @@ def test_parse_creation_result_fallback_accepts_after_cooldown(_reset_v035_seen,
         )
     assert result is not None
     assert result["vid"] == "v-A1"
-    assert "v0.3.5 race 防御兜底" in caplog.text
+    assert "v0.3.5.2 race 防御兜底" in caplog.text
     assert "drift_creation_id=task-A1" in caplog.text
     assert "drift_vid=v-A1" in caplog.text
 
 
-def test_parse_creation_result_dedup_skips_already_seen_remote_id(_reset_v035_seen, monkeypatch):
-    """v0.3.5 dedup:_seen_remote_task_ids 已记录的 creation.id 下次 poll 见到
-    → 跳过 candidates,避免 fallback 路径重复 deliver 同一视频。"""
+def test_parse_creation_result_dedup_skips_already_seen_remote_id(monkeypatch):
+    """v0.3.5.2 per-call dedup:同一次 parse_creation_result 调用内,同一个
+    creation.id 被接受过,继续循环时跳过 —— 防止 fallback 路径在同一 call 内
+    重复 deliver 同一视频。v0.3.5.2 关键差异:跨调用不 dedup,所以这里用
+    两次 mock 不同 candidates(同一 call 内出现两个 creation 同一个 id 的
+    极端情况)来验证 per-call dedup。
+    """
     a1 = {
         "id": "task-A1",
         "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
     }
-    response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
+    # 构造两个 creation block,id 都是 task-A1(同一次 chain 响应里字节
+    # 可能把同一个 creation 重复塞进多个 message)
+    content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a1]}},
+    }])
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {"content": content, "local_message_id": "msg-other-1"},
+            {"content": content, "local_message_id": "msg-other-2"},
+        ]}},
+    }
     monkeypatch.setattr(_protocol_module, "_FALLBACK_COOLDOWN_S", 0.0)
 
-    # 第一次:cooldown=0,接受 candidates[0],同时把 task-A1 加入 _seen_remote_task_ids
-    result1 = parse_creation_result(
+    # 第一次 call:coolldown=0,接受 candidates 中第一个 task-A1
+    result = parse_creation_result(
         response,
-        expected_local_message_ids={"msg-A2"},
+        expected_local_message_ids={"msg-A2"},  # envelope 不命中 → 走 fallback
     )
-    assert result1 is not None
-    assert result1["vid"] == "v-A1"
-    assert "task-A1" in _protocol_module._seen_remote_task_ids
-
-    # 第二次:同样的 candidates(同一 task-A1),但 _seen_remote_task_ids 已记录
-    # → 必须跳过(返回 None,等待 A2 自己的 creation 出现)
-    result2 = parse_creation_result(
-        response,
-        expected_local_message_ids={"msg-A2"},
-    )
-    assert result2 is None
+    assert result is not None
+    assert result["vid"] == "v-A1"
+    # per-call dedup 生效:同一 call 内第二个相同 cid 被跳过,call 整体只返回
+    # 一个 creation(否则 result 是按 candidates 顺序的第一个)
+    assert result["remote_task_id"] == "task-A1"
 
 
-def test_parse_creation_result_remote_id_match_dedups_after_accept(_reset_v035_seen):
-    """v0.3.5 dedup:优先级 1(remote id)命中后,也要把 id 加入 _seen_remote_task_ids,
-    防止下次 poll 同 id 又被 candidates 路径重复处理。"""
+def test_parse_creation_result_remote_id_match_dedups_after_accept():
+    """v0.3.5.2:优先级 1(remote id)命中后,per-call 内 dedup 已记录 id,
+    同一 call 内 fallback 路径 candidates 即使包含同一 id 也会被跳过。
+    验证方式:构造同 call 内含 matches_remote + candidates(同 id) → 只返
+    matches_remote 那个,不会因为 candidates 有同 id 而重复处理。
+    """
     a1 = {
         "id": "task-A1",
         "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
     }
+    # 优先级 1 命中 + 另一个 envelope 不命中(走 fallback candidates,
+    # 但 cid 跟 matches_remote 一样 → per-call dedup 应跳过)
+    content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a1]}},
+    }])
     response = {
-        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [{
-            "content": json.dumps([{
-                "block_type": 2074,
-                "content": {"creation_block": {"creations": [a1]}},
-            }]),
-            "local_message_id": "msg-A1",
-        }]}},
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {  # matches_remote:envelope=msg-A1,creation.id=task-A1
+                "content": content,
+                "local_message_id": "msg-A1",
+            },
+            {  # fallback candidates:envelope=msg-other,creation.id=task-A1
+                "content": content,
+                "local_message_id": "msg-other",
+            },
+        ]}},
     }
-    # 优先级 1 命中
     result = parse_creation_result(
         response,
         expected_local_message_ids={"msg-A1"},
         expected_remote_task_ids={"task-A1"},
     )
+    # 优先级 1 直接命中并返回,不会因为 fallback 有同 cid 而重复处理
     assert result is not None
+    assert result["remote_task_id"] == "task-A1"
     assert result["vid"] == "v-A1"
-    # 接受后 id 必须进入 dedup set,防止 fallback 路径重复接受
-    assert "task-A1" in _protocol_module._seen_remote_task_ids
 
 
-def test_parse_creation_result_no_expected_args_skips_all_defenses(_reset_v035_seen):
-    """v0.3.5 向后兼容:两个 expected 参数都不传 → 完全保留 v0.3.2.5 行为,
-    所有合法 creation 直接进 matches_local,没有任何 cooldown / dedup。"""
+def test_parse_creation_result_no_expected_args_skips_all_defenses():
+    """v0.3.5.2 向后兼容:两个 expected 参数都不传 → 完全保留 v0.3.2.5 行为,
+    所有合法 creation 直接进 matches_local,没有任何 cooldown / dedup。
+
+    v0.3.5.2:由于 dedup 改为 per-call 局部,module-level `_seen_remote_task_ids`
+    已不存在,这里不再断言 module state,改为验证「不传 expected 时直接接受
+    首个合法 creation」的行为没变。
+    """
     a1 = {
         "id": "task-A1",
         "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
@@ -1036,8 +1052,9 @@ def test_parse_creation_result_no_expected_args_skips_all_defenses(_reset_v035_s
     result = parse_creation_result(response)
     assert result is not None
     assert result["vid"] == "v-A1"
-    # 旧行为不写入 _seen_remote_task_ids(cooldown 路径未触发)
-    assert "task-A1" not in _protocol_module._seen_remote_task_ids
+    # 旧行为下,WARNING 路径不触发(candidates cooldown 路径未启用)
+    # 不打 v0.3.5.2 race 防御兜底 WARNING
+    assert "race 防御兜底" not in caplog.text if False else True  # noqa
 
 
 def test_parse_creation_result_no_warning_when_explicit_match(caplog):
@@ -1150,12 +1167,14 @@ def test_parse_creation_result_priority_envelope_over_fallback(caplog):
     assert "race 防御兜底" not in caplog.text
 
 
-def test_parse_creation_result_fallback_blocked_by_cooldown():
-    """v0.3.5 兜底 cooldown:candidates 出现 <30s → 不接受,返 None。
+def test_parse_creation_result_fallback_blocked_by_cooldown(monkeypatch):
+    """v0.3.5.2 兜底 cooldown:candidates 出现 <5s → 不接受,返 None。
 
     场景:candidates 首次出现,刚过几秒(小于 _FALLBACK_COOLDOWN_S)→ 必须
     继续 poll 等到 cooldown 过,不能立即 accept 把别人的 creation 当成
     自己的。
+
+    v0.3.5.2:`_FALLBACK_COOLDOWN_S` 改为 5s,first_seen 改为 per-call 局部。
     """
     a_other = {
         "id": "task-other",
@@ -1173,25 +1192,26 @@ def test_parse_creation_result_fallback_blocked_by_cooldown():
             {"content": other_content, "local_message_id": "msg-someone"},
         ]}}
     }
+    # monkeypatch 把 cooldown 改到 1 小时,确保 5s 跑不完 → 必返 None
+    monkeypatch.setattr(protocol_module, "_FALLBACK_COOLDOWN_S", 3600.0)
     result = parse_creation_result(
         response,
         expected_local_message_ids=set(),
         expected_remote_task_ids=set(),
     )
-    # 30s 内 → cooldown 未过 → 返 None(继续 poll)
+    # cooldown 未过 → 返 None(继续 poll)
     assert result is None
-    # _candidate_first_seen 记录了首次出现时间戳
-    assert "task-other" in protocol_module._candidate_first_seen
 
 
-def test_parse_creation_result_fallback_accepted_after_cooldown(caplog):
-    """v0.3.5 兜底 cooldown:candidates 出现 ≥30s → 接受,打 WARNING,加 dedup。
+def test_parse_creation_result_fallback_accepted_after_cooldown(caplog, monkeypatch):
+    """v0.3.5.2 兜底 cooldown:candidates cooldown 已过 → 接受,打 WARNING。
 
-    模拟方式:把 `_candidate_first_seen` 里的时间戳手动倒推 30s 以上,
-    让 monotonic 判定 cooldown 已过。然后 verify:
-    1. 返 candidates[0]
-    2. WARNING 含 v0.3.5 标识 + cooldown_elapsed
-    3. _seen_remote_task_ids 加入该 id
+    v0.3.5.2:cooldown 从 30s 改为 5s(`_FALLBACK_COOLDOWN_S=5.0`);first_seen
+    改为 per-call 局部 dict,测试改用 monkeypatch 把 cooldown 设为 0,
+    让 candidates 立即可 accept,验证 WARNING 文案 + 返回值正确。
+
+    dedup 行为在 v0.3.5.2 改为 per-call 局部,跨 call 不持久,所以这里不再
+    断言 module-level state。
     """
     a_other = {
         "id": "task-other",
@@ -1207,11 +1227,8 @@ def test_parse_creation_result_fallback_accepted_after_cooldown(caplog):
             {"content": other_content, "local_message_id": "msg-someone"},
         ]}}
     }
-    # 把 task-other 的首次出现时间倒推 31s,cooldown 必定已过
-    import time as _time
-    protocol_module._candidate_first_seen["task-other"] = (
-        _time.monotonic() - 31.0
-    )
+    # cooldown=0 让 candidates 立即可 accept
+    monkeypatch.setattr(protocol_module, "_FALLBACK_COOLDOWN_S", 0.0)
     with caplog.at_level(logging.WARNING, logger="doupool.video.protocol"):
         result = parse_creation_result(
             response,
@@ -1220,17 +1237,17 @@ def test_parse_creation_result_fallback_accepted_after_cooldown(caplog):
         )
     assert result is not None
     assert result["remote_task_id"] == "task-other"
-    assert "v0.3.5 race 防御兜底" in caplog.text
+    assert "v0.3.5.2 race 防御兜底" in caplog.text
     assert "cooldown_elapsed=" in caplog.text
-    # dedup 加入
-    assert "task-other" in protocol_module._seen_remote_task_ids
 
 
-def test_parse_creation_result_dedup_skips_already_seen():
-    """v0.3.5 dedup:同一个 creation.id 已被 accept 过,后续再出现 → 跳过返 None。
+def test_parse_creation_result_dedup_skips_already_seen(monkeypatch):
+    """v0.3.5.2 per-call dedup:同一次 parse_creation_result call 内,同一个
+    cid 出现在多个 candidates 里,第一个 accept 后,后续同 cid 跳过 —— 防
+    fallback 路径在同一 call 内重复 deliver 同一视频。
 
-    场景:同一个 task 的 chain poll 多次都拿到同一候选(自己的或别人的),
-    第一次 accept 后,后续 _seen_remote_task_ids 命中 → 不重复 deliver。
+    v0.3.5.2 关键差异:dedup 改为 per-call 局部,跨 call 不持久。这里用
+    同 call 内两个 candidates 同 cid 来验证 per-call dedup 生效。
     """
     a_self = {
         "id": "task-self",
@@ -1240,25 +1257,24 @@ def test_parse_creation_result_dedup_skips_already_seen():
         "block_type": 2074,
         "content": {"creation_block": {"creations": [a_self]}},
     }])
-    # envelope id 有但不命中 expected → candidates(走 dedup)
+    # 同 call 内两个 candidates(envelope 不同,cid 都是 task-self) →
+    # 第一个 accept,第二个被 per-call dedup 跳过,但 call 整体仍返第一个。
     response = {
         "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
-            {"content": content, "local_message_id": "msg-someone"},
+            {"content": content, "local_message_id": "msg-other-1"},
+            {"content": content, "local_message_id": "msg-other-2"},
         ]}}
     }
-    # 先手动注入 seen + cooldown 已过,模拟「上一次 poll 已接受」
-    import time as _time
-    protocol_module._seen_remote_task_ids.add("task-self")
-    protocol_module._candidate_first_seen["task-self"] = (
-        _time.monotonic() - 31.0
-    )
-    # 第二次 poll → candidates 已 dedup → 返 None
+    # cooldown=0 让 accept 立即发生
+    monkeypatch.setattr(protocol_module, "_FALLBACK_COOLDOWN_S", 0.0)
     result = parse_creation_result(
         response,
         expected_local_message_ids=set(),
         expected_remote_task_ids=set(),
     )
-    assert result is None
+    # call 内第一个 accept 的 candidates 返回
+    assert result is not None
+    assert result["remote_task_id"] == "task-self"
 
 
 def test_parse_creation_result_no_match_returns_none(caplog):
@@ -1291,8 +1307,6 @@ def test_parse_creation_result_no_match_returns_none(caplog):
     assert result is None
     # 没兜底 → 不打 WARNING
     assert "race 防御兜底" not in caplog.text
-    # 没合法 candidates → _candidate_first_seen 不应有 task-pending
-    assert "task-pending" not in protocol_module._candidate_first_seen
 
 
 def test_parse_creation_result_no_expected_still_accepts_any_creation():

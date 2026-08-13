@@ -15,28 +15,19 @@ from doupool.prompt_reviser import _POLICY_PATTERNS
 _LOGGER = logging.getLogger(__name__)
 
 
-# v0.3.5:跨任务 fallback dedup —— module-level set,key 是 creation.id
-# (=remote_task_id,见 L528)。兜底 accept 时同步加入,避免下一次 poll 又
-# 拿到同一个 id 又被当成 candidates。生命周期跟进程一致(playwright runner
-# 是长生命周期),不会越攒越大,因为生产环境每任务 unique creation.id。
-_seen_remote_task_ids: set[str] = set()
+# v0.3.5.2:取消 v0.3.5 的 module-level `_seen_remote_task_ids` /
+# `_candidate_first_seen`。原因:实测同账号并发场景下,字节 /im/chain/single
+# 会把 A1 的 creation 反复塞给 A2 的 chain response,A2 的 candidates
+# 列表里永远是 A1 的 cid。如果 A1 的 cid 在前面某次 task accept 时写入
+# module-level dedup,A2 永远 dedup 跳过 → 7min timeout。改用 per-call
+# 局部 dedup + per-call 局部 first_seen dict(同一次 parse_creation_result
+# 调用内有效,跨调用不共享),保留同 run 内不重复 accept 的行为。
 
-# v0.3.5:candidate 首次出现时间戳。用于判断 30s cooldown 是否过 —— 用
-# monotonic clock,跟之前 DEBUG 日志一致。
-_candidate_first_seen: dict[str, float] = {}
-
-# v0.3.5:兜底 cooldown 30s。超过这个时间窗仍匹配不上 expected 才允许
-# candidates 兜底 accept,避免一收到 chain response 立即拿错 creation。
-# 设计依据:A1 submit 后,A2 submit 在 30s 内完成,A2 的 chain response 几乎
-# 立刻拿到 → 此时距离 A1 submit 还在 30s 内,如果先到的是 A1,A2 不会误判;
-# 反过来,如果先到的是别人刚 submit 的 creation(同 conversation),30s 内
-# 不接,等自家 creation 出来。
-# v0.3.5.1:实测 30s 太长 —— 同账号 4 条并发场景下,3 条 cooldown 兜底 elapsed
-# 38.2s / 37.9s / 37.9s(几乎全卡满 30s 才识别到),视频生成 30s 前就完成,
-# 用户体感「成功好久了才识别到」。5s 仍能挡住 race 窗口(2 个并发任务 submit
-# 间隔通常 < 5s,但 A1 chain response 通常需要 5-10s 才到客户端),
-# 配合 matches_remote + matches_local 两层强匹配兜底足够。失败时 candidates
-# 始终空 → 走 5min chain 超时报「视频生成超时」(沿用既有兜底)。
+# v0.3.5.2:实测 5s cooldown 已经能让 race defense 兜底 elapsed 12.6s
+# (v0.3.5.1 跑出来),再压到 0s 风险是:同账号并发 submit 后,A1 还没拿到自己
+# creation 时 chain response 已有别人刚 submit 的 creation,A1 立刻 accept
+# 错。把 cooldown 设 0 但保留 dedup 还是有保护 —— 但 v0.3.5.2 取消全局
+# dedup,所以 cooldown 不能为 0。保留 5s,允许 candidates 兜底正常 accept。
 _FALLBACK_COOLDOWN_S = 5.0
 
 
@@ -520,7 +511,7 @@ def parse_creation_result(
       透传浏览器 crypto.randomUUID,chain response 用服务端内部 id)。WARNING 留下
       现场,后续可观测服务端 id 漂移频率。
 
-    v0.3.5 三层优先级 + 兜底 cooldown + dedup:
+    v0.3.5 三层优先级 + 兜底 cooldown:
     - 新参数 `expected_remote_task_ids`:submit 时抽到的服务端 creation.id 集合
       (浏览器 UI 路径下从 SSE_ACK payload / fetch 路径下从响应 envelope 上抽)。
       creation.id 命中这一集合是**最强证据**(服务端返回的就是我们 submit 的)。
@@ -529,11 +520,17 @@ def parse_creation_result(
       * `matches_local`:envelope ∩ expected_local_message_ids ≠ ∅ —— 优先级 2
       * `candidates`:合法 creation,但既不命中 expected_remote_task_ids,
         envelope 也没匹配 expected_local_message_ids
-    - 兜底 cooldown 30s:candidates 必须存在 ≥ 30s 才允许 accept,避免
+    - 兜底 cooldown 5s:candidates 必须存在 ≥ 5s 才允许 accept,避免
       早返回把别人刚 submit 的 creation 当成我们自己的。
-    - 全局 dedup `_seen_remote_task_ids`:已经 accept 过的 creation.id,
-      下一次 poll 见到就跳过(防止 fallback 路径重复 deliver 同一视频)。
-    - 优先级 1 > 优先级 2 > 兜底(cooldown + dedup 后)。
+    - v0.3.5.2:**取消 v0.3.5 全局模块级 `_seen_remote_task_ids` dedup**。
+      v0.3.5 设计假设"每任务 unique creation.id",实测同账号并发场景下
+      字节 /im/chain/single 会把 A1 的 creation 反复塞给 A2 的 chain
+      response(v0.3.5.2 DEBUG 日志证实),导致 A2 的 candidates 列表里
+      始终是 A1 的 cid,而 A1 的 cid 在某次其它 task 的兜底 accept 时已
+      写入 `_seen_remote_task_ids` → A2 永久跳过 → 7min timeout。改成
+      per-poll-call 局部 dedup:同一次 run 的 poll 循环内不重复 accept
+      同一 cid,跨 run 不 dedup。
+    - 优先级 1 > 优先级 2 > 兜底(cooldown 后)。
     """
     messages = response.get("downlink_body", {}).get("pull_singe_chain_downlink_body", {}).get("messages", [])
 
@@ -616,16 +613,39 @@ def parse_creation_result(
                 else:
                     candidates.append((envelope_ids, payload))
 
+    # v0.3.5.2 DEBUG:打印三层分类结果,定位"生成完毕但 UI 卡生成中"。
+    # 用户报 v0.3.5.1 跑下来 1 个 task 一直显示"生成中",DB 不动。
+    # 把三层数 + accepted/candidates cooldown 状态打出来,复现一次即可
+    # 知道是优先级 1/2 没命中,还是 candidates cooldown 没到,还是 dedup
+    # 把这个 creation.id 永久跳过。
+    _LOGGER.info(
+        "[v0.3.5.2 DEBUG parse_creation_result] matches_remote=%d matches_local=%d "
+        "candidates=%d expected_remote=%s expected_local=%s",
+        len(matches_remote),
+        len(matches_local),
+        len(candidates),
+        sorted(expected_remote_task_ids) if expected_remote_task_ids else "None",
+        sorted(expected_local_message_ids) if expected_local_message_ids else "None",
+    )
+
+    # v0.3.5.2:per-call 局部 dedup —— 同一次 run 的 poll 循环内不重复 accept
+    # 同一 cid,跨 run 不 dedup。完全替换 v0.3.5 的 module-level
+    # `_seen_remote_task_ids`(实测有 bug:同账号并发场景下字节
+    # /im/chain/single 会把 A1 的 creation 反复塞给 A2 的 chain response,
+    # A2 的 candidates 列表里永远是 A1 的 cid,而 A1 的 cid 已经在前面某次
+    # task accept 时写入全局 dedup → A2 永久跳过 → 7min timeout)。
+    local_seen_remote_ids: set[str] = set()
+
     # v0.3.5:优先级 1 命中 → 直接 return,不打 WARNING(强证据)。
     if matches_remote:
         # 把命中 id 加进 dedup set,避免同一 task 后续 poll 又被当 fallback。
         for m in matches_remote:
-            _seen_remote_task_ids.add(m["remote_task_id"])
+            local_seen_remote_ids.add(m["remote_task_id"])
         return matches_remote[0]
 
     # v0.3.5:优先级 2 命中 → 直接 return,不打 WARNING(envelope 匹配足以
     # 证明是我们 submit 的)。
-    # 注意:完全向后兼容路径(expected 都 None)不要写入 _seen_remote_task_ids,
+    # 注意:完全向后兼容路径(expected 都 None)不要写入 dedup,
     # 否则会破坏既有调用方的 dedup 假设。
     if matches_local:
         if (
@@ -633,10 +653,10 @@ def parse_creation_result(
             or expected_local_message_ids is not None
         ):
             for m in matches_local:
-                _seen_remote_task_ids.add(m["remote_task_id"])
+                local_seen_remote_ids.add(m["remote_task_id"])
         return matches_local[0]
 
-    # v0.3.5:兜底 candidates —— 30s cooldown + 全局 dedup。
+    # v0.3.5.2:兜底 candidates —— 5s cooldown + per-call dedup。
     if candidates and (
         expected_remote_task_ids is not None
         or expected_local_message_ids is not None
@@ -647,24 +667,38 @@ def parse_creation_result(
         # 跟踪 cooldown 最早出现的 candidate 时间(用于打 WARNING 时记录
         # 实际等多久才接受)。
         earliest_first_seen = now
+        # v0.3.5.2:cooldown 时间戳也改为 per-call 局部,避免 module-level
+        # `_candidate_first_seen` 在跨 run 时被陈旧 first_seen 卡死。
+        local_candidate_first_seen: dict[str, float] = {}
         for envelope_ids, payload in candidates:
             cid = payload["remote_task_id"]
-            if cid in _seen_remote_task_ids:
+            first_seen = local_candidate_first_seen.setdefault(cid, now)
+            earliest_first_seen = min(earliest_first_seen, first_seen)
+            # v0.3.5.2 DEBUG:candidates 遍历时把每个 cid + 是否在 dedup + cooldown
+            # 剩余秒数打出来。dedup 命中 = 这个 cid 之前 accept 过,新 task 永远
+            # 拿不到。cooldown 未到 = 候选存在但还在 5s 兜底窗口内。
+            _LOGGER.info(
+                "[v0.3.5.2 DEBUG candidates loop] cid=%s in_dedup=%s "
+                "first_seen_age=%.2fs cooldown_left=%.2fs",
+                cid,
+                cid in local_seen_remote_ids,
+                now - first_seen,
+                max(0.0, _FALLBACK_COOLDOWN_S - (now - first_seen)),
+            )
+            if cid in local_seen_remote_ids:
                 # 已接受过,跳过(防止重复 deliver 同一视频)
                 continue
-            first_seen = _candidate_first_seen.setdefault(cid, now)
-            earliest_first_seen = min(earliest_first_seen, first_seen)
             if now - first_seen < _FALLBACK_COOLDOWN_S:
-                # 还没过 30s,等下一轮 poll
+                # 还没过 5s,等下一轮 poll
                 continue
             accepted_envelope_ids = envelope_ids
             accepted_payload = payload
             break
 
         if accepted_payload is not None:
-            _seen_remote_task_ids.add(accepted_payload["remote_task_id"])
+            local_seen_remote_ids.add(accepted_payload["remote_task_id"])
             _LOGGER.warning(
-                "v0.3.5 race 防御兜底:30s cooldown 后仍未命中 expected_remote_task_ids "
+                "v0.3.5.2 race 防御兜底:5s cooldown 后仍未命中 expected_remote_task_ids "
                 "/ expected_local_message_ids, accept candidates[0]。candidates=%d, "
                 "expected_remote=%d, expected_local=%d, drift_envelope_ids=%s, "
                 "drift_creation_id=%s, drift_vid=%s, cooldown_elapsed=%.1fs",
