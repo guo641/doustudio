@@ -2,10 +2,12 @@ import json
 
 import pytest
 
+from doupool.video import protocol as protocol_module
 from doupool.video.protocol import (
     EXTRA_CLIENT_META_KEYS,
     DoubaoContentRejected,
     DoubaoRateLimited,
+    _FALLBACK_COOLDOWN_S,
     build_completion_payload,
     find_creation_directory,
     find_video_node,
@@ -13,6 +15,21 @@ from doupool.video.protocol import (
     parse_download_info,
     parse_sse_ack,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_seen_remote_task_ids():
+    """每个 test 前后清空 module-level dedup + cooldown map。
+
+    v0.3.5 引入的 `_seen_remote_task_ids` / `_candidate_first_seen` 是进程级
+    全局状态,跨 test 共享会污染 isolation(例如一个 test accept 过的 id,
+    下个 test 再看到就被 dedup 跳过了)。
+    """
+    protocol_module._seen_remote_task_ids.clear()
+    protocol_module._candidate_first_seen.clear()
+    yield
+    protocol_module._seen_remote_task_ids.clear()
+    protocol_module._candidate_first_seen.clear()
 
 
 def test_build_new_conversation_video_payload():
@@ -655,13 +672,11 @@ def test_parse_creation_result_filters_by_expected_local_message_id():
     assert result["fallback_result_url"] == "https://example/A2.mp4"
 
 
-def test_parse_creation_result_relaxes_when_envelope_id_drifts():
-    """v0.3.4.1:服务端 envelope id 不匹配但 creation 合法 → 兜底接受 candidates[0]
-    并打 WARNING(不再返 None / 继续 poll 直至 timeout)。
-
-    用户的"4 条视频生成好但仍卡生成中"真根因:v0.3.3 单遍扫描一遇到 envelope
-    id 不匹配就 continue,把所有合法 creation 一票否决 → 永远拿不到结果 →
-    10min timeout 标 failed,但服务端其实早已成功。v0.3.4.1 两阶段扫描改兜底。
+def test_parse_creation_result_relaxes_when_envelope_id_drifts(monkeypatch):
+    """v0.3.5 收紧了 v0.3.4.1 的兜底 —— 「envelope 不匹配」必须先等 cooldown(默认
+    30s)才接受 candidates[0]。这是为了解 A2/A4 拿到 A1/A3 的真根因:
+    v0.3.4.1 在 race 窗口下立刻吞掉别人的 creation,而 v0.3.5 给客户端充足
+    时间继续 poll,等服务端 envelope id 漂移窗口关闭后再兜底。
     """
     a1 = {
         "id": "task-A1",
@@ -669,8 +684,12 @@ def test_parse_creation_result_relaxes_when_envelope_id_drifts():
     }
     response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
 
-    # A2 worker 收自己的 message_id → A1 envelope 不匹配 → 兜底接受 A1 creation
-    # (v0.3.3 行为:返 None → poll 直至 timeout;v0.3.4.1 行为:返 A1 + WARNING)
+    # 1) 默认 cooldown(30s)未过 → 返 None,继续 poll
+    result = parse_creation_result(response, expected_local_message_ids={"msg-A2"})
+    assert result is None
+
+    # 2) cooldown 已过 → 接受 A1(兜底),这是 v0.3.4.1 旧的立即接受语义迁移后的样子
+    monkeypatch.setattr(protocol_module, "_FALLBACK_COOLDOWN_S", 0.0)
     result = parse_creation_result(response, expected_local_message_ids={"msg-A2"})
     assert result is not None
     assert result["vid"] == "v-A1"
@@ -811,25 +830,214 @@ def test_parse_creation_result_returns_none_when_no_valid_creation(caplog):
     assert "v0.3.4.1 race 防御兜底" not in caplog.text
 
 
-def test_parse_creation_result_logs_warning_on_drift_fallthrough(caplog):
-    """v0.3.4.1:envelope id 漂移兜底必须打 WARNING,留下服务端 id drift 现场。"""
+def test_parse_creation_result_logs_warning_on_drift_fallthrough(caplog, monkeypatch):
+    """v0.3.5:envelope id 漂移兜底必须打 WARNING,留下服务端 id drift 现场。
+
+    v0.3.4.1 立即 accept;v0.3.5 加 cooldown → 测试必须 monkeypatch 缩短
+    cooldown 才能命中 WARNING 路径。
+    """
     a1 = {
         "id": "task-A1",
         "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
     }
     response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
+    monkeypatch.setattr(protocol_module, "_FALLBACK_COOLDOWN_S", 0.0)
 
     with caplog.at_level(logging.WARNING, logger="doupool.video.protocol"):
         result = parse_creation_result(response, expected_local_message_ids={"msg-A2"})
 
     assert result is not None
     assert result["vid"] == "v-A1"
-    # WARNING 必须出现且带关键字段,方便观测服务端 id 漂移
-    assert "v0.3.4.1 race 防御兜底" in caplog.text
+    # v0.3.5 WARNING 标识(取代 v0.3.4.1 的标识)
+    assert "v0.3.5 race 防御兜底" in caplog.text
     assert "drift_vid=v-A1" in caplog.text
+    assert "drift_creation_id=task-A1" in caplog.text
     assert "drift_envelope_ids=['msg-A1']" in caplog.text
     assert "candidates=1" in caplog.text
-    assert "expected=1" in caplog.text
+
+
+# =============================================================================
+# v0.3.5:三层优先级 + 30s cooldown + 全局 dedup
+# =============================================================================
+# v0.3.4.1 fallback 太宽 —— 服务端 envelope id 跟客户端 expected 不匹配时立刻
+# 接受 candidates[0],导致 A2 worker 拿到 A1 的 creation。v0.3.5 加三层:
+# 1. expected_remote_task_ids 命中 creation.id(强证据,优先级 1)
+# 2. expected_local_message_ids 命中 envelope(中等证据,优先级 2)
+# 3. candidates 兜底 —— 必须满足:首次出现 ≥ 30s 且 _seen_remote_task_ids 未记录
+# =============================================================================
+
+from doupool.video import protocol as _protocol_module
+
+
+@pytest.fixture(autouse=False)
+def _reset_v035_seen():
+    """每个 v0.3.5 测试隔离 module-level dedup state。
+    不加 autouse=True —— 只对 v0.3.5 测试显式请求,避免影响其他测试。
+    """
+    _protocol_module._seen_remote_task_ids.clear()
+    _protocol_module._candidate_first_seen.clear()
+    yield
+    _protocol_module._seen_remote_task_ids.clear()
+    _protocol_module._candidate_first_seen.clear()
+
+
+def test_parse_creation_result_prefers_remote_id_over_local_envelope(_reset_v035_seen):
+    """v0.3.5 优先级 1:creation.id 命中 expected_remote_task_ids,即使 envelope 也
+    命中 expected_local_message_ids,优先按 remote 返回(更明确的强证据)。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    # envelope 用别人的 id(模拟 A2 worker 视角下 envelope 跟 remote 不一致)
+    content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a1]}},
+    }])
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [{
+            "content": content,
+            "local_message_id": "msg-A2",  # A2 的 envelope,但 creation 是 A1
+        }]}},
+    }
+    # expected_remote_task_ids 命中 → 优先级 1 → 直接返回
+    result = parse_creation_result(
+        response,
+        expected_local_message_ids={"msg-A2"},
+        expected_remote_task_ids={"task-A1"},
+    )
+    assert result is not None
+    assert result["vid"] == "v-A1"
+
+
+def test_parse_creation_result_uses_local_envelope_when_remote_missing(_reset_v035_seen):
+    """v0.3.5 优先级 2:服务端不返回 creation.id(老版本/字段缺失),但 envelope
+    命中 expected_local_message_ids → 按优先级 2 接受。"""
+    a1 = {
+        # 没有 id 字段,模拟服务端不返回
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
+    result = parse_creation_result(
+        response,
+        expected_local_message_ids={"msg-A1"},
+        expected_remote_task_ids={"task-A1"},  # 集合里有但 creation 没带 id
+    )
+    assert result is not None
+    assert result["vid"] == "v-A1"
+
+
+def test_parse_creation_result_fallback_returns_none_before_cooldown(_reset_v035_seen):
+    """v0.3.5 cooldown:fallback candidates 必须等 ≥ 30s 才允许 accept。模拟 A2
+    worker 第一次 poll 返回 A1 的 creation —— 此时距离 candidates 首次出现 < 30s,
+    必须返回 None 让 caller 继续 poll,而不是立刻吞掉 A1 的视频。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    # envelope id 不在 expected 里 → 走 fallback candidates
+    response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
+    # 注意:不传 expected_remote_task_ids(服务端没返回 creation.id)
+    result = parse_creation_result(
+        response,
+        expected_local_message_ids={"msg-A2"},  # A2 worker 视角
+    )
+    # cooldown 未满 → 返回 None
+    assert result is None
+
+
+def test_parse_creation_result_fallback_accepts_after_cooldown(_reset_v035_seen, monkeypatch, caplog):
+    """v0.3.5 cooldown:模拟 30s 后,candidates 首次出现时间已过 cooldown →
+    允许 accept 兜底并打 WARNING。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
+    # 让 cooldown 已过
+    monkeypatch.setattr(_protocol_module, "_FALLBACK_COOLDOWN_S", 0.0)
+
+    with caplog.at_level(logging.WARNING, logger="doupool.video.protocol"):
+        result = parse_creation_result(
+            response,
+            expected_local_message_ids={"msg-A2"},
+        )
+    assert result is not None
+    assert result["vid"] == "v-A1"
+    assert "v0.3.5 race 防御兜底" in caplog.text
+    assert "drift_creation_id=task-A1" in caplog.text
+    assert "drift_vid=v-A1" in caplog.text
+
+
+def test_parse_creation_result_dedup_skips_already_seen_remote_id(_reset_v035_seen, monkeypatch):
+    """v0.3.5 dedup:_seen_remote_task_ids 已记录的 creation.id 下次 poll 见到
+    → 跳过 candidates,避免 fallback 路径重复 deliver 同一视频。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
+    monkeypatch.setattr(_protocol_module, "_FALLBACK_COOLDOWN_S", 0.0)
+
+    # 第一次:cooldown=0,接受 candidates[0],同时把 task-A1 加入 _seen_remote_task_ids
+    result1 = parse_creation_result(
+        response,
+        expected_local_message_ids={"msg-A2"},
+    )
+    assert result1 is not None
+    assert result1["vid"] == "v-A1"
+    assert "task-A1" in _protocol_module._seen_remote_task_ids
+
+    # 第二次:同样的 candidates(同一 task-A1),但 _seen_remote_task_ids 已记录
+    # → 必须跳过(返回 None,等待 A2 自己的 creation 出现)
+    result2 = parse_creation_result(
+        response,
+        expected_local_message_ids={"msg-A2"},
+    )
+    assert result2 is None
+
+
+def test_parse_creation_result_remote_id_match_dedups_after_accept(_reset_v035_seen):
+    """v0.3.5 dedup:优先级 1(remote id)命中后,也要把 id 加入 _seen_remote_task_ids,
+    防止下次 poll 同 id 又被 candidates 路径重复处理。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [{
+            "content": json.dumps([{
+                "block_type": 2074,
+                "content": {"creation_block": {"creations": [a1]}},
+            }]),
+            "local_message_id": "msg-A1",
+        }]}},
+    }
+    # 优先级 1 命中
+    result = parse_creation_result(
+        response,
+        expected_local_message_ids={"msg-A1"},
+        expected_remote_task_ids={"task-A1"},
+    )
+    assert result is not None
+    assert result["vid"] == "v-A1"
+    # 接受后 id 必须进入 dedup set,防止 fallback 路径重复接受
+    assert "task-A1" in _protocol_module._seen_remote_task_ids
+
+
+def test_parse_creation_result_no_expected_args_skips_all_defenses(_reset_v035_seen):
+    """v0.3.5 向后兼容:两个 expected 参数都不传 → 完全保留 v0.3.2.5 行为,
+    所有合法 creation 直接进 matches_local,没有任何 cooldown / dedup。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
+    # 不传任何 expected → 旧行为,直接返回
+    result = parse_creation_result(response)
+    assert result is not None
+    assert result["vid"] == "v-A1"
+    # 旧行为不写入 _seen_remote_task_ids(cooldown 路径未触发)
+    assert "task-A1" not in _protocol_module._seen_remote_task_ids
 
 
 def test_parse_creation_result_no_warning_when_explicit_match(caplog):
@@ -847,3 +1055,261 @@ def test_parse_creation_result_no_warning_when_explicit_match(caplog):
     assert result["vid"] == "v-A1"
     # 强匹配成功 → 不应打 WARNING(避免刷屏)
     assert "v0.3.4.1 race 防御兜底" not in caplog.text
+
+
+# ---------- v0.3.5:三层优先级 + 兜底 cooldown + dedup ----------
+
+
+def test_parse_creation_result_priority_remote_over_envelope(caplog):
+    """v0.3.5 优先级 1:creation.id ∈ expected_remote_task_ids 强于 envelope 命中。
+
+    场景:服务端 race 把 A2 的 creation 塞进 A1 的 chain response,但 A1
+    submit 时拿到的 ack 里有 A1 自己的 creation.id (= "task-A1")。同时
+    envelope 上 msg-A2 命中 A1 的 expected_local_message_ids。
+    必须返回 A1(服务端实际分配给 A1 的 creation),不能因为 envelope 上
+    msg-A2 命中而错选 A2 creation。
+    """
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    a2 = {
+        "id": "task-A2",
+        "video": {"status": 3, "vid": "v-A2", "download_url": "https://example/A2.mp4"},
+    }
+    a1_content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a1]}},
+    }])
+    a2_content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a2]}},
+    }])
+    # 故意把 A1 的 creation 放在 msg-A2 envelope 上(模拟服务端 envelope 串话),
+    # 同时把 A2 的 creation 放在 msg-A1 envelope 上。A1 worker:
+    #   expected_remote_task_ids = {"task-A1"}    → 强匹配 A1
+    #   expected_local_message_ids = {"msg-A1"}   → 命中 A2 envelope
+    # 期望:返回 A1,不打 WARNING。
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {"content": a1_content, "local_message_id": "msg-A2"},
+            {"content": a2_content, "local_message_id": "msg-A1"},
+        ]}}
+    }
+    with caplog.at_level(logging.WARNING, logger="doupool.video.protocol"):
+        result = parse_creation_result(
+            response,
+            expected_local_message_ids={"msg-A1"},
+            expected_remote_task_ids={"task-A1"},
+        )
+    assert result is not None
+    assert result["remote_task_id"] == "task-A1"
+    assert result["vid"] == "v-A1"
+    # 不应打 WARNING:优先级 1 命中,无需兜底
+    assert "race 防御兜底" not in caplog.text
+
+
+def test_parse_creation_result_priority_envelope_over_fallback(caplog):
+    """v0.3.5 优先级 2:envelope ∩ expected_local_message_ids 强于 candidates 兜底。
+
+    场景:服务端没在 ack 里 echo remote_task_id(expected_remote_task_ids=None),
+    但 envelope 上 msg-A1 命中 expected_local_message_ids。同时有别的
+    creation 在 envelope 上没有任何 id(candidates 兜底层)。
+    期望:envelope 命中优先,不打 WARNING(只有 candidates 才打)。
+    """
+    a_match = {
+        "id": "task-match",
+        "video": {"status": 3, "vid": "v-match", "download_url": "https://example/match.mp4"},
+    }
+    a_other = {
+        "id": "task-other",
+        "video": {"status": 3, "vid": "v-other", "download_url": "https://example/other.mp4"},
+    }
+    match_content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a_match]}},
+    }])
+    other_content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a_other]}},
+    }])
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {"content": match_content, "local_message_id": "msg-match"},
+            {"content": other_content},  # 没有 envelope id → candidates 兜底
+        ]}}
+    }
+    with caplog.at_level(logging.WARNING, logger="doupool.video.protocol"):
+        result = parse_creation_result(
+            response,
+            expected_local_message_ids={"msg-match"},
+        )
+    assert result is not None
+    assert result["remote_task_id"] == "task-match"
+    # 不应打 WARNING:envelope 命中,不走兜底
+    assert "race 防御兜底" not in caplog.text
+
+
+def test_parse_creation_result_fallback_blocked_by_cooldown():
+    """v0.3.5 兜底 cooldown:candidates 出现 <30s → 不接受,返 None。
+
+    场景:candidates 首次出现,刚过几秒(小于 _FALLBACK_COOLDOWN_S)→ 必须
+    继续 poll 等到 cooldown 过,不能立即 accept 把别人的 creation 当成
+    自己的。
+    """
+    a_other = {
+        "id": "task-other",
+        "video": {"status": 3, "vid": "v-other", "download_url": "https://example/other.mp4"},
+    }
+    other_content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a_other]}},
+    }])
+    # envelope id 有但不命中 expected → candidates(走 cooldown)。
+    # 注意:envelope 完全缺失会触发 v0.3.3 「字段缺失 fall through」→ matches_local,
+    # 那就测不到 cooldown 路径了,所以这里必须给 envelope id。
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {"content": other_content, "local_message_id": "msg-someone"},
+        ]}}
+    }
+    result = parse_creation_result(
+        response,
+        expected_local_message_ids=set(),
+        expected_remote_task_ids=set(),
+    )
+    # 30s 内 → cooldown 未过 → 返 None(继续 poll)
+    assert result is None
+    # _candidate_first_seen 记录了首次出现时间戳
+    assert "task-other" in protocol_module._candidate_first_seen
+
+
+def test_parse_creation_result_fallback_accepted_after_cooldown(caplog):
+    """v0.3.5 兜底 cooldown:candidates 出现 ≥30s → 接受,打 WARNING,加 dedup。
+
+    模拟方式:把 `_candidate_first_seen` 里的时间戳手动倒推 30s 以上,
+    让 monotonic 判定 cooldown 已过。然后 verify:
+    1. 返 candidates[0]
+    2. WARNING 含 v0.3.5 标识 + cooldown_elapsed
+    3. _seen_remote_task_ids 加入该 id
+    """
+    a_other = {
+        "id": "task-other",
+        "video": {"status": 3, "vid": "v-other", "download_url": "https://example/other.mp4"},
+    }
+    other_content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a_other]}},
+    }])
+    # envelope id 有但不命中 expected → candidates(走 cooldown)
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {"content": other_content, "local_message_id": "msg-someone"},
+        ]}}
+    }
+    # 把 task-other 的首次出现时间倒推 31s,cooldown 必定已过
+    import time as _time
+    protocol_module._candidate_first_seen["task-other"] = (
+        _time.monotonic() - 31.0
+    )
+    with caplog.at_level(logging.WARNING, logger="doupool.video.protocol"):
+        result = parse_creation_result(
+            response,
+            expected_local_message_ids=set(),
+            expected_remote_task_ids=set(),
+        )
+    assert result is not None
+    assert result["remote_task_id"] == "task-other"
+    assert "v0.3.5 race 防御兜底" in caplog.text
+    assert "cooldown_elapsed=" in caplog.text
+    # dedup 加入
+    assert "task-other" in protocol_module._seen_remote_task_ids
+
+
+def test_parse_creation_result_dedup_skips_already_seen():
+    """v0.3.5 dedup:同一个 creation.id 已被 accept 过,后续再出现 → 跳过返 None。
+
+    场景:同一个 task 的 chain poll 多次都拿到同一候选(自己的或别人的),
+    第一次 accept 后,后续 _seen_remote_task_ids 命中 → 不重复 deliver。
+    """
+    a_self = {
+        "id": "task-self",
+        "video": {"status": 3, "vid": "v-self", "download_url": "https://example/self.mp4"},
+    }
+    content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a_self]}},
+    }])
+    # envelope id 有但不命中 expected → candidates(走 dedup)
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {"content": content, "local_message_id": "msg-someone"},
+        ]}}
+    }
+    # 先手动注入 seen + cooldown 已过,模拟「上一次 poll 已接受」
+    import time as _time
+    protocol_module._seen_remote_task_ids.add("task-self")
+    protocol_module._candidate_first_seen["task-self"] = (
+        _time.monotonic() - 31.0
+    )
+    # 第二次 poll → candidates 已 dedup → 返 None
+    result = parse_creation_result(
+        response,
+        expected_local_message_ids=set(),
+        expected_remote_task_ids=set(),
+    )
+    assert result is None
+
+
+def test_parse_creation_result_no_match_returns_none(caplog):
+    """v0.3.5:无任何 expected + 无合法 creation → 返 None(保持 v0.3.2.5 兼容)。
+
+    跟 v0.3.4.1 的「合法 candidates 但 envelope 不匹配」区分 —— 这里连
+    candidates 都没合法 creation,只验证兜底 cooldown + dedup 路径在没有
+    合法 creation 时仍能安全返 None。
+    """
+    pending = {
+        "id": "task-pending",
+        "video": {"status": 1, "vid": "v-pending"},  # 还在生成中
+    }
+    content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [pending]}},
+    }])
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {"content": content},
+        ]}}
+    }
+    with caplog.at_level(logging.WARNING, logger="doupool.video.protocol"):
+        result = parse_creation_result(
+            response,
+            expected_local_message_ids={"some-id"},
+            expected_remote_task_ids={"some-remote-id"},
+        )
+    # 没合法 creation(全在生成中) → 返 None
+    assert result is None
+    # 没兜底 → 不打 WARNING
+    assert "race 防御兜底" not in caplog.text
+    # 没合法 candidates → _candidate_first_seen 不应有 task-pending
+    assert "task-pending" not in protocol_module._candidate_first_seen
+
+
+def test_parse_creation_result_no_expected_still_accepts_any_creation():
+    """v0.3.5 向后兼容:两个 expected 都 None → 接受首个合法 creation(原 v0.3.2.5 行为)。
+
+    验证 v0.3.5 没破坏老调用方(没传任何 expected 集合时的 fall through)。
+    """
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a1]}},
+    }])
+    response = _build_chain_response_with_envelope(envelope_id="msg-someone-else", creation=a1)
+    # 故意 envelope 上是别人的 id,但调用方没传任何 expected → 旧行为保留
+    result = parse_creation_result(response)
+    assert result is not None
+    assert result["vid"] == "v-A1"

@@ -1291,6 +1291,61 @@ def _extract_local_message_ids_from_ack_payload(ack_payload: dict) -> set[str]:
     return ids
 
 
+def _extract_remote_task_ids_from_ack_payload(ack_payload: dict) -> set[str]:
+    """v0.3.5:从 SSE_ACK payload 里抽本任务 submit 时分配的服务端 creation.id。
+
+    与 `_extract_local_message_ids_from_ack_payload` 配对 —— 后者抽客户端
+    local_message_id,本函数抽服务端 `creation.id`(被记为 remote_task_id,
+    `parse_creation_result` payload 里的 `creation.id` 字段)。
+
+    字节不同版本可能 echo 在不同位置,做宽口径 fallback:
+      - 顶层 `remote_task_id` / `task_id` / `creation_id`(部分版本)
+      - `ack_client_meta.remote_task_id` / `task_id` / `creation_id`
+      - `query_list[].remote_task_id` / `task_id` / `creation_id`
+
+    字段缺失 / 全部空 → 返回空 set,parse_creation_result 走兜底 candidates
+    + 30s cooldown(由 `expected_local_message_ids` 这层兜底)。本函数是
+    best-effort,失败不挂流程。
+    """
+    ids: set[str] = set()
+
+    def _ingest(value) -> None:
+        if isinstance(value, str) and value:
+            ids.add(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item:
+                    ids.add(item)
+                elif isinstance(item, dict):
+                    inner = (
+                        item.get("remote_task_id")
+                        or item.get("task_id")
+                        or item.get("creation_id")
+                    )
+                    _ingest(inner)
+
+    # 顶层
+    _ingest(ack_payload.get("remote_task_id"))
+    _ingest(ack_payload.get("task_id"))
+    _ingest(ack_payload.get("creation_id"))
+
+    # ack_client_meta 子树
+    meta = ack_payload.get("ack_client_meta") or {}
+    _ingest(meta.get("remote_task_id"))
+    _ingest(meta.get("task_id"))
+    _ingest(meta.get("creation_id"))
+
+    # query_list[].*
+    for query in ack_payload.get("query_list") or []:
+        if not isinstance(query, dict):
+            continue
+        _ingest(query.get("remote_task_id"))
+        _ingest(query.get("task_id"))
+        _ingest(query.get("creation_id"))
+
+    return ids
+
+
 async def submit_via_ui(
     page: Page,
     prompt: str,
@@ -1499,6 +1554,7 @@ class PlaywrightVideoRunner:
         *,
         deadline_seconds: float = 90,
         expected_local_message_ids: set[str] | None = None,
+        expected_remote_task_ids: set[str] | None = None,
     ) -> dict[str, str] | None:
         """v0.2.9:不重提交,只重解析 —— 复用已存的 conversation_id,
         重新打开 /chat/<id> 拉一次 CHAIN_SCRIPT,parse 出最新 result。
@@ -1572,9 +1628,11 @@ class PlaywrightVideoRunner:
                 # expected_local_message_ids=None 走 fall through(原行为);
                 # 若 task.db 之前 v0.3.3+ 写入过 id 集合就透传,做 best-effort
                 # 串话过滤。
+                # v0.3.5:同样透传 expected_remote_task_ids(若调用方有)。
                 result = parse_creation_result(
                     chain["data"],
                     expected_local_message_ids=expected_local_message_ids,
+                    expected_remote_task_ids=expected_remote_task_ids,
                 )
                 if result:
                     update(status="resolving", **result)
@@ -1834,6 +1892,7 @@ class PlaywrightVideoRunner:
         *,
         use_real_browser: bool = True,
         expected_local_message_ids: set[str] | None = None,
+        expected_remote_task_ids: set[str] | None = None,
     ) -> dict[str, str]:
         """v0.3.2:run() 的 submit + poll 切片,被 retry loop 复用。
 
@@ -1850,6 +1909,10 @@ class PlaywrightVideoRunner:
         v0.3.3:`expected_local_message_ids` —— 本任务 submit 时用过的
         local_message_id 集合(t2v 1 个,i2v 2 个)。不传 → 退回到旧行为
         (envelope 上有 id 也走 fall through,即 race 防御关闭)。
+
+        v0.3.5:`expected_remote_task_ids` —— submit 时抽到的服务端
+        `creation.id`(=remote_task_id)。在 chain response 里 `creation.id`
+        命中这一集合是**最强证据**(`parse_creation_result` 优先级 1)。
         """
         if use_real_browser:
             # v0.3.2:UI click → /chat/completion 响应 → parse_sse_ack。
@@ -1869,12 +1932,17 @@ class PlaywrightVideoRunner:
             # Python 侧拿不到,只能从 server echo 的 SSE_ACK payload 里抽。
             # 调用方没传 expected → 用 ack 里抓到的 id(若 ack 里也抓不到
             # 就退化为 None = race 防御关闭,不阻塞正常任务)。
-            if expected_local_message_ids is None:
-                ack_payload = ack_state.get("ack_payload")
-                if isinstance(ack_payload, dict):
+            ack_payload = ack_state.get("ack_payload")
+            if isinstance(ack_payload, dict):
+                if expected_local_message_ids is None:
                     extracted = _extract_local_message_ids_from_ack_payload(ack_payload)
                     if extracted:
                         expected_local_message_ids = extracted
+                # v0.3.5:同理从 ack 抽服务端 creation.id(=remote_task_id)
+                if expected_remote_task_ids is None:
+                    extracted_remote = _extract_remote_task_ids_from_ack_payload(ack_payload)
+                    if extracted_remote:
+                        expected_remote_task_ids = extracted_remote
             update(status="generating", **ack)
         else:
             # 原 fetch 路径完整保留 —— 测试 + 回滚兜底
@@ -1916,6 +1984,16 @@ class PlaywrightVideoRunner:
                         ids.add(mm_lm)
                 if ids:
                     expected_local_message_ids = ids
+            # v0.3.5:fetch 路径同样尝试从 ack 抽服务端 creation.id,优先
+            # 用 ack_payload,字段缺失就保持 None(走 expected_local + cooldown
+            # 兜底)。python-side 的 SSE 解析跟浏览器 UI 路径共用同一个
+            # ack_payload 来源(_parse_sse_ack_payload_from_text)。
+            if isinstance(response.get("text"), str):
+                ack_payload = _parse_sse_ack_payload_from_text(response["text"])
+                if isinstance(ack_payload, dict) and expected_remote_task_ids is None:
+                    extracted_remote = _extract_remote_task_ids_from_ack_payload(ack_payload)
+                    if extracted_remote:
+                        expected_remote_task_ids = extracted_remote
             update(status="generating", **ack)
 
         deadline = time.monotonic() + self.timeout
@@ -1943,9 +2021,13 @@ class PlaywrightVideoRunner:
             # 塞给 A2 的 chain response。expected_local_message_ids 把本任务
             # submit 时用过的 id 喂给 parse_creation_result,串话的 creation
             # 没有匹配的 id 会被跳过 → 继续 poll 直到拿到自己的。
+            # v0.3.5:新增 expected_remote_task_ids,服务端 creation.id 命中是
+            # 优先级 1 强证据(envelope 命中是优先级 2)。两个都为 None 时退化为
+            # 完全向后兼容(无 race 防御)。
             result = parse_creation_result(
                 chain["data"],
                 expected_local_message_ids=expected_local_message_ids,
+                expected_remote_task_ids=expected_remote_task_ids,
             )
             if result:
                 update(status="resolving", **result)

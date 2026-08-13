@@ -2,6 +2,97 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.3.5 - 2026-08-13
+
+**修复 v0.3.4.1 兜底接受 A1/A3 后,后续 race 窗口里 A1/A3 又被 A2/A4 拿到 → A2/A4 任务文件被覆盖。**
+
+### 为什么做
+
+v0.3.4.1 把 race 串话改成了"两阶段扫描 + 兜底接受 candidates[0] + WARNING"。但用户实测继续发现:
+
+> 「A2/A4 的任务跑出来结果都是 A1/A3 的视频,A2/A4 的 prompt 文件根本没存下来。」
+
+DB 验证:`remote_task_id` / `vid` / `result_url` 写入了 A2/A4 行,但值跟 A1/A3 完全相同。竞态序列:
+
+```
+T+0s   A1 submit, ack 拿到 creation.id="task-A1"
+T+1s   A2 submit, ack 拿到 creation.id="task-A2"
+T+30s  A1 真正生成好,服务端 chain response 带 task-A1
+       → A1 worker 拿到自己的,完成 ✅
+T+45s  A2 真正生成好,服务端 chain response **带 task-A1**(同 conversation 上下文串话)
+       → A2 worker 跑 parse_creation_result:
+         expected_local_message_ids = {"msg-A2"}
+         envelope 上 = {"msg-A1"} → envelope ∩ expected = ∅ → 走 candidates 兜底
+         candidates[0] = task-A1 → A2 收到 A1 的视频 ❌
+```
+
+v0.3.4.1 已经 accept 过的 task-A1 又被当作 candidates,第二个 worker 拿到就覆盖自己文件。
+
+### 真根因
+
+v0.3.4.1 candidates 兜底**没有去重 + 没有 cooldown** —— race 窗口里同 conversation 上下文的另一个 task 一旦拿到合法 creation,就立即当 candidates[0] accept,覆盖正在跑的本任务。
+
+字节 server 端 SSE_ACK 不一定 echo `creation.id`(字段名漂移),所以单纯靠 `expected_remote_task_ids` 也兜不住所有 race —— 还必须:
+
+1. **服务端 creation.id 强匹配**(优先级 1):浏览器 UI 路径从 SSE_ACK payload 抽 `remote_task_id` / `task_id` / `creation_id`(多位置 fallback);fetch 路径从响应 ack 抽。
+2. **envelope id 匹配**(优先级 2):v0.3.4.1 已有。
+3. **兜底 cooldown 30s + 全局 dedup**(优先级 3):
+   - candidates 必须**首次出现 ≥30s** 才允许 accept(防止把别人刚 submit 的当自己的)
+   - 已经 accept 过的 creation.id 加入 module-level `_seen_remote_task_ids`,后续 poll 再见到就跳过(防止 race 把同视频二次分发)
+
+### 改动
+
+**1. `src/doupool/video/protocol.py:parse_creation_result` —— 三层优先级 + cooldown + dedup**
+
+新参数 `expected_remote_task_ids: set[str] | None = None`(submit 时抽到的服务端 creation.id 集合)。三层分类:
+
+- 优先级 1 `matches_remote`:creation.id ∈ expected_remote_task_ids —— 直接 return(不打 WARNING)
+- 优先级 2 `matches_local`:envelope ∩ expected_local_message_ids ≠ ∅ —— 直接 return(不打 WARNING)
+- 兜底 `candidates`:candidates 必须存在 ≥ `_FALLBACK_COOLDOWN_S = 30s` 且未在 `_seen_remote_task_ids` 才 accept —— 打 v0.3.5 WARNING
+
+新 module-level 状态:
+- `_seen_remote_task_ids: set[str]` —— 已 accept 过的 creation.id,后续跳过
+- `_candidate_first_seen: dict[str, float]` —— 首次出现的 monotonic 时间戳,用于 cooldown 判定
+- `_FALLBACK_COOLDOWN_S = 30.0` —— 兜底阈值
+
+向后兼容:两个 expected 都 None → 走原 v0.3.2.5 路径(无 race 防御)。
+
+**2. `src/doupool/video/browser.py:_submit_and_poll` —— 抽 expected_remote_task_ids**
+
+新 helper `_extract_remote_task_ids_from_ack_payload(ack_payload)`,从 SSE_ACK payload 的以下位置宽口径抽 `remote_task_id` / `task_id` / `creation_id`:
+- 顶层
+- `ack_client_meta` 子树
+- `query_list[].*`
+
+UI click 路径(`use_real_browser=True`)从 `_ack_interceptor` 缓存的 ack_payload 抽,fetch 路径(`use_real_browser=False`)从 response["text"] 抽。抽不到 → 保持 None,走 expected_local + cooldown 兜底(best-effort)。
+
+`recheck_result` 也加 `expected_remote_task_ids` 参数透传。
+
+**3. `tests/test_video_protocol.py` —— 6 个新 case**
+
+- `test_parse_creation_result_priority_remote_over_envelope` —— 优先级 1 > 2
+- `test_parse_creation_result_priority_envelope_over_fallback` —— 优先级 2 > 3
+- `test_parse_creation_result_fallback_blocked_by_cooldown` —— cooldown 未过返 None
+- `test_parse_creation_result_fallback_accepted_after_cooldown` —— cooldown 过后 accept + WARNING + dedup
+- `test_parse_creation_result_dedup_skips_already_seen` —— dedup 命中跳过
+- `test_parse_creation_result_no_match_returns_none` —— 无合法 creation 返 None
+- (附)`test_parse_creation_result_no_expected_still_accepts_any_creation` —— 向后兼容
+
+测试用 `autouse fixture` 清 module-level `_seen_remote_task_ids` + `_candidate_first_seen`,保证 isolation。
+
+### 契约不变
+
+- `parse_creation_result(response)` 不传 expected → 完全向后兼容(老调用方零修改)
+- `parse_creation_result(response, expected_local_message_ids=set)` 不传 expected_remote_task_ids → 退化为 v0.3.4.1 两阶段行为
+- 优先级 1 + 2 命中路径不打 WARNING(避免刷屏,正常路径)
+- policy 关键词扫描(rejected)路径不变
+
+### 已知限制
+
+- `_seen_remote_task_ids` / `_candidate_first_seen` 是进程级全局 set/dict,长跑(>1000 unique task)会有少量内存增长,可忽略
+- 30s cooldown 是启发式,极端 race(<30s 内 race + cooldown 后无 candidates)仍可能 hang 到 timeout(10min default)
+- `_extract_remote_task_ids_from_ack_payload` 假设服务端 echo `remote_task_id` / `task_id` / `creation_id` 之一;如果字节未来完全移除这些字段,会退化为 v0.3.4.1 行为(只剩 cooldown + dedup)
+
 ## v0.3.4.1 - 2026-08-13
 
 **修复 v0.3.4 poll 循环恢复正常后,v0.3.3 race 防御过激 → 4 条视频生成好仍 timeout。**

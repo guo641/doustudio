@@ -15,6 +15,25 @@ from doupool.prompt_reviser import _POLICY_PATTERNS
 _LOGGER = logging.getLogger(__name__)
 
 
+# v0.3.5:跨任务 fallback dedup —— module-level set,key 是 creation.id
+# (=remote_task_id,见 L528)。兜底 accept 时同步加入,避免下一次 poll 又
+# 拿到同一个 id 又被当成 candidates。生命周期跟进程一致(playwright runner
+# 是长生命周期),不会越攒越大,因为生产环境每任务 unique creation.id。
+_seen_remote_task_ids: set[str] = set()
+
+# v0.3.5:candidate 首次出现时间戳。用于判断 30s cooldown 是否过 —— 用
+# monotonic clock,跟之前 DEBUG 日志一致。
+_candidate_first_seen: dict[str, float] = {}
+
+# v0.3.5:兜底 cooldown 30s。超过这个时间窗仍匹配不上 expected 才允许
+# candidates 兜底 accept,避免一收到 chain response 立即拿错 creation。
+# 设计依据:A1 submit 后,A2 submit 在 30s 内完成,A2 的 chain response 几乎
+# 立刻拿到 → 此时距离 A1 submit 还在 30s 内,如果先到的是 A1,A2 不会误判;
+# 反过来,如果先到的是别人刚 submit 的 creation(同 conversation),30s 内
+# 不接,等自家 creation 出来。
+_FALLBACK_COOLDOWN_S = 30.0
+
+
 MODELS = {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}
 RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}
 # v0.2.29:豆包接受任意整数 4..10 秒时长,放宽白名单(原 {5,10} 太严)。
@@ -457,6 +476,7 @@ def parse_creation_result(
     response: dict,
     *,
     expected_local_message_ids: set[str] | None = None,
+    expected_remote_task_ids: set[str] | None = None,
 ) -> dict[str, str] | None:
     """从 chain 响应里解析视频生成结果。
 
@@ -493,6 +513,21 @@ def parse_creation_result(
       已成功。这是字节 SSE_ACK / chain response 之间 id 命名不一致导致的(ACK
       透传浏览器 crypto.randomUUID,chain response 用服务端内部 id)。WARNING 留下
       现场,后续可观测服务端 id 漂移频率。
+
+    v0.3.5 三层优先级 + 兜底 cooldown + dedup:
+    - 新参数 `expected_remote_task_ids`:submit 时抽到的服务端 creation.id 集合
+      (浏览器 UI 路径下从 SSE_ACK payload / fetch 路径下从响应 envelope 上抽)。
+      creation.id 命中这一集合是**最强证据**(服务端返回的就是我们 submit 的)。
+    - 三层分类:
+      * `matches_remote`:creation.id ∈ expected_remote_task_ids —— 优先级 1
+      * `matches_local`:envelope ∩ expected_local_message_ids ≠ ∅ —— 优先级 2
+      * `candidates`:合法 creation,但既不命中 expected_remote_task_ids,
+        envelope 也没匹配 expected_local_message_ids
+    - 兜底 cooldown 30s:candidates 必须存在 ≥ 30s 才允许 accept,避免
+      早返回把别人刚 submit 的 creation 当成我们自己的。
+    - 全局 dedup `_seen_remote_task_ids`:已经 accept 过的 creation.id,
+      下一次 poll 见到就跳过(防止 fallback 路径重复 deliver 同一视频)。
+    - 优先级 1 > 优先级 2 > 兜底(cooldown + dedup 后)。
     """
     messages = response.get("downlink_body", {}).get("pull_singe_chain_downlink_body", {}).get("messages", [])
 
@@ -512,9 +547,12 @@ def parse_creation_result(
         except (TypeError, json.JSONDecodeError):
             decoded_blocks.append([])
 
-    # v0.3.4.1:成功块扫描 —— 两阶段,先收集再决策,避免单遍扫描中 race 防御
-    # 一票否决全部 creation(用户的"生成成功但仍卡生成中"真根因)。
-    matches: list[dict] = []
+    # v0.3.5:成功块扫描 —— 三层分类,优先级 matches_remote > matches_local >
+    # candidates(兜底 cooldown + dedup)。
+    # 兼容性 fallback 列表:满足 v0.3.3「字段缺失 fall through」或 v0.3.4.1
+    # 「envelope drift 立即 accept」语义,直接进 matches_local 不走 cooldown。
+    matches_remote: list[dict] = []
+    matches_local: list[dict] = []
     candidates: list[tuple[set[str], dict]] = []
     for blocks, envelope_ids in zip(decoded_blocks, envelope_id_sets):
         for block in blocks:
@@ -524,43 +562,115 @@ def parse_creation_result(
                 if not (video.get("status") == 3 and video.get("download_url")):
                     # 非法 creation(还在生成中 / 失败 / 缺 URL)→ 不参与分类
                     continue
+                creation_id = str(creation.get("id", ""))
                 payload = {
-                    "remote_task_id": str(creation.get("id", "")),
+                    "remote_task_id": creation_id,
                     "vid": str(video.get("vid", "")),
                     "fallback_result_url": video["download_url"],
                     "cover_url": video.get("cover", {}).get("image_thumb", {}).get("url", ""),
                 }
-                # 三分类:
-                # - expected=None(v0.3.2.5 调用方):不做 race 防御,所有合法 creation
-                #   直接进 matches —— 完全向后兼容。
-                # - envelope ∩ expected ≠ ∅:强匹配,进 matches。
-                # - 其他(envelope 上 id 缺失 / 与 expected 不相交):兜底,进 candidates
-                #   触发 WARNING。
-                if expected_local_message_ids is None:
-                    matches.append(payload)
-                elif envelope_ids and not envelope_ids.isdisjoint(expected_local_message_ids):
-                    matches.append(payload)
+                # v0.3.5 三层优先级:
+                # - 两 expected 都 None(v0.3.2.5 调用方,完全向后兼容):不做 race
+                #   防御,所有合法 creation 进 matches_local,旧行为保留。
+                # - 优先级 1:creation.id ∈ expected_remote_task_ids → matches_remote
+                # - 优先级 2:envelope ∩ expected_local_message_ids ≠ ∅ →
+                #   matches_local(只在传了 expected_local_message_ids 时检查)
+                # - v0.3.3 「字段缺失」fall through:envelope 上没 id 字段 且
+                #   expected_local_message_ids 非空集合(空集合 ≠ None → 不算
+                #   「字段缺失兜底」,是调用方明确 opt-in 进 race 防御) →
+                #   matches_local。
+                # - 兜底 candidates(后续 30s cooldown + dedup 才允许 accept)
+                if (
+                    expected_remote_task_ids is None
+                    and expected_local_message_ids is None
+                ):
+                    # v0.3.2.5 完全向后兼容:不做 race 防御,直接接受。
+                    matches_local.append(payload)
+                elif (
+                    expected_remote_task_ids is not None
+                    and creation_id
+                    and creation_id in expected_remote_task_ids
+                ):
+                    matches_remote.append(payload)
+                elif (
+                    expected_local_message_ids is not None
+                    and envelope_ids
+                    and not envelope_ids.isdisjoint(expected_local_message_ids)
+                ):
+                    matches_local.append(payload)
+                elif (
+                    expected_local_message_ids is not None
+                    and expected_local_message_ids  # 必须是「非空集合」才认作字段缺失兜底
+                    and not envelope_ids
+                ):
+                    # v0.3.3:服务端没带 envelope id → fall through,不强匹配
+                    # (字段缺失是字节版本差异,不是 race)。调用方 expected_local
+                    # 是非空集合时才 fall through;空集合是显式 opt-in,要走 cooldown。
+                    matches_local.append(payload)
                 else:
                     candidates.append((envelope_ids, payload))
 
-    if matches:
-        return matches[0]
-    if candidates and expected_local_message_ids is not None:
-        # v0.3.4.1 WARNING:服务端 envelope id 与客户端 expected 不匹配但 creation
-        # 已成功 → 兜底接受 candidates[0]。这是字节 SSE_ACK ↔ chain response
-        # id 命名不一致(id drift)的已知症状。
-        drift_envelope_ids, drift_payload = candidates[0]
-        _LOGGER.warning(
-            "v0.3.4.1 race 防御兜底:envelope id 与 expected 不匹配但 creation 已成功,"
-            " accept candidates[0]。candidates=%d, expected=%d, "
-            "drift_envelope_ids=%s, drift_creation_id=%s, drift_vid=%s",
-            len(candidates),
-            len(expected_local_message_ids),
-            sorted(drift_envelope_ids),
-            drift_payload.get("remote_task_id", ""),
-            drift_payload.get("vid", ""),
-        )
-        return drift_payload
+    # v0.3.5:优先级 1 命中 → 直接 return,不打 WARNING(强证据)。
+    if matches_remote:
+        # 把命中 id 加进 dedup set,避免同一 task 后续 poll 又被当 fallback。
+        for m in matches_remote:
+            _seen_remote_task_ids.add(m["remote_task_id"])
+        return matches_remote[0]
+
+    # v0.3.5:优先级 2 命中 → 直接 return,不打 WARNING(envelope 匹配足以
+    # 证明是我们 submit 的)。
+    # 注意:完全向后兼容路径(expected 都 None)不要写入 _seen_remote_task_ids,
+    # 否则会破坏既有调用方的 dedup 假设。
+    if matches_local:
+        if (
+            expected_remote_task_ids is not None
+            or expected_local_message_ids is not None
+        ):
+            for m in matches_local:
+                _seen_remote_task_ids.add(m["remote_task_id"])
+        return matches_local[0]
+
+    # v0.3.5:兜底 candidates —— 30s cooldown + 全局 dedup。
+    if candidates and (
+        expected_remote_task_ids is not None
+        or expected_local_message_ids is not None
+    ):
+        now = time.monotonic()
+        accepted_envelope_ids: set[str] = set()
+        accepted_payload: dict | None = None
+        # 跟踪 cooldown 最早出现的 candidate 时间(用于打 WARNING 时记录
+        # 实际等多久才接受)。
+        earliest_first_seen = now
+        for envelope_ids, payload in candidates:
+            cid = payload["remote_task_id"]
+            if cid in _seen_remote_task_ids:
+                # 已接受过,跳过(防止重复 deliver 同一视频)
+                continue
+            first_seen = _candidate_first_seen.setdefault(cid, now)
+            earliest_first_seen = min(earliest_first_seen, first_seen)
+            if now - first_seen < _FALLBACK_COOLDOWN_S:
+                # 还没过 30s,等下一轮 poll
+                continue
+            accepted_envelope_ids = envelope_ids
+            accepted_payload = payload
+            break
+
+        if accepted_payload is not None:
+            _seen_remote_task_ids.add(accepted_payload["remote_task_id"])
+            _LOGGER.warning(
+                "v0.3.5 race 防御兜底:30s cooldown 后仍未命中 expected_remote_task_ids "
+                "/ expected_local_message_ids, accept candidates[0]。candidates=%d, "
+                "expected_remote=%d, expected_local=%d, drift_envelope_ids=%s, "
+                "drift_creation_id=%s, drift_vid=%s, cooldown_elapsed=%.1fs",
+                len(candidates),
+                len(expected_remote_task_ids) if expected_remote_task_ids else 0,
+                len(expected_local_message_ids) if expected_local_message_ids else 0,
+                sorted(accepted_envelope_ids),
+                accepted_payload.get("remote_task_id", ""),
+                accepted_payload.get("vid", ""),
+                now - earliest_first_seen,
+            )
+            return accepted_payload
 
     # 2. v0.2.21:policy 关键词兜底扫描 — 任意 block 含「侵权|违规|换个主题|无法
     # 返回该内容|sensitive content」等关键词 → 抛 rejected,service 层立即 failed。
