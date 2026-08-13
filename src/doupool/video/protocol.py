@@ -31,7 +31,13 @@ _candidate_first_seen: dict[str, float] = {}
 # 立刻拿到 → 此时距离 A1 submit 还在 30s 内,如果先到的是 A1,A2 不会误判;
 # 反过来,如果先到的是别人刚 submit 的 creation(同 conversation),30s 内
 # 不接,等自家 creation 出来。
-_FALLBACK_COOLDOWN_S = 30.0
+# v0.3.5.1:实测 30s 太长 —— 同账号 4 条并发场景下,3 条 cooldown 兜底 elapsed
+# 38.2s / 37.9s / 37.9s(几乎全卡满 30s 才识别到),视频生成 30s 前就完成,
+# 用户体感「成功好久了才识别到」。5s 仍能挡住 race 窗口(2 个并发任务 submit
+# 间隔通常 < 5s,但 A1 chain response 通常需要 5-10s 才到客户端),
+# 配合 matches_remote + matches_local 两层强匹配兜底足够。失败时 candidates
+# 始终空 → 走 5min chain 超时报「视频生成超时」(沿用既有兜底)。
+_FALLBACK_COOLDOWN_S = 5.0
 
 
 MODELS = {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}
