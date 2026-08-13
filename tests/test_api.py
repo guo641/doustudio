@@ -1883,23 +1883,34 @@ def _seed_grouped_tasks(repository, group_id: str, count: int = 3):
 # ---------- v0.2.35:批量下载命名 —— 单条任务 download_filename 字段 ----------
 class _FakeTaskForFilename:
     """最小 _build_download_filename 鸭子类型:只读 prompt / created_at /
-    group_index / clean_video_url,无需 DB 实例。"""
+    group_index / clean_video_url / id,无需 DB 实例。"""
 
     def __init__(self, *, prompt: str, group_index: int = 0,
-                 created_at=None, clean_video_url: str | None = None):
+                 created_at=None, clean_video_url: str | None = None,
+                 id=None):
         from datetime import datetime as _dt
+        import hashlib as _h
         self.prompt = prompt
         self.group_index = group_index
         self.created_at = created_at or _dt(2026, 1, 2, 13, 51, 45)
         self.clean_video_url = clean_video_url
+        # 默认 id 用 prompt+group+ts 拼一个稳定串,这样不同 fixture
+        # 自动产生不同 hash,无需手填 UUID
+        self.id = id if id is not None else f"fake-{prompt}-{group_index}-{self.created_at.isoformat()}"
+
+
+def _expected_hash(task) -> str:
+    """根据 task.id 计算 SHA1 前 8 字符(跟 _build_download_filename 内部保持一致)。"""
+    import hashlib as _h
+    return _h.sha1(str(task.id).encode("utf-8", errors="replace")).hexdigest()[:8]
 
 
 def test_build_download_filename_format_basic():
-    """v0.2.35:基础格式 `{group_index:02d}_{HHMMSS}_{prompt前12字符}.mp4`"""
+    """v0.2.35:基础格式 `{group_index:02d}_{HHMMSS}_{prompt前12字符}_{id_hash}.mp4`"""
     from doupool.api.app import _build_download_filename
     task = _FakeTaskForFilename(prompt="猫在草地上跑", group_index=1)
     fn = _build_download_filename(task)
-    assert fn == "01_135145_猫在草地上跑.mp4"
+    assert fn == f"01_135145_猫在草地上跑_{_expected_hash(task)}.mp4"
 
 
 def test_build_download_filename_truncates_long_prompt():
@@ -1909,12 +1920,14 @@ def test_build_download_filename_truncates_long_prompt():
     assert len(long_prompt) > 12  # 确认测试本身在跑长字符串分支
     task = _FakeTaskForFilename(prompt=long_prompt, group_index=3)
     fn = _build_download_filename(task)
-    # 文件名 stem 部分 = `03_135145_` + prompt前 12 字符(Windows 文件名 max_len)
-    name_part = fn.removesuffix(".mp4").removeprefix("03_135145_")
-    assert len(name_part) == 12
-    assert name_part == long_prompt[:12]
+    # 文件名 stem 部分 = `03_135145_` + prompt前 12 字符 + _ + id_hash(8)
+    stem = fn.removesuffix(".mp4")
+    expected_hash = _expected_hash(task)
+    name_part = stem.removeprefix("03_135145_")
+    # 前 12 字符是 prompt 截断,后 8 字符是 hash,中间用 `_` 隔开
+    assert name_part == f"{long_prompt[:12]}_{expected_hash}"
     # 完整文件名格式校验
-    assert fn.startswith("03_135145_") and fn.endswith(".mp4")
+    assert fn.startswith("03_135145_") and fn.endswith(f"_{expected_hash}.mp4")
 
 
 def test_build_download_filename_sanitizes_illegal_chars():
@@ -1925,7 +1938,7 @@ def test_build_download_filename_sanitizes_illegal_chars():
     # 直接验证 sanitize 行为
     sanitized = _sanitize_filename_part('a/b\\c:d*e')
     assert sanitized == "a_b_c_d_e"
-    assert fn == "05_135145_a_b_c_d_e.mp4"
+    assert fn == f"05_135145_a_b_c_d_e_{_expected_hash(task)}.mp4"
 
 
 def test_build_download_filename_appends_clean_when_present():
@@ -1933,7 +1946,7 @@ def test_build_download_filename_appends_clean_when_present():
     from doupool.api.app import _build_download_filename
     task = _FakeTaskForFilename(prompt="猫", group_index=2, clean_video_url="https://x.test/clean.mp4")
     fn = _build_download_filename(task)
-    assert fn == "02_135145_猫-clean.mp4"
+    assert fn == f"02_135145_猫_{_expected_hash(task)}-clean.mp4"
 
 
 def test_build_download_filename_handles_empty_prompt():
@@ -1941,7 +1954,7 @@ def test_build_download_filename_handles_empty_prompt():
     from doupool.api.app import _build_download_filename
     task = _FakeTaskForFilename(prompt="", group_index=0)
     fn = _build_download_filename(task)
-    assert fn == "00_135145_video.mp4"
+    assert fn == f"00_135145_video_{_expected_hash(task)}.mp4"
 
 
 def test_build_download_filename_zero_group_index_for_single_task():
@@ -1949,7 +1962,37 @@ def test_build_download_filename_zero_group_index_for_single_task():
     from doupool.api.app import _build_download_filename
     task = _FakeTaskForFilename(prompt="单独的任务", group_index=0)
     fn = _build_download_filename(task)
-    assert fn == "00_135145_单独的任务.mp4"
+    assert fn == f"00_135145_单独的任务_{_expected_hash(task)}.mp4"
+
+
+def test_build_download_filename_dedup_by_task_id_hash():
+    """v0.3.3:同 prompt + 同 group_index + 同秒 → task_id 不同 → 文件名不撞。
+
+    这是 race 防御的次生防线:即使 parse_creation_result race 防御漏过,DB
+    两条都拿到错 URL,本文件名 hash 也能让 group_download 时本地落盘
+    两个文件不互相覆盖,用户在视觉上能看到「确实有两条」。
+    """
+    from datetime import datetime as _dt
+    from doupool.api.app import _build_download_filename
+
+    same_when = _dt(2026, 8, 13, 10, 30, 45)
+    # 同样的 prompt + group_index + 创建时间,只 task.id 不同
+    task1 = _FakeTaskForFilename(
+        prompt="同样的 prompt", group_index=0, created_at=same_when,
+        id="uuid-aaaa-bbbb-cccc-dddd-eeee-ffff",
+    )
+    task2 = _FakeTaskForFilename(
+        prompt="同样的 prompt", group_index=0, created_at=same_when,
+        id="uuid-1111-2222-3333-4444-5555-6666",
+    )
+    name1 = _build_download_filename(task1)
+    name2 = _build_download_filename(task2)
+    assert name1 != name2, f"v0.3.3 race 防御次生防线失败:{name1} == {name2}"
+    # hash 是 8 字符 hex
+    h1 = name1.removesuffix(".mp4").split("_")[-1]
+    h2 = name2.removesuffix(".mp4").split("_")[-1]
+    assert len(h1) == 8 and len(h2) == 8
+    assert h1 != h2
 
 
 def test_group_download_streams_all_videos(repository, tmp_path, database_manager, monkeypatch):
@@ -1979,11 +2022,14 @@ def test_group_download_streams_all_videos(repository, tmp_path, database_manage
     saved_dir = Path(body["saved_dir"])
     assert saved_dir.exists()
     assert saved_dir.name.startswith("abcdef12_")  # {group_id 前 8 位}_{HHMMSS}
-    # v0.2.35:批量下载命名 —— 文件名格式 `{group_index:02d}_{HHMMSS}_{prompt前12字符}.mp4`
-    # 测试任务的 prompt 是 "段1/段2/段3"(≤12 字符,无需截断),所以期望形如
-    # `01_HHMMSS_段1.mp4`。我们只断言文件名后缀 `{prompt}.mp4`,前缀用 glob 模糊匹配。
+    # v0.2.35 + v0.3.3:批量下载命名 —— 文件名格式
+    # `{group_index:02d}_{HHMMSS}_{prompt前12字符}_{task_id短哈希}.mp4`
+    # v0.3.3 加 SHA1 后缀避免同 group_index + 同秒撞名。测试任务的 prompt 是
+    # "段1/段2/段3"(≤12 字符,无需截断),所以期望形如
+    # `01_HHMMSS_段1_<8位hash>.mp4`。我们只断言文件名后缀 `_段{N}.mp4`,
+    # 前缀用 glob 模糊匹配(hash 用 `[0-9a-f]×8` 收窄)。
     for i, tid in enumerate(task_ids, 1):
-        matches = list(saved_dir.glob(f"??_*_段{i}.mp4"))
+        matches = list(saved_dir.glob(f"??_*_段{i}_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].mp4"))
         assert len(matches) == 1, f"期望恰好 1 个匹配 段{i} 的 mp4,实际 {matches}"
         fp = matches[0]
         assert fp.read_bytes() == f"video-{i}".encode()

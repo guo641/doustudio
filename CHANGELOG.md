@@ -2,6 +2,241 @@
 
 本文件记录 DouStudio 的重要功能变化。
 
+## v0.3.4.1 - 2026-08-13
+
+**修复 v0.3.4 poll 循环恢复正常后,v0.3.3 race 防御过激 → 4 条视频生成好仍 timeout。**
+
+### 为什么做
+
+v0.3.4 修好 poll 循环的 aegis 探测盲区后,用户实测再发现:
+
+> 「傻逼玩意,你真的给我修复了吗?4 条视频全部生成好了,你还卡在生成中,
+> 我问你,你是读取不到生成成功的数据吗?」
+
+DB 验证:4 条任务都跑到 `default_timeout_minutes=10` 才标 `status='failed'` +
+`error_message='视频生成超时'`,**`remote_task_id` / `vid` / `result_url` 全 NULL**
+—— 客户端根本没把服务端已经成功的 creation 拿回来。
+
+### 真根因
+
+v0.3.3 race 防御代码过激:
+
+```python
+for blocks, envelope_ids in zip(decoded_blocks, envelope_id_sets):
+    for creation in creations:
+        if video.status == 3 and video.download_url:
+            if (
+                expected_local_message_ids is not None
+                and envelope_ids
+                and envelope_ids.isdisjoint(expected_local_message_ids)
+            ):
+                continue  # ← 一票否决,跳过整个 envelope
+```
+
+字节 SSE_ACK 透传浏览器 `crypto.randomUUID()` 生成的 id,chain response
+却用服务端内部 id 命名。两者不一致时,envelope id 不在 `expected` 集合 → v0.3.3
+**一遇到就跳过**,所有合法 creation 都被一票否决 → 永远拿不到 vid → poll 至
+timeout。
+
+### 改动
+
+`src/doupool/video/protocol.py:parse_creation_result` —— **两阶段扫描**取代单遍
+continue 防御:
+
+1. **第一遍**:扫所有 creation 三分类
+   - `matches`:envelope ∩ expected ≠ ∅ 且 creation 合法(强匹配,首选)
+   - `candidates`:envelope 与 expected 不相交但 creation 合法(兜底)
+   - 非法 creation(status≠3 / 无 download_url)直接丢
+2. **决策**:
+   - `matches` 非空 → 返回 `matches[0]`
+   - elif `expected` 非空且 `candidates` 非空 → **WARNING log** + 返回 `candidates[0]`
+   - 都没有 → 走兜底 policy 关键词扫描(原有 rejected 检测)
+3. **WARNING 内容**:candidates 数 / expected 数 / drift envelope ids / drift creation id
+   / drift vid —— 便于观测字节 SSE_ACK ↔ chain response id 漂移频率
+4. **保留行为**:`expected_local_message_ids=None` 时完全向后兼容(v0.3.2.5 +
+   v0.3.3 旧测试零修改);envelope 上 id 字段缺失 → 走 candidates 兜底(等同 v0.3.3
+   "字段缺失 fall through")
+
+### 契约不变
+
+- `_submit_and_poll` 签名零变化 → browser.py 完全不动
+- `parse_creation_result(response, *, expected_local_message_ids=None)` 签名零变化
+- SSE 拒绝检测 / `_resolve_original_download` / DB 写库路径 / 前端 全部不动
+
+### 测试
+
+| 文件 | 新增 case |
+|---|---|
+| `tests/test_video_protocol.py` | 5 个新 case + 1 个改写:relax_when_drift / prefer_matching_over_drift / returns_none_when_no_valid_creation / logs_warning_on_drift_fallthrough / no_warning_when_explicit_match + 改写原 returns_none_when_no_creation_matches → 反映新语义 |
+
+5 个 v0.3.3 旧 case 保留(matches 强匹配、None 向后兼容、字段缺失 fall through、
+message_id 字段名 fallback、envelope id 命中)。
+
+### 不做的事
+
+- ❌ 改 `_submit_and_poll` / browser.py(签名不变就够)
+- ❌ 改 SSE 拒绝检测
+- ❌ 改 v0.3.4 poll 循环 aegis 探测逻辑
+- ❌ 改前端 / `_build_download_filename` / DB schema
+- ❌ bump 到 0.3.5(同 bug 复发的修复性变更,patch bump)
+
+## v0.3.4 - 2026-08-13
+
+**修复 poll 循环 aegis 探测被 cooldown 短路 → 30+ 分钟盲飞 → "卡生成中" 假死。**
+
+### 为什么做
+
+v0.3.3 修好 race 后,用户在生产环境再发现一个新问题(原话):
+
+> 「你真是个傻逼啊！我在后台看到视频已经生成成功了,你特么还卡在生成中!
+> 你是检测不到视频已经生成好了吗?」
+
+任务状态长期显示「生成中」,但后台浏览器页面其实已经跑完、链上能拿到 creation
+字段 —— 客户端根本没机会识别出来。
+
+### 真根因
+
+`_try_solve_captcha_in_video`(`browser.py:840`)在 poll 循环里负责 aegis 探测 +
+图鉴拖拽。但 `captcha/solver.py:_captcha_cooldown` 是 30 分钟模块级 cooldown 字典,
+**同 profile_dir 第一次返回「已冷却」后,后续 30 分钟内直接 short-circuit**,不再
+探 DOM、不再调图鉴、不再 raise。
+
+实际触发链路:
+
+1. submit 后 chain 第一次返 poll → `_handle_aegis_in_poll` 探测到 aegis → 调
+   `_try_solve_captcha_in_video` → 用户关了弹窗 / 凭证没配 / 网络抖 → 失败 →
+   **mark cooldown**(`solver.py:_captcha_mark_cooldown`)
+2. 之后 30 分钟内,即便 aegis 又冒出来(用户重新提交 / 网络恢复后 service 重新发起
+   poll),**`probe_aegis_quickly` 不被调**,`wait_for_timeout(35*60s)` 一次睡满 35 分钟
+3. 用户点开后台页面看到视频其实 5 分钟前就生成好了 → 但前端状态还是「生成中」
+4. 35 分钟后 `wait_for_timeout` 返回 → 抛「视频生成超时」→ 任务 failed → 退额度
+
+### 修复(4 处)
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 1 | `captcha/solver.py` | 新增 `probe_aegis_quickly(page)`:200ms `wait_for_selector` 看 aegis/verify/captcha/puzzle 容器,**不**走 cooldown、**不**调 `page.content()`、**不**扫 iframe。廉价,~30ms,任何时候都跑 |
+| 2 | `video/browser.py` | 新增 `_handle_aegis_in_poll(page, profile_dir, update)`:探测 → 查凭证 → 凭证不可用 → mark cooldown + `update(error_message=...)` → **`raise _AegisUnresolvableInPoll`**。**凭证可用才调 solver** |
+| 3 | `video/browser.py` | `_submit_and_poll` poll 循环 + `recheck_result` poll 循环:`wait_for_timeout(poll_interval)` 拆成 1s 段循环,每段先 `_probe_aegis_quickly`;探测到 aegis → 调 `_handle_aegis_in_poll`;凭证不可用 → **`raise _AegisUnresolvableInPoll`**,任务立刻 fail,不再盲飞 |
+| 4 | `video/browser.py` | probe 在 wait 段里抛异常(典型:`TargetClosedError`,page 被用户关掉)→ 只 break 出内层 wait,**不** propagate 到外层 → 上层 `finally` 还能正常 `page.close()`(避免 anchor page 泄漏导致 v0.2.26 那种 context 崩溃) |
+
+### 设计决策
+
+- **`probe_aegis_quickly` 不走 cooldown**:这是 fail-fast 信号源,必须总能探测,
+  否则 `_handle_aegis_in_poll` 永远拿不到入口。冷却只应该作用于「solve 失败」,不
+  应该作用于「detect」
+- **fail-fast 而不是 retry**:用户原话明确表达「视频已经生成好了,你检测不到」——
+  说明服务端 creation 已经存在但客户端没识别。这种情况再拖 35 分钟没有意义,
+  应该立刻 fail 让用户看到,而不是浪费配额
+- **凭证缺失时也 mark cooldown**:避免后续 30 分钟每次 poll 都重复「探测 → 查
+  凭证缺失」,浪费 CPU
+- **probe 异常不 propagate**:防止用户在生成期间关页面时,`finally` 里的
+  `page.close()` 被跳过,anchor page 残留导致下个 task 撞同 context 时崩(详见
+  v0.2.26 教训)
+- **`_AegisUnresolvableInPoll(RuntimeError)`**:子类型化,方便上层针对 aegis
+  阻塞做特殊提示(不是普通超时)
+
+### 契约不变
+
+- `_try_solve_captcha_in_video` 行为不变 —— 仍负责「solve 失败 → mark cooldown」
+- v0.3.3 race 防御(parse_creation_result envelope_id 过滤)完整保留
+- v0.3.2.5 shark_admin keepalive-solve-retry 逻辑完整保留
+- submit 前阻塞式 aegis 网关(`_pre_submit_aegis_gate`)完整保留
+- chain poll 频率、poll_interval、timeout 设置不变
+- _resolve_original_download 链路不变
+
+### 测试
+
+`tests/test_video_captcha_hook.py` + `tests/test_video_ui_submit.py` 新增 12 个 case:
+
+| 测试 | 验证 |
+|---|---|
+| `test_handle_aegis_in_poll_no_popup_returns_false` | probe=False → 返 False,无 solve,无 mark |
+| `test_handle_aegis_in_poll_popup_with_creds_calls_solver` | probe=True + creds OK → 调 solver,`wait_for_popup_seconds=0` |
+| `test_handle_aegis_in_poll_creds_disabled_raises_unresolvable` | probe=True + creds=None → 抛 unresolvable,mark cooldown,update |
+| `test_handle_aegis_in_poll_make_client_disabled_raises` | probe=True + creds OK + make_client 抛 AegisCaptchaDisabled → 包装为 unresolvable(`from exc` 链保留) |
+| `test_handle_aegis_in_poll_update_exception_does_not_swallow_fail_fast` | update 抛 → 仍抛 unresolvable |
+| `test_aegis_unresolvable_is_runtime_error` | `issubclass(_AegisUnresolvableInPoll, RuntimeError)` |
+| `test_probe_aegis_quickly_runs_even_when_in_cooldown` | cooldown 中 probe 仍跑 |
+| `test_probe_aegis_quickly_no_selector_returns_false` | TimeoutError → False |
+| `test_poll_loop_calls_handle_aegis_in_poll_each_iteration` | 每轮 poll 都调 `_handle_aegis_in_poll` |
+| `test_poll_loop_fails_fast_on_aegis_unresolvable` | 第 1 轮就抛 unresolvable,不是 35 分钟后 |
+| `test_poll_loop_segments_wait_into_1s_intervals` | `sleep(1)` 段循环,不是 `wait_for_timeout(大数)` |
+| `test_poll_loop_probe_exception_breaks_wait_not_loop` | probe 抛异常不 propagate,外层 finally 还能 close page |
+
+### 不做的事
+
+- ❌ 取消 cooldown 机制本身 —— solve 失败仍应 mark,避免对图鉴服务轰炸
+- ❌ 把 probe 加到 chain 请求 body 里(服务端 API 我们控制不了)
+- ❌ 改 v0.3.2.5 shark_admin 重提循环(已经能跑)
+- ❌ 改 v0.3.3 race 防御(已经能跑)
+- ❌ 改前端状态展示(任务状态机本身能正确响应 unresolvable → failed → quota refund)
+- ❌ 改 `_resolve_original_download`(与本 bug 无关)
+- ❌ bump 到 0.3.5 —— 是同 bug 域的修复,minor bump 到 0.3.4
+
+## v0.3.3 - 2026-08-13
+
+**修复同账号多任务并发下载拿到错视频 URL + 批量下载文件名撞名覆盖。**
+
+### 为什么做
+
+v0.3.2.5 解决 shark_admin 拒绝后浏览器被关卡死的 bug 后,用户复测发现新问题:
+
+> 「发现了一个问题,如果一个账号被分配了2个任务,视频生成完成后,下载下来的视频
+> 都是第一条提交的视频。比如A账号被分配了2个任务A1 A2,A在前B在后,这两个任务
+> 全部生成了,我去下载,下载下来的视频都是A1」
+
+根因有两层:
+
+1. **race 串话**:字节 `/im/chain/single` POST body 只用 `conversation_id` 查 chain,
+   客户端 `parse_creation_result` 也不校验 creation 是否属于本任务 submit 的 message。
+   同账号并发提交 A1/A2 时,字节在 race 窗口下可能把 A1 的 creation block 错塞
+   给 A2 的 chain response → A2 worker 拿到 A1 的 vid+download_url → A2 行
+   `result_url` 指向 A1
+2. **文件撞名**:`_build_download_filename` 在两条 task 都是 `group_index=0` + 同秒
+   提交时,文件名完全一致 → group_download 时后者覆盖前者,用户视觉只看到 1 个文件
+   (进一步误导「两条都拿到 A1」)
+
+### 改动
+
+- `src/doupool/video/protocol.py`:
+  - `parse_creation_result` 新增 `expected_local_message_ids: set[str] | None = None` 参数
+  - 成功块扫描时校验 envelope 上 `local_message_id` / `message_id` 是否在 expected
+    集合中;不在 → 跳过这个 envelope 继续 poll
+  - **None / 字段缺失 → fall through**(向后兼容,不阻塞正常生成)
+- `src/doupool/video/browser.py`:
+  - `_ack_interceptor` 拦截 `/chat/completion` SSE 响应,从 SSE_ACK payload 里抽
+    `local_message_id` / `message_id`
+  - `_submit_and_poll` 新增 `expected_local_message_ids` 参数(从 ack payload 或
+    fetch path payload 提取后透传给 `parse_creation_result`)
+  - `recheck_result` 同上(重 parse 路径不主动带 id,默认 None → 兜底走旧路径)
+- `src/doupool/api/app.py`:
+  - `_build_download_filename` 加 `task_id` 短哈希(8 字符 SHA1)后缀,避免
+    `group_index=0` + 同秒提交时文件名撞车
+
+### 契约不变
+
+- `parse_creation_result` 不传 expected 时行为完全兼容旧版 → 既有测试 0 修改
+- `_resolve_original_download` 不动 —— vid → AISpace 节点 → main_url 路径不变
+- ack 解析契约不变(3 字段全在)
+- service.py / chain poll 循环结构不变
+
+### 测试
+
+| 文件 | 新增 case |
+|---|---|
+| `tests/test_video_protocol.py` | race 防御 5 case(过滤命中 / 全不匹配返 None / None 兼容 / 字段缺失 fall through / `message_id` 字段名 fallback) |
+| `tests/test_api.py` | `_build_download_filename` 加 `task_id` 哈希(6 个原 case 同步更新 + 1 个新 case 验证去重) |
+
+### 不做的事
+
+- ❌ 改 v0.3.2.5 shark_admin keepalive-solve-retry 逻辑
+- ❌ 改 `CHAIN_SCRIPT`(服务端 API 不归我们改)
+- ❌ 改 `_resolve_original_download`(vid 找节点逻辑不变)
+- ❌ 改 service.py / repository.py 写库路径
+- ❌ 改前端
+- ❌ bump 到 0.3.4 —— 仍是同账号并发稳定性修复,minor bump 到 0.3.3
+
 ## v0.3.2.5 - 2026-08-13
 
 **修复 shark_admin 风控弹滑块场景下浏览器被立即关闭:服务端拒绝后保留浏览器 → 等滑块 → 图鉴拖 → 同 prompt 重提。**

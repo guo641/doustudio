@@ -146,6 +146,37 @@ async def _safe_inner_html(page: Page) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 廉价探测(poll 路径专用,不走 cooldown)
+# ---------------------------------------------------------------------------
+
+async def probe_aegis_quickly(page: Page) -> bool:
+    """v0.3.4:poll 循环专用廉价探测 —— 只看 DOM 里有没有 aegis/verify 容器,
+    **不**走 cooldown、**不**调 `page.content()`、**不**做 iframe 扫描。
+
+    设计目标:每次 poll wait_for_timeout 前调用一次,~30ms 内返。
+
+    为什么必须跟 `detect_aegis_captcha` 分开:
+      - `detect_aegis_captcha` 会跑 `_safe_inner_html` 拉 iframe content
+        + page.content(),几百 ms 到 1s,1s 段 poll 周期里跑就废了
+      - `detect_aegis_captcha` 上游(`_try_solve_captcha_in_video`)有 cooldown
+        短路,30 分钟盲飞期里完全看不到 popup 是否还在
+      - 本函数廉价 + 永远跑,是 poll 循环的「眼睛」
+
+    返回 True = DOM 里有疑似 aegis 容器,需要进一步 classify 或调 solver。
+    """
+    try:
+        # wait_for_selector 超时 200ms 兜底,首字节返回就立即返
+        await page.wait_for_selector(
+            "div[class*='aegis'], div[class*='verify'], "
+            "iframe[src*='aegis'], div[class*='captcha'], div[class*='puzzle']",
+            timeout=200,
+        )
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # 拖拽动作层
 # ---------------------------------------------------------------------------
 

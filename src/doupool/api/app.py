@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import secrets
@@ -149,17 +150,25 @@ def _sanitize_filename_part(text: str, max_len: int = 12) -> str:
 
 
 def _build_download_filename(task) -> str:
-    """v0.2.35:批量下载命名 —— `{group_index:02d}_{HHMMSS}_{prompt前12字符}[-clean].mp4`。
+    """v0.2.35 + v0.3.3:批量下载命名 —— `{group_index:02d}_{HHMMSS}_{prompt前12字符}_{task_id短哈希}[-clean].mp4`。
 
     单条任务(group_index=0)同样落到 01:统一格式方便排序。
     -clean 后缀优先于重名去重 N(无水印版本始终命名为 -clean.mp4,
     原画重名才加 -2/-3)。
+
+    v0.3.3 加 task_id 短哈希(8 字符,SHA1):避免同 group_index + 同秒提交
+    时文件名撞车 —— group_download 写到同一目录,后者覆盖前者,用户只看到
+    1 个文件,误以为「两条都拿到同一个视频」。这是 v0.3.3 单账号多任务并发
+    修复的次生防线:race 防御管 DB 写入,文件名 hash 管下载到本地后的可
+    区分性,两道关一起兜底。
     """
     group_index = getattr(task, "group_index", 0) or 0
     index_str = f"{group_index:02d}"
     ts = task.created_at.strftime("%H%M%S")
     name_part = _sanitize_filename_part(task.prompt, max_len=12)
-    stem = f"{index_str}_{ts}_{name_part}"
+    task_id = getattr(task, "id", None) or 0
+    id_hash = hashlib.sha1(str(task_id).encode("utf-8", errors="replace")).hexdigest()[:8]
+    stem = f"{index_str}_{ts}_{name_part}_{id_hash}"
     if getattr(task, "clean_video_url", None):
         stem = f"{stem}-clean"
     return f"{stem}.mp4"

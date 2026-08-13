@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from uuid import uuid4
 
@@ -8,6 +9,10 @@ from uuid import uuid4
 # 等),chain 响应任意 message 文本命中即抛 DoubaoContentRejected,让 service 层
 # 立即标 failed + 退还额度,而不是等 5min timeout。
 from doupool.prompt_reviser import _POLICY_PATTERNS
+
+# v0.3.4.1:race 防御放宽 — 当服务端 envelope id 不匹配但 creation 合法时,
+# 需要打 WARNING 暴露服务端 id 漂移,便于后续观测 / 排查。
+_LOGGER = logging.getLogger(__name__)
 
 
 MODELS = {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}
@@ -448,7 +453,11 @@ def scan_sse_for_policy_rejection(sse_text: str) -> str | None:
     return None
 
 
-def parse_creation_result(response: dict) -> dict[str, str] | None:
+def parse_creation_result(
+    response: dict,
+    *,
+    expected_local_message_ids: set[str] | None = None,
+) -> dict[str, str] | None:
     """从 chain 响应里解析视频生成结果。
 
     两条返回路径:
@@ -458,28 +467,100 @@ def parse_creation_result(response: dict) -> dict[str, str] | None:
 
     顺序:**先扫成功块**(若已成功直接 return),再扫拒绝关键词。避免已成功的任务
     被同包里的 reject 文本误判。
+
+    v0.3.3 同账号并发 race 防御:字节 `/im/chain/single` 在 race 窗口下偶尔把别
+    人的 creation 塞进我们的 chain response(共用同一 conversation 上下文)。
+    防御思路:
+    - 每个 message envelope 上有 `local_message_id` / `message_id` 字段(字节
+      提交响应里就有,见 docs/doubao-video-api-analysis.md L177)。
+    - 调用方传入 `expected_local_message_ids = {本任务 submit 时用过的 id 集合}`
+      (t2v 单 id,i2v 双 id:attachment + text)。
+    - 命中规则:如果 envelope 有 id 且 id 不在 expected 集合 → 跳过这个
+      creation(继续 poll,等我们自己那条出来)。
+    - Fall through 条件:
+      * `expected_local_message_ids is None`(默认,完全向后兼容 v0.3.2.5)
+      * envelope 上 id 字段缺失(字段名或字节版本差异)→ 仍 return 第一个
+        status==3,不阻塞正常生成。
+
+    v0.3.4.1 放宽:**两阶段扫描**。
+    - 第一遍扫所有 creation,三分类:
+      * `matches`:envelope ∩ expected ≠ ∅ 且 creation 合法(强匹配,首选)
+      * `candidates`:envelope 与 expected 不相交但 creation 合法(兜底)
+      * 非法 creation(status≠3 / 无 download_url)直接丢
+    - 决策:`matches` 非空 → 返回 matches[0];否则 `candidates` 非空 → 打
+      WARNING 后返回 candidates[0];都没有 → 走兜底扫描(rejected reason)。
+    - 触发 WARNING 的场景:服务端 envelope id 与客户端 expected 不匹配但 creation
+      已成功。这是字节 SSE_ACK / chain response 之间 id 命名不一致导致的(ACK
+      透传浏览器 crypto.randomUUID,chain response 用服务端内部 id)。WARNING 留下
+      现场,后续可观测服务端 id 漂移频率。
     """
     messages = response.get("downlink_body", {}).get("pull_singe_chain_downlink_body", {}).get("messages", [])
+
+    # v0.3.3:同时记录 envelope id 和 decoded blocks,这样成功块扫描可以基于
+    # envelope identity 过滤。
     decoded_blocks: list[list[dict]] = []
+    envelope_id_sets: list[set[str]] = []
     for message in messages:
+        envelope_ids: set[str] = set()
+        for key in ("local_message_id", "message_id"):
+            value = message.get(key)
+            if isinstance(value, str) and value:
+                envelope_ids.add(value)
+        envelope_id_sets.append(envelope_ids)
         try:
             decoded_blocks.append(json.loads(message.get("content") or "[]"))
         except (TypeError, json.JSONDecodeError):
             decoded_blocks.append([])
 
-    # 1. 成功块优先
-    for blocks in decoded_blocks:
+    # v0.3.4.1:成功块扫描 —— 两阶段,先收集再决策,避免单遍扫描中 race 防御
+    # 一票否决全部 creation(用户的"生成成功但仍卡生成中"真根因)。
+    matches: list[dict] = []
+    candidates: list[tuple[set[str], dict]] = []
+    for blocks, envelope_ids in zip(decoded_blocks, envelope_id_sets):
         for block in blocks:
             creations = block.get("content", {}).get("creation_block", {}).get("creations", [])
             for creation in creations:
                 video = creation.get("video") or {}
-                if video.get("status") == 3 and video.get("download_url"):
-                    return {
-                        "remote_task_id": str(creation.get("id", "")),
-                        "vid": str(video.get("vid", "")),
-                        "fallback_result_url": video["download_url"],
-                        "cover_url": video.get("cover", {}).get("image_thumb", {}).get("url", ""),
-                    }
+                if not (video.get("status") == 3 and video.get("download_url")):
+                    # 非法 creation(还在生成中 / 失败 / 缺 URL)→ 不参与分类
+                    continue
+                payload = {
+                    "remote_task_id": str(creation.get("id", "")),
+                    "vid": str(video.get("vid", "")),
+                    "fallback_result_url": video["download_url"],
+                    "cover_url": video.get("cover", {}).get("image_thumb", {}).get("url", ""),
+                }
+                # 三分类:
+                # - expected=None(v0.3.2.5 调用方):不做 race 防御,所有合法 creation
+                #   直接进 matches —— 完全向后兼容。
+                # - envelope ∩ expected ≠ ∅:强匹配,进 matches。
+                # - 其他(envelope 上 id 缺失 / 与 expected 不相交):兜底,进 candidates
+                #   触发 WARNING。
+                if expected_local_message_ids is None:
+                    matches.append(payload)
+                elif envelope_ids and not envelope_ids.isdisjoint(expected_local_message_ids):
+                    matches.append(payload)
+                else:
+                    candidates.append((envelope_ids, payload))
+
+    if matches:
+        return matches[0]
+    if candidates and expected_local_message_ids is not None:
+        # v0.3.4.1 WARNING:服务端 envelope id 与客户端 expected 不匹配但 creation
+        # 已成功 → 兜底接受 candidates[0]。这是字节 SSE_ACK ↔ chain response
+        # id 命名不一致(id drift)的已知症状。
+        drift_envelope_ids, drift_payload = candidates[0]
+        _LOGGER.warning(
+            "v0.3.4.1 race 防御兜底:envelope id 与 expected 不匹配但 creation 已成功,"
+            " accept candidates[0]。candidates=%d, expected=%d, "
+            "drift_envelope_ids=%s, drift_creation_id=%s, drift_vid=%s",
+            len(candidates),
+            len(expected_local_message_ids),
+            sorted(drift_envelope_ids),
+            drift_payload.get("remote_task_id", ""),
+            drift_payload.get("vid", ""),
+        )
+        return drift_payload
 
     # 2. v0.2.21:policy 关键词兜底扫描 — 任意 block 含「侵权|违规|换个主题|无法
     # 返回该内容|sensitive content」等关键词 → 抛 rejected,service 层立即 failed。

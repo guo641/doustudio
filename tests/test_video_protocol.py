@@ -598,3 +598,252 @@ def test_build_completion_payload_rejects_duration_outside_4_to_10(duration):
             duration=duration,
             fingerprint="fp",
         )
+
+
+# v0.3.3:单账号多任务并发 race 防御 —— parse_creation_result 必须按 envelope
+# 上 local_message_id / message_id 过滤串话的 creation。同账号 A 同时提交 A1/A2,
+# 字节 race 窗口下可能把 A1 的 creation 错塞给 A2 的 chain response,导致 A2
+# worker 拿到 A1 的 vid+download_url。用户视角「下载下来都是 A1」。防御:
+# 客户端在调用 parse_creation_result 时把本任务 submit 用过的 local_message_id
+# 集合传进来,串话的 envelope 上 id 不在集合中 → 跳过这个 creation。
+def _build_chain_response_with_envelope(*, envelope_id, creation):
+    """构造一个 chain 响应:envelope 上带 envelope_id(message_id 或
+    local_message_id),内部 content 里有 creation。
+    """
+    content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [creation]}},
+    }])
+    return {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [{
+            "content": content,
+            "local_message_id": envelope_id,
+        }]}},
+    }
+
+
+def test_parse_creation_result_filters_by_expected_local_message_id():
+    """v0.3.3:race 串话 —— A2 worker 只收自己的 envelope id,A1 envelope 必须跳过。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    a2 = {
+        "id": "task-A2",
+        "video": {"status": 3, "vid": "v-A2", "download_url": "https://example/A2.mp4"},
+    }
+    a1_content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a1]}},
+    }])
+    a2_content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a2]}},
+    }])
+    # 模拟 race 窗口:A1 和 A2 各占一个 envelope,envelope id 分别标到各自消息上。
+    # 字节这种结构:每个 message 一个 envelope + 一个 content。
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {"content": a1_content, "local_message_id": "msg-A1"},
+            {"content": a2_content, "local_message_id": "msg-A2"},
+        ]}}
+    }
+    # A2 worker 用自己的 expected 集合 → 必须跳过 A1 envelope,命中 A2 envelope
+    result = parse_creation_result(response, expected_local_message_ids={"msg-A2"})
+    assert result is not None
+    assert result["vid"] == "v-A2"
+    assert result["fallback_result_url"] == "https://example/A2.mp4"
+
+
+def test_parse_creation_result_relaxes_when_envelope_id_drifts():
+    """v0.3.4.1:服务端 envelope id 不匹配但 creation 合法 → 兜底接受 candidates[0]
+    并打 WARNING(不再返 None / 继续 poll 直至 timeout)。
+
+    用户的"4 条视频生成好但仍卡生成中"真根因:v0.3.3 单遍扫描一遇到 envelope
+    id 不匹配就 continue,把所有合法 creation 一票否决 → 永远拿不到结果 →
+    10min timeout 标 failed,但服务端其实早已成功。v0.3.4.1 两阶段扫描改兜底。
+    """
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
+
+    # A2 worker 收自己的 message_id → A1 envelope 不匹配 → 兜底接受 A1 creation
+    # (v0.3.3 行为:返 None → poll 直至 timeout;v0.3.4.1 行为:返 A1 + WARNING)
+    result = parse_creation_result(response, expected_local_message_ids={"msg-A2"})
+    assert result is not None
+    assert result["vid"] == "v-A1"
+    assert result["fallback_result_url"] == "https://example/A1.mp4"
+
+
+def test_parse_creation_result_prefers_matching_id_over_drift():
+    """v0.3.4.1:matches(强匹配)优先于 candidates(漂移兜底)。
+
+    模拟:A1 是别人任务的 creation(被串话进来),A2 是本任务的 creation。
+    两个 envelope 同时存在 → 必须返回 A2(A2 envelope 命中 expected,A1 漂移)。
+    """
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    a2 = {
+        "id": "task-A2",
+        "video": {"status": 3, "vid": "v-A2", "download_url": "https://example/A2.mp4"},
+    }
+    a1_content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a1]}},
+    }])
+    a2_content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a2]}},
+    }])
+    # A1 envelope (id=msg-A1) 和 A2 envelope (id=msg-A2) 同时出现在 chain response。
+    # A2 worker 的 expected={"msg-A2"} → A1 envelope 是 candidates,A2 envelope 是 matches。
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [
+            {"content": a1_content, "local_message_id": "msg-A1"},
+            {"content": a2_content, "local_message_id": "msg-A2"},
+        ]}}
+    }
+    result = parse_creation_result(response, expected_local_message_ids={"msg-A2"})
+    assert result is not None
+    assert result["vid"] == "v-A2"  # 强匹配优先,不能被 A1 漂移抢先
+
+
+def test_parse_creation_result_no_filter_when_expected_is_none():
+    """v0.3.3:向后兼容 —— expected_local_message_ids=None 时返回首个 creation(原行为)。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    # envelope 上故意带别人的 id,expected=None → 必须 fall through(不破坏旧测试)
+    response = _build_chain_response_with_envelope(envelope_id="msg-someone-else", creation=a1)
+    result = parse_creation_result(response, expected_local_message_ids=None)
+    assert result is not None
+    assert result["vid"] == "v-A1"
+
+
+def test_parse_creation_result_message_id_missing_falls_through():
+    """v0.3.3:服务端响应没带 envelope id → 仍 return(不阻塞正常生成)。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    # envelope 上**没有** local_message_id / message_id 字段
+    content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a1]}},
+    }])
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [{
+            "content": content,
+        }]}}
+    }
+    # 即使 expected 集合给了一个不存在的 id,服务端没带 envelope id → fall through
+    result = parse_creation_result(response, expected_local_message_ids={"msg-unknown"})
+    assert result is not None
+    assert result["vid"] == "v-A1"
+
+
+def test_parse_creation_result_message_id_field_name_fallback():
+    """v0.3.3:envelope 上只有 `message_id`(没有 `local_message_id`)也要识别。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [a1]}},
+    }])
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [{
+            "content": content,
+            "message_id": "msg-A1",
+        }]}}
+    }
+    # 期望集合里有 msg-A1 → 必须命中
+    result = parse_creation_result(response, expected_local_message_ids={"msg-A1"})
+    assert result is not None
+    assert result["vid"] == "v-A1"
+
+
+# v0.3.4.1:race 防御放宽后的额外覆盖 —— 漂移兜底、WARNING 日志、合法性判定
+# 等新增行为需要专门测试。前面 5 个 v0.3.3 case 保留 + 上面 relax_when_drift /
+# prefer_matching 两个是改写 + 下面是 3 个新增。
+import logging
+
+
+def test_parse_creation_result_returns_none_when_no_valid_creation(caplog):
+    """v0.3.4.1:所有 creation 都不合法(status≠3 / 无 download_url)→ None。
+
+    跟 v0.3.3 的"returns_none_when_no_creation_matches"区分:那个测的是 envelope
+    id 不匹配(现在会兜底接受);这个测的是 creation 本身非法(服务端还没生成好 /
+    生成失败)→ 必须返 None 让 caller 继续 poll,不能误把"在生成中"当作成功。
+    """
+    creating = {
+        "id": "task-A1",
+        "video": {"status": 1, "vid": "v-A1"},  # status=1 = 还在生成中
+    }
+    failed = {
+        "id": "task-A2",
+        "video": {"status": 5, "vid": "v-A2", "download_url": ""},  # 失败 + 无 URL
+    }
+    no_url = {
+        "id": "task-A3",
+        "video": {"status": 3, "vid": "v-A3"},  # status=3 但 download_url 缺失
+    }
+    content = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [creating, failed, no_url]}},
+    }])
+    response = {
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [{
+            "content": content,
+            "local_message_id": "msg-A1",
+        }]}}
+    }
+    with caplog.at_level(logging.WARNING, logger="doupool.video.protocol"):
+        result = parse_creation_result(response, expected_local_message_ids={"msg-A1"})
+    assert result is None
+    # 非法 creation 不触发漂移兜底 → 不应该有 WARNING
+    assert "v0.3.4.1 race 防御兜底" not in caplog.text
+
+
+def test_parse_creation_result_logs_warning_on_drift_fallthrough(caplog):
+    """v0.3.4.1:envelope id 漂移兜底必须打 WARNING,留下服务端 id drift 现场。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
+
+    with caplog.at_level(logging.WARNING, logger="doupool.video.protocol"):
+        result = parse_creation_result(response, expected_local_message_ids={"msg-A2"})
+
+    assert result is not None
+    assert result["vid"] == "v-A1"
+    # WARNING 必须出现且带关键字段,方便观测服务端 id 漂移
+    assert "v0.3.4.1 race 防御兜底" in caplog.text
+    assert "drift_vid=v-A1" in caplog.text
+    assert "drift_envelope_ids=['msg-A1']" in caplog.text
+    assert "candidates=1" in caplog.text
+    assert "expected=1" in caplog.text
+
+
+def test_parse_creation_result_no_warning_when_explicit_match(caplog):
+    """v0.3.4.1:envelope id 强匹配(matches)路径不打 WARNING —— 正常路径不应噪音。"""
+    a1 = {
+        "id": "task-A1",
+        "video": {"status": 3, "vid": "v-A1", "download_url": "https://example/A1.mp4"},
+    }
+    response = _build_chain_response_with_envelope(envelope_id="msg-A1", creation=a1)
+
+    with caplog.at_level(logging.WARNING, logger="doupool.video.protocol"):
+        result = parse_creation_result(response, expected_local_message_ids={"msg-A1"})
+
+    assert result is not None
+    assert result["vid"] == "v-A1"
+    # 强匹配成功 → 不应打 WARNING(避免刷屏)
+    assert "v0.3.4.1 race 防御兜底" not in caplog.text

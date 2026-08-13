@@ -25,6 +25,7 @@ from ..captcha.solver import (
     is_in_cooldown as _captcha_is_in_cooldown,
     make_client as _make_captcha_client,
     mark_cooldown as _captcha_mark_cooldown,
+    probe_aegis_quickly as _probe_aegis_quickly,
     solve_aegis_captcha as _solve_aegis_captcha,
 )
 from ..captcha.config import load_credentials as _load_captcha_credentials
@@ -36,8 +37,8 @@ from .protocol import (
     find_creation_directory,
     find_video_node,
     parse_creation_result,
-    parse_download_info,
     parse_sse_ack,
+    parse_download_info,
 )
 
 # v0.3.1.2:video runner 在 page.goto 之后、提交之前等弹窗出现的最长时间。
@@ -768,6 +769,74 @@ def load_image_base64(path: Path) -> tuple[str, str, str]:
     return path.name, mime, base64.b64encode(data).decode("ascii")
 
 
+async def _handle_aegis_in_poll(
+    page: Page,
+    profile_dir: Path,
+    update: Callable[..., None],
+) -> bool:
+    """v0.3.4:poll 循环里碰到 aegis 弹窗时的统一处理入口。
+
+    设计目标:
+      - 不被 cooldown 短路(廉价探测必须每次跑)
+      - 凭证可用 + 未在 cooldown → 调完整 solver 求解
+      - 凭证不可用 / 已 cooldown → **fail-fast**,不浪费 30 分钟盲飞
+        (用户原话:"我在后台看到视频已经生成成功了,你特么还卡在生成中")
+
+    返回:
+      True  = 探测到弹窗并**已解决**(solver 跑通),调用方继续 poll
+      False = 未探测到弹窗,调用方继续 poll
+      raise  AegisCaptchaUnresolvable = 探测到但**无法自动解**
+              (凭证关 / 已 cooldown),调用方应终止任务
+
+    与 `_try_solve_captcha_in_video` 的关系:
+      本函数是 poll 专用入口,内部仍可能调 `_try_solve_captcha_in_video`
+      做求解(它会走 cooldown),但探测 + fail-fast 决策由本函数负责。
+    """
+    if not await _probe_aegis_quickly(page):
+        return False
+
+    # 探测到了 → 先看凭证能不能用
+    creds = _load_captcha_credentials()
+    client = None
+    try:
+        client = _make_captcha_client(creds)
+    except _AegisCaptchaDisabled as exc:
+        # 凭证不可用 —— 整个 ~35 分钟视频生成都要被这个 popup 挡住,
+        # 早 fail 早让用户知道,别让任务挂"生成中"直到超时。
+        _LOGGER.warning(
+            "aegis popup detected during poll but credentials unusable: %s; "
+            "failing task fast instead of polling blind",
+            exc,
+        )
+        _captcha_mark_cooldown(str(profile_dir))
+        try:
+            update(error_message=(
+                f"aegis 拖拽验证已弹出,但图鉴打码凭证未配置或已停用({exc})。"
+                "请在 Settings → 图鉴打码平台填写凭证并启用,或手动在浏览器中拖动验证后重新提交任务。"
+            ))
+        except Exception:
+            pass
+        raise _AegisUnresolvableInPoll(
+            "aegis drag captcha blocking poll loop; captcha credentials not configured"
+        ) from exc
+
+    # 凭证可用 → 立即关掉 client(只需要 make_client 用来检查可不可用,
+    # 真正的 solver 会自己构造 client)。然后调老 solver。
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+    return await _try_solve_captcha_in_video(
+        page, profile_dir, update, wait_for_popup_seconds=0.0,
+    )
+
+
+class _AegisUnresolvableInPoll(RuntimeError):
+    """v0.3.4:poll 循环里 aegis 弹窗持续挂着但客户端无法自动解。
+    抛这个让上层 service 把任务标 failed + 退额度。"""
+
+
 async def _try_solve_captcha_in_video(
     page: Page,
     profile_dir: Path,
@@ -1103,6 +1172,10 @@ async def _ack_interceptor(page: Page):
     - context.on 会拦截所有 page 的响应,跨 task 串台(同 account 多 task)
     - 一次 submit 只对应一个 page 的 /chat/completion,page.on 更精准
     - context manager 保证 listener 不 leak(每 task 独立,exit 时清理)
+
+    v0.3.3:同时缓存解析后的 SSE_ACK payload(`state["ack_payload"]`),供
+    race 防御读 `local_message_ids` 用 —— 浏览器侧生成的 id 我们 Python
+    侧没法预生成,只能从 server echo 的 ack 里抓。
     """
     state: dict[str, object] = {}
 
@@ -1117,6 +1190,15 @@ async def _ack_interceptor(page: Page):
             return
         state["text"] = text
         state["ts"] = time.time()
+        # v0.3.3:从 SSE 流里抽 SSE_ACK 包的 data(整段 JSON),喂给
+        # _extract_local_message_ids_from_ack_payload。失败不挂流程
+        # —— race 防御是 best-effort,字段缺失就 fall through。
+        try:
+            ack_payload = _parse_sse_ack_payload_from_text(text)
+            if ack_payload is not None:
+                state["ack_payload"] = ack_payload
+        except Exception:
+            pass
 
     page.on("response", _on_response)
     try:
@@ -1140,6 +1222,73 @@ async def _wait_for_ack(state: dict, *, timeout: float = _UI_ACK_WAIT_SECONDS) -
             return str(state["text"])
         await asyncio.sleep(0.1)
     raise RuntimeError(f"等待 /chat/completion 响应超时 ({timeout}s)")
+
+
+def _parse_sse_ack_payload_from_text(text: str) -> dict | None:
+    """v0.3.3:从完整 SSE 流里抽 SSE_ACK 包的 data JSON(整段)。
+
+    与 `protocol.parse_sse_ack` 不同 —— 那个函数最后 return 一个 3 字段字典
+    并丢掉 ack_payload。本函数只取 ack_payload 原文,不做拒绝文案扫描
+    (由 parse_sse_ack 自己做)。
+
+    返回 None = 没拿到 / JSON 解析失败。race 防御是 best-effort,失败直接
+    走 fall through,不影响主流程。
+    """
+    try:
+        for packet in text.replace("\r\n", "\n").split("\n\n"):
+            event = ""
+            data = ""
+            for line in packet.splitlines():
+                if line.startswith("event:"):
+                    event = line[6:].strip()
+                elif line.startswith("data:"):
+                    data += line[5:].strip()
+            if event == "SSE_ACK" and data:
+                return json.loads(data)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def _extract_local_message_ids_from_ack_payload(ack_payload: dict) -> set[str]:
+    """v0.3.3:从 SSE_ACK payload 里抽本任务 submit 时用过的 local_message_id。
+
+    浏览器 UI 路径(`use_real_browser=True`)下 id 由前端 crypto.randomUUID
+    生成,Python 侧拿不到。服务端 echo 回来的 ack_payload 通常在以下位置
+    带 id(字节不同版本字段命名略有差异,做宽口径 fallback):
+      - `ack_client_meta.local_message_id`(单值)
+      - `ack_client_meta.local_message_ids`(列表)
+      - `query_list[].local_message_id`(每条 query 一个)
+      - `query_list[].local_message_ids`(列表)
+
+    字段缺失 / 全部空 → 返回空 set,调用方走 fall through 不阻塞正常任务。
+    """
+    ids: set[str] = set()
+
+    def _ingest(value) -> None:
+        if isinstance(value, str) and value:
+            ids.add(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item:
+                    ids.add(item)
+                elif isinstance(item, dict):
+                    inner = item.get("local_message_id") or item.get("message_id")
+                    _ingest(inner)
+
+    meta = ack_payload.get("ack_client_meta") or {}
+    _ingest(meta.get("local_message_id"))
+    _ingest(meta.get("local_message_ids"))
+    _ingest(meta.get("message_id"))
+
+    for query in ack_payload.get("query_list") or []:
+        if not isinstance(query, dict):
+            continue
+        _ingest(query.get("local_message_id"))
+        _ingest(query.get("local_message_ids"))
+        _ingest(query.get("message_id"))
+
+    return ids
 
 
 async def submit_via_ui(
@@ -1349,6 +1498,7 @@ class PlaywrightVideoRunner:
         cancel_event: threading.Event,
         *,
         deadline_seconds: float = 90,
+        expected_local_message_ids: set[str] | None = None,
     ) -> dict[str, str] | None:
         """v0.2.9:不重提交,只重解析 —— 复用已存的 conversation_id,
         重新打开 /chat/<id> 拉一次 CHAIN_SCRIPT,parse 出最新 result。
@@ -1363,6 +1513,11 @@ class PlaywrightVideoRunner:
         返回 dict = parse_creation_result 出的 result 字段(result_url /
         backup_result_url / fallback_result_url / vid / cover_url 等),
         调用方负责写回 VideoTask。
+
+        v0.3.3:`expected_local_message_ids` —— recheck 不重提交,不知道
+        本任务 submit 时用过的 id,通常传 None 走 fall through(原有行为)。
+        service.py 调过来时透传 task.db 里存的 id 集合(若以前 v0.3.3+
+        写入过的话)。这是 best-effort,不传一样能工作。
         """
         context, _bundle = await self._get_shared_context(profile_dir, pc_version=None)
         # v0.2.26:不复用 anchor page(同 run() 一样的修复 —— 详见 run() 注释)。
@@ -1396,9 +1551,16 @@ class PlaywrightVideoRunner:
             )
             update(status="rechecking")
             deadline = time.monotonic() + deadline_seconds
+            poll_interval_s = max(1, int(self.poll_interval))  # v0.3.4:同主 poll
             while time.monotonic() < deadline:
                 if cancel_event.is_set():
                     raise RuntimeError("任务已取消")
+                # v0.3.4:recheck 路径同样会撞 aegis(用户查视频时正好赶上弹窗),
+                # 走相同的 fail-fast / solve 逻辑,不让 aegis 把 recheck 阻塞到超时。
+                try:
+                    await _handle_aegis_in_poll(page, profile_dir, update)
+                except _AegisUnresolvableInPoll:
+                    raise
                 chain = await page.evaluate(
                     CHAIN_SCRIPT, {"conversationId": conversation_id}
                 )
@@ -1406,11 +1568,27 @@ class PlaywrightVideoRunner:
                     raise RuntimeError(
                         f"豆包结果接口返回 HTTP {chain['status']}"
                     )
-                result = parse_creation_result(chain["data"])
+                # v0.3.3 race 防御:recheck 不重提交,调用方通常传
+                # expected_local_message_ids=None 走 fall through(原行为);
+                # 若 task.db 之前 v0.3.3+ 写入过 id 集合就透传,做 best-effort
+                # 串话过滤。
+                result = parse_creation_result(
+                    chain["data"],
+                    expected_local_message_ids=expected_local_message_ids,
+                )
                 if result:
                     update(status="resolving", **result)
                     return await self._resolve_original_download(page, result, cancel_event)
-                await page.wait_for_timeout(self.poll_interval * 1000)
+                # v0.3.4:wait 拆 1s 段 + 每段先 probe(同主 poll)
+                for _ in range(poll_interval_s):
+                    if time.monotonic() >= deadline:
+                        break
+                    try:
+                        if await _probe_aegis_quickly(page):
+                            break
+                    except Exception:
+                        break
+                    await asyncio.sleep(1)
             return None
         finally:
             await page.close()
@@ -1655,6 +1833,7 @@ class PlaywrightVideoRunner:
         profile_dir: Path,
         *,
         use_real_browser: bool = True,
+        expected_local_message_ids: set[str] | None = None,
     ) -> dict[str, str]:
         """v0.3.2:run() 的 submit + poll 切片,被 retry loop 复用。
 
@@ -1667,6 +1846,10 @@ class PlaywrightVideoRunner:
 
         ack 解析契约不变(parse_sse_ack 不动,3 字段全在):只是 trigger
         方式换了,响应体一致 → service.py **ack 解包不破坏。
+
+        v0.3.3:`expected_local_message_ids` —— 本任务 submit 时用过的
+        local_message_id 集合(t2v 1 个,i2v 2 个)。不传 → 退回到旧行为
+        (envelope 上有 id 也走 fall through,即 race 防御关闭)。
         """
         if use_real_browser:
             # v0.3.2:UI click → /chat/completion 响应 → parse_sse_ack。
@@ -1682,6 +1865,16 @@ class PlaywrightVideoRunner:
                     ack_state, timeout=_UI_ACK_WAIT_SECONDS,
                 )
             ack = parse_sse_ack(text)
+            # v0.3.3 race 防御:浏览器侧 crypto.randomUUID 生成的 id 我们
+            # Python 侧拿不到,只能从 server echo 的 SSE_ACK payload 里抽。
+            # 调用方没传 expected → 用 ack 里抓到的 id(若 ack 里也抓不到
+            # 就退化为 None = race 防御关闭,不阻塞正常任务)。
+            if expected_local_message_ids is None:
+                ack_payload = ack_state.get("ack_payload")
+                if isinstance(ack_payload, dict):
+                    extracted = _extract_local_message_ids_from_ack_payload(ack_payload)
+                    if extracted:
+                        expected_local_message_ids = extracted
             update(status="generating", **ack)
         else:
             # 原 fetch 路径完整保留 —— 测试 + 回滚兜底
@@ -1707,30 +1900,53 @@ class PlaywrightVideoRunner:
                     f"豆包提交接口返回 HTTP {response['status']}"
                 )
             ack = parse_sse_ack(response["text"])
+            # v0.3.3 race 防御:fetch 路径是 Python 构造的 payload,直接
+            # 从 messages 数组里抽我们自己生成的两个 id 即可。
+            if expected_local_message_ids is None:
+                ids: set[str] = set()
+                for message in payload.get("messages") or []:
+                    if not isinstance(message, dict):
+                        continue
+                    lm = message.get("local_message_id")
+                    if isinstance(lm, str) and lm:
+                        ids.add(lm)
+                    mm = message.get("message_meta") or {}
+                    mm_lm = mm.get("local_message_id")
+                    if isinstance(mm_lm, str) and mm_lm:
+                        ids.add(mm_lm)
+                if ids:
+                    expected_local_message_ids = ids
             update(status="generating", **ack)
 
         deadline = time.monotonic() + self.timeout
         poll_log_every = max(5, int(self.timeout / 6))  # 默认 20min → 每 3min 一条;最短 5
         poll_count = 0
+        poll_interval_s = max(1, int(self.poll_interval))  # v0.3.4:wait 拆 1s 段
         while time.monotonic() < deadline:
             if cancel_event.is_set():
                 raise RuntimeError("任务已取消")
-            # v0.3.1.3:每次 poll 都探 aegis,挪到 chain 请求之前 —— 用户实测
-            # aegis 在 submit 之后才弹,且弹窗会让 chain 接口返非 200。
-            # 探的时机必须在 chain 之前,否则 aegis 让 task 先挂掉,我们
-            # 永远走不到 captcha 解算。cooldown 自动跳过(30min 复用 login 路径
-            # 的同一份 _captcha_cooldown dict),helper 内部 wait=0(poll 路径
-            # 不重复等弹窗)。
-            await _try_solve_captcha_in_video(
-                page,
-                profile_dir,
-                update,
-                wait_for_popup_seconds=0.0,
-            )
+            # v0.3.1.3 + v0.3.4:每次 poll 都探 aegis,挪到 chain 请求之前。
+            # v0.3.1.3 的实现有 bug:`_try_solve_captcha_in_video` 内部被
+            # 30 分钟 cooldown 短路,导致探测只在第 1 次生效,后续 30 分钟
+            # 完全失明 → 用户看到「卡生成中」,实际 aegis 一直挂着挡 chain。
+            # v0.3.4 改用 `_handle_aegis_in_poll` —— 探测不走 cooldown,
+            # 凭证不可用时直接抛 `_AegisUnresolvableInPoll` 让任务 fail-fast,
+            # 不浪费 35 分钟盲飞。
+            try:
+                await _handle_aegis_in_poll(page, profile_dir, update)
+            except _AegisUnresolvableInPoll:
+                raise
             chain = await page.evaluate(CHAIN_SCRIPT, {"conversationId": ack["conversation_id"]})
             if chain["status"] != 200:
                 raise RuntimeError(f"豆包结果接口返回 HTTP {chain['status']}")
-            result = parse_creation_result(chain["data"])
+            # v0.3.3 race 防御:同账号并发 A1/A2 → 字节偶尔把 A1 的 creation
+            # 塞给 A2 的 chain response。expected_local_message_ids 把本任务
+            # submit 时用过的 id 喂给 parse_creation_result,串话的 creation
+            # 没有匹配的 id 会被跳过 → 继续 poll 直到拿到自己的。
+            result = parse_creation_result(
+                chain["data"],
+                expected_local_message_ids=expected_local_message_ids,
+            )
             if result:
                 update(status="resolving", **result)
                 return await self._resolve_original_download(page, result, cancel_event)
@@ -1744,7 +1960,22 @@ class PlaywrightVideoRunner:
                     "video poll still waiting conv=%s polls=%d remaining=%ds",
                     ack.get("conversation_id", "?"), poll_count, remaining,
                 )
-            await page.wait_for_timeout(self.poll_interval * 1000)
+            # v0.3.4:wait_for_timeout 拆成 1s 段 + 每段先 probe —— 避免 aegis
+            # 弹窗刚弹出后到下一次 wait 之间被关掉 page 时客户端毫无反应。
+            # 一次 wait 最多 1s(避免 TargetClosedError 堆积),命中 popup
+            # 立即 break 进入下一轮 chain 探测。
+            for _ in range(poll_interval_s):
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    if await _probe_aegis_quickly(page):
+                        # 探测到 popup → 跳出 wait 段,下一轮开头由
+                        # `_handle_aegis_in_poll` 做凭证检查 / fail-fast / 求解
+                        break
+                except Exception:
+                    # page 在 wait 期间被外部关掉 → 跳出,上层 catch 后处理
+                    break
+                await asyncio.sleep(1)
         raise RuntimeError("视频生成超时")
 
     async def _resolve_original_download(self, page, result: dict[str, str], cancel_event: threading.Event) -> dict[str, str]:

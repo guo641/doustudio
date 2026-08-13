@@ -31,9 +31,12 @@ from doupool.video.browser import (
     SEND_BTN_FALLBACK_SEL,
     VIDEO_TAB_SEL,
     PlaywrightVideoRunner,
+    _AegisUnresolvableInPoll,
     _ack_interceptor,
     _build_launch_kwargs,
+    _handle_aegis_in_poll,
     _pre_submit_aegis_gate,
+    _probe_aegis_quickly,
     _wait_for_ack,
     clear_prose_mirror,
     submit_via_ui,
@@ -1246,3 +1249,344 @@ async def test_run_non_risk_rate_limit_still_bubbles(monkeypatch, fast_gate_cons
         f"非风控的 quota 限流绝不能触发滑块等待 gate; "
         f"实际 await_count={gate_mock.await_count}"
     )
+
+
+# ------------------------- v0.3.4:poll 循环 aegis fail-fast ------------------------- #
+#
+# 背景:用户原话「我在后台看到视频已经生成成功了,你特么还卡在生成中」。
+# 真根因:poll 循环里 `_try_solve_captcha_in_video` 被 30 分钟 cooldown 短路,
+# 用户关掉弹窗或凭证没配时,aegis 持续挡 chain → poll 盲飞到超时。
+#
+# v0.3.4 修复:
+#   1. 加 `_handle_aegis_in_poll`(廉价探测 + fail-fast)
+#   2. poll 循环 wait_for_timeout 拆 1s 段,每段先 `_probe_aegis_quickly`
+#   3. 探测到 aegis 但凭证不可用 → 抛 `_AegisUnresolvableInPoll`,任务立刻 fail
+#
+# 本节测试:验证(2)(3)的契约,(1)已在 test_video_captcha_hook.py 覆盖。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _build_chain_response_no_creation() -> dict:
+    """构造 chain 返回 payload 但**没有**creation_block → poll 继续等待。"""
+    return {
+        "status": 200,
+        "data": {
+            "downlink_body": {
+                "pull_singe_chain_downlink_body": {
+                    "messages": [{"content": "[]"}]
+                }
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_calls_handle_aegis_in_poll_each_iteration(
+    monkeypatch,
+):
+    """v0.3.4:poll 循环每次 chain 请求前都调 `_handle_aegis_in_poll`，
+    而非只调被 cooldown 短路的 `_try_solve_captcha_in_video`。
+    """
+    runner = PlaywrightVideoRunner(timeout=10, poll_interval=1)
+    page = MagicMock()
+
+    handle_mock = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "doupool.video.browser._handle_aegis_in_poll", handle_mock,
+    )
+
+    sse_text = (
+        "event:SSE_ACK\n"
+        "data:" + json.dumps({
+            "ack_client_meta": {"conversation_id": "C", "section_id": "S"},
+            "query_list": [{"question_id": "Q"}],
+        }) + "\n\n"
+    )
+    chain_no_creation = _build_chain_response_no_creation()
+
+    call_count = {"n": 0}
+
+    async def fake_evaluate(expr, arg=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None  # history.replaceState
+        if call_count["n"] == 2:
+            return {"status": 200, "text": sse_text}
+        return chain_no_creation  # chain 空 → 继续 poll
+
+    page.evaluate = fake_evaluate
+
+    async def fake_resolve(self, page, result, cancel_event):
+        raise RuntimeError("never reached - poll times out")
+
+    monkeypatch.setattr(
+        "doupool.video.browser.PlaywrightVideoRunner._resolve_original_download",
+        fake_resolve,
+    )
+    # 加速 poll:timeout=2s,poll_interval=1s,只跑 2 轮
+    runner.timeout = 2
+    runner.poll_interval = 1
+
+    bundle = MagicMock()
+    bundle.to_client_meta.return_value = {}
+
+    with pytest.raises(RuntimeError, match="视频生成超时"):
+        await runner._submit_and_poll(
+            page,
+            "prompt",
+            "seedance_v2.0_mini",
+            "16:9",
+            10,
+            "fp",
+            bundle,
+            "t2v",
+            [],
+            MagicMock(),
+            threading.Event(),
+            Path("/tmp/p"),
+            use_real_browser=False,
+        )
+    # 关键断言:`_handle_aegis_in_poll` 至少被调一次(每轮 poll 必跑)
+    assert handle_mock.await_count >= 1, (
+        f"v0.3.4 要求 poll 每轮都调 _handle_aegis_in_poll; "
+        f"实际 await_count={handle_mock.await_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_fails_fast_on_aegis_unresolvable(
+    monkeypatch,
+):
+    """v0.3.4 关键防御:探测到 aegis + 凭证不可用 → **立即抛** `_AegisUnresolvableInPoll`，
+    不浪费 30+ 分钟盲飞等 chain 响应。
+    """
+    runner = PlaywrightVideoRunner(timeout=600, poll_interval=5)
+    page = MagicMock()
+
+    # 让 chain 永远返空(模拟 video 实际未生成完),让 _handle_aegis_in_poll 失败能 break 出 loop
+    chain_no_creation = _build_chain_response_no_creation()
+    call_count = {"n": 0}
+
+    async def fake_evaluate(expr, arg=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        if call_count["n"] == 2:
+            return {
+                "status": 200,
+                "text": (
+                    "event:SSE_ACK\n"
+                    "data:" + json.dumps({
+                        "ack_client_meta": {
+                            "conversation_id": "C", "section_id": "S",
+                        },
+                        "query_list": [{"question_id": "Q"}],
+                    }) + "\n\n"
+                ),
+            }
+        return chain_no_creation
+
+    page.evaluate = fake_evaluate
+
+    # stub _handle_aegis_in_poll 让它第一轮就抛
+    call_log = {"handle_calls": 0}
+
+    async def fake_handle_aegis(*a, **kw):
+        call_log["handle_calls"] += 1
+        raise _AegisUnresolvableInPoll(
+            "aegis drag captcha blocking poll loop; captcha credentials not configured"
+        )
+
+    monkeypatch.setattr(
+        "doupool.video.browser._handle_aegis_in_poll", fake_handle_aegis,
+    )
+
+    bundle = MagicMock()
+    bundle.to_client_meta.return_value = {}
+
+    # 关键断言:必须抛 `_AegisUnresolvableInPoll`,而不是普通的「视频生成超时」
+    with pytest.raises(_AegisUnresolvableInPoll):
+        await runner._submit_and_poll(
+            page,
+            "prompt",
+            "seedance_v2.0_mini",
+            "16:9",
+            10,
+            "fp",
+            bundle,
+            "t2v",
+            [],
+            MagicMock(),
+            threading.Event(),
+            Path("/tmp/p"),
+            use_real_browser=False,
+        )
+
+    # 必须**第一轮就 fail**,不能拖到 timeout
+    assert call_log["handle_calls"] == 1, (
+        f"fail-fast 失败:handle_aegis_in_poll 应在第 1 轮就抛; "
+        f"实际被调 {call_log['handle_calls']} 次"
+    )
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_segments_wait_into_1s_intervals(monkeypatch):
+    """v0.3.4:wait_for_timeout 拆 1s 段 + 每段先 probe —— 而不是一次 wait 35*60s。
+
+    验证:poll_interval=3 时,1s 段循环应跑 3 次 `_probe_aegis_quickly`,
+    每次 sleep 1s。run_in_executor/真 asyncio.sleep 会被 monkeypatch。
+    """
+    runner = PlaywrightVideoRunner(timeout=2, poll_interval=3)
+    page = MagicMock()
+
+    chain_no_creation = _build_chain_response_no_creation()
+    sse_text = (
+        "event:SSE_ACK\n"
+        "data:" + json.dumps({
+            "ack_client_meta": {"conversation_id": "C", "section_id": "S"},
+            "query_list": [{"question_id": "Q"}],
+        }) + "\n\n"
+    )
+
+    call_count = {"n": 0}
+
+    async def fake_evaluate(expr, arg=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        if call_count["n"] == 2:
+            return {"status": 200, "text": sse_text}
+        return chain_no_creation
+
+    page.evaluate = fake_evaluate
+
+    handle_mock = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "doupool.video.browser._handle_aegis_in_poll", handle_mock,
+    )
+    probe_mock = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "doupool.video.browser._probe_aegis_quickly", probe_mock,
+    )
+    # 真 sleep 加速(避免 35 分钟测试)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(
+        "doupool.video.browser.asyncio.sleep", sleep_mock,
+    )
+
+    async def fake_resolve(self, page, result, cancel_event):
+        raise RuntimeError("never reached")
+
+    monkeypatch.setattr(
+        "doupool.video.browser.PlaywrightVideoRunner._resolve_original_download",
+        fake_resolve,
+    )
+
+    bundle = MagicMock()
+    bundle.to_client_meta.return_value = {}
+
+    with pytest.raises(RuntimeError, match="视频生成超时"):
+        await runner._submit_and_poll(
+            page,
+            "prompt",
+            "seedance_v2.0_mini",
+            "16:9",
+            10,
+            "fp",
+            bundle,
+            "t2v",
+            [],
+            MagicMock(),
+            threading.Event(),
+            Path("/tmp/p"),
+            use_real_browser=False,
+        )
+
+    # v0.3.4 关键契约:`_probe_aegis_quickly` 必被 poll 循环多次调
+    # (timeout=2, poll_interval=3,但 timeout 先到 → 至少 1 轮 → probe 至少 3 次)
+    assert probe_mock.await_count >= 1, (
+        f"_probe_aegis_quickly 必须至少调一次(每 1s 段都探); "
+        f"实际 {probe_mock.await_count} 次"
+    )
+    # 单次 1s sleep 调用次数 = 至少一轮 wait 内的 1s 段数
+    sleep_calls_of_1s = [
+        c for c in sleep_mock.await_args_list
+        if c.args and c.args[0] == 1
+    ]
+    assert len(sleep_calls_of_1s) >= 1, (
+        f"v0.3.4 要求 sleep(1) 段而不是 wait_for_timeout(大数); "
+        f"实际 sleep calls={sleep_mock.await_args_list}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_probe_exception_breaks_wait_not_loop(monkeypatch):
+    """v0.3.4:probe 在 wait 段里抛异常(典型:TargetClosedError,page 被用户关掉)
+    → break 出内层 wait,下一轮外层 while 仍跑 → 上层 finally close page。
+
+    不能因为 probe 异常就让整个 poll loop raise 出去 —— 那样会跳过
+    finally page.close(),导致 anchor page 被其它 task 抢走(详见 v0.2.26)。
+    """
+    runner = PlaywrightVideoRunner(timeout=2, poll_interval=3)
+    page = MagicMock()
+
+    chain_no_creation = _build_chain_response_no_creation()
+    sse_text = (
+        "event:SSE_ACK\n"
+        "data:" + json.dumps({
+            "ack_client_meta": {"conversation_id": "C", "section_id": "S"},
+            "query_list": [{"question_id": "Q"}],
+        }) + "\n\n"
+    )
+
+    call_count = {"n": 0}
+
+    async def fake_evaluate(expr, arg=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        if call_count["n"] == 2:
+            return {"status": 200, "text": sse_text}
+        return chain_no_creation
+
+    page.evaluate = fake_evaluate
+
+    handle_mock = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "doupool.video.browser._handle_aegis_in_poll", handle_mock,
+    )
+    # probe 每次都抛(模拟 page 在 wait 期间被外部关)
+    probe_mock = AsyncMock(side_effect=Exception("Target closed"))
+    monkeypatch.setattr(
+        "doupool.video.browser._probe_aegis_quickly", probe_mock,
+    )
+
+    async def fake_resolve(self, page, result, cancel_event):
+        raise RuntimeError("never reached")
+
+    monkeypatch.setattr(
+        "doupool.video.browser.PlaywrightVideoRunner._resolve_original_download",
+        fake_resolve,
+    )
+
+    bundle = MagicMock()
+    bundle.to_client_meta.return_value = {}
+
+    # 关键断言:不抛异常出去,而是跑完 poll_interval 段后由 while
+    # 条件(time.monotonic() >= deadline) 退出 → raise「视频生成超时」
+    with pytest.raises(RuntimeError, match="视频生成超时"):
+        await runner._submit_and_poll(
+            page,
+            "prompt",
+            "seedance_v2.0_mini",
+            "16:9",
+            10,
+            "fp",
+            bundle,
+            "t2v",
+            [],
+            MagicMock(),
+            threading.Event(),
+            Path("/tmp/p"),
+            use_real_browser=False,
+        )
