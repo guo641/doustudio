@@ -389,6 +389,7 @@ async def test_service_persists_and_runs_i2v_task(repository, temp_profile, tmp_
     assert saved.image_paths and "demo.png" in saved.image_paths
     assert runner.kwargs["mode"] == "i2v"
     assert runner.kwargs["image_paths"] and runner.kwargs["image_paths"][0].endswith("demo.png")
+    assert runner.kwargs["owner_task_id"] == task.id
 
 
 @pytest.mark.asyncio

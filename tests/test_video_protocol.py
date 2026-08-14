@@ -18,13 +18,13 @@ from doupool.video.protocol import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_seen_remote_task_ids():
-    """v0.3.5.2:dedup + cooldown 改 per-call 局部(见 protocol.py 注释),
-    module-level `_seen_remote_task_ids` / `_candidate_first_seen` 已删除。
-    fixture 保留为 no-op,让测试代码不需要在 v0.3.5.2 移除全局时再改一遍
-    (autouse 必须始终 yield)。
-    """
+def _reset_protocol_race_state():
+    """隔离 cooldown 与进程内 task owner,避免测试顺序影响结果。"""
+    protocol_module._candidate_first_seen.clear()
+    protocol_module._accepted_remote_ids.clear()
     yield
+    protocol_module._candidate_first_seen.clear()
+    protocol_module._accepted_remote_ids.clear()
 
 
 def test_build_new_conversation_video_payload():
@@ -843,8 +843,8 @@ def test_parse_creation_result_logs_warning_on_drift_fallthrough(caplog, monkeyp
 
     assert result is not None
     assert result["vid"] == "v-A1"
-    # v0.3.5.3 WARNING 标识(取代 v0.3.4.1 / v0.3.5 的标识)
-    assert "v0.3.5.3 race 防御兜底" in caplog.text
+    # v0.3.5.4 WARNING 标识(取代 v0.3.4.1 / v0.3.5 的标识)
+    assert "v0.3.5.4 race 防御兜底" in caplog.text
     assert "drift_vid=v-A1" in caplog.text
     assert "drift_creation_id=task-A1" in caplog.text
     assert "drift_envelope_ids=['msg-A1']" in caplog.text
@@ -866,14 +866,183 @@ from doupool.video import protocol as _protocol_module
 
 @pytest.fixture(autouse=False)
 def _reset_v035_seen():
-    """v0.3.5.3:fixture 清空 module-level `_candidate_first_seen`(cooldown
-    计时 dict)。`_seen_remote_task_ids` 已删除(dedup 在 v0.3.5.3 是 per-call
-    局部,无需清空)。
+    """v0.3.5.4:fixture 清空 module-level cooldown + task owner 状态。
     不加 autouse=True —— 只对 v0.3.5+ 测试显式请求,避免影响其他测试。
     """
     _protocol_module._candidate_first_seen.clear()
+    _protocol_module._accepted_remote_ids.clear()
     yield
     _protocol_module._candidate_first_seen.clear()
+    _protocol_module._accepted_remote_ids.clear()
+
+
+@pytest.mark.parametrize(
+    "identity_kwargs",
+    [
+        {"expected_local_message_ids": {"msg-A1"}},
+        {"expected_remote_task_ids": {"task-A1"}},
+    ],
+)
+def test_parse_creation_result_owner_claim_is_idempotent_and_exclusive(
+    identity_kwargs,
+):
+    creation = {
+        "id": "task-A1",
+        "video": {
+            "status": 3,
+            "vid": "v-A1",
+            "download_url": "https://example/A1.mp4",
+        },
+    }
+    response = _build_chain_response_with_envelope(
+        envelope_id="msg-A1",
+        creation=creation,
+    )
+
+    first = parse_creation_result(
+        response,
+        owner_task_id="owner-A",
+        **identity_kwargs,
+    )
+    same_owner = parse_creation_result(
+        response,
+        owner_task_id="owner-A",
+        **identity_kwargs,
+    )
+    other_owner = parse_creation_result(
+        response,
+        owner_task_id="owner-B",
+        **identity_kwargs,
+    )
+
+    assert first is not None
+    assert same_owner == first
+    assert other_owner is None
+    assert _protocol_module._accepted_remote_ids == {"task-A1": "owner-A"}
+
+
+def test_parse_creation_result_fallback_skips_foreign_owner_and_claims_next(
+    monkeypatch,
+):
+    monkeypatch.setattr(_protocol_module, "_FALLBACK_COOLDOWN_S", 0.0)
+    messages = []
+    for index in (1, 2):
+        content = json.dumps([{
+            "content": {
+                "creation_block": {
+                    "creations": [{
+                        "id": f"task-A{index}",
+                        "video": {
+                            "status": 3,
+                            "vid": f"v-A{index}",
+                            "download_url": f"https://example/A{index}.mp4",
+                        },
+                    }],
+                },
+            },
+        }])
+        messages.append({
+            "content": content,
+            "local_message_id": f"msg-foreign-{index}",
+        })
+    response = {
+        "downlink_body": {
+            "pull_singe_chain_downlink_body": {"messages": messages},
+        },
+    }
+
+    first = parse_creation_result(
+        response,
+        expected_local_message_ids={"msg-owner-A"},
+        owner_task_id="owner-A",
+    )
+    second = parse_creation_result(
+        response,
+        expected_local_message_ids={"msg-owner-B"},
+        owner_task_id="owner-B",
+    )
+
+    assert first is not None and first["remote_task_id"] == "task-A1"
+    assert second is not None and second["remote_task_id"] == "task-A2"
+    assert _protocol_module._accepted_remote_ids == {
+        "task-A1": "owner-A",
+        "task-A2": "owner-B",
+    }
+
+
+def test_parse_creation_result_does_not_claim_candidate_before_cooldown():
+    creation = {
+        "id": "task-A1",
+        "video": {
+            "status": 3,
+            "vid": "v-A1",
+            "download_url": "https://example/A1.mp4",
+        },
+    }
+    response = _build_chain_response_with_envelope(
+        envelope_id="msg-foreign",
+        creation=creation,
+    )
+
+    result = parse_creation_result(
+        response,
+        expected_local_message_ids={"msg-owner"},
+        owner_task_id="owner-A",
+    )
+
+    assert result is None
+    assert _protocol_module._accepted_remote_ids == {}
+
+
+def test_parse_creation_result_owner_none_keeps_legacy_behavior():
+    creation = {
+        "id": "task-A1",
+        "video": {
+            "status": 3,
+            "vid": "v-A1",
+            "download_url": "https://example/A1.mp4",
+        },
+    }
+    response = _build_chain_response_with_envelope(
+        envelope_id="msg-A1",
+        creation=creation,
+    )
+    _protocol_module._accepted_remote_ids["task-A1"] = "owner-A"
+
+    result = parse_creation_result(response, owner_task_id=None)
+
+    assert result is not None and result["remote_task_id"] == "task-A1"
+    assert _protocol_module._accepted_remote_ids == {"task-A1": "owner-A"}
+
+
+def test_parse_creation_result_missing_cid_does_not_create_empty_claim():
+    creation = {
+        "id": None,
+        "video": {
+            "status": 3,
+            "vid": "v-A1",
+            "download_url": "https://example/A1.mp4",
+        },
+    }
+    response = _build_chain_response_with_envelope(
+        envelope_id="msg-A1",
+        creation=creation,
+    )
+
+    result = parse_creation_result(
+        response,
+        expected_local_message_ids={"msg-A1"},
+        owner_task_id="owner-A",
+    )
+
+    assert result is not None
+    assert result["remote_task_id"] == ""
+    assert _protocol_module._accepted_remote_ids == {}
+
+
+def test_parse_creation_result_rejects_empty_owner_task_id():
+    with pytest.raises(ValueError, match="owner_task_id"):
+        parse_creation_result({}, owner_task_id="")
 
 
 def test_parse_creation_result_prefers_remote_id_over_local_envelope(_reset_v035_seen):
@@ -958,7 +1127,7 @@ def test_parse_creation_result_fallback_accepts_after_cooldown(_reset_v035_seen,
         )
     assert result is not None
     assert result["vid"] == "v-A1"
-    assert "v0.3.5.3 race 防御兜底" in caplog.text
+    assert "v0.3.5.4 race 防御兜底" in caplog.text
     assert "drift_creation_id=task-A1" in caplog.text
     assert "drift_vid=v-A1" in caplog.text
 
@@ -1241,7 +1410,7 @@ def test_parse_creation_result_fallback_accepted_after_cooldown(_reset_v035_seen
         )
     assert result is not None
     assert result["remote_task_id"] == "task-other"
-    assert "v0.3.5.3 race 防御兜底" in caplog.text
+    assert "v0.3.5.4 race 防御兜底" in caplog.text
     assert "cooldown_elapsed=" in caplog.text
 
 

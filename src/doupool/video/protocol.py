@@ -41,8 +41,39 @@ _FALLBACK_COOLDOWN_S = 5.0
 # v0.3.5.3:保留 module-level `_candidate_first_seen` —— per-cid 累计冷却时长。
 # key=cid(str),value=该 cid 在本进程 chain response 里首次出现的 monotonic
 # 时间戳。注意:这个 dict 只服务 candidates cooldown,不参与 dedup。
-# dedup 在 v0.3.5.3 是 per-call 局部(local_seen_remote_ids)。
 _candidate_first_seen: dict[str, float] = {}
+
+# v0.3.5.4:进程内记录 creation 的 task 归属。与 v0.3.5 的全局 set 不同,
+# 同 owner 可幂等重入,只有其他 task 会被跳过,因此不会重现「见过一次就让原
+# task 永久超时」的问题。owner=None 的兼容调用不读写此表。
+_accepted_remote_ids: dict[str, str] = {}
+
+
+def _claim_remote_id_for_owner(payload: dict[str, str], owner_task_id: str | None) -> bool:
+    """为最终选中的 creation 建立进程内归属;返回当前 task 是否可接受。"""
+    if owner_task_id is None:
+        return True
+
+    cid = payload.get("remote_task_id", "")
+    if not cid:
+        _LOGGER.warning(
+            "v0.3.5.4 creation 缺少 cid,无法记录归属 owner_task_id=%s",
+            owner_task_id,
+        )
+        return True
+
+    owner = _accepted_remote_ids.get(cid)
+    if owner is not None and owner != owner_task_id:
+        _LOGGER.warning(
+            "v0.3.5.4 creation cid=%s 已归属 task=%s,当前 task=%s 跳过",
+            cid,
+            owner,
+            owner_task_id,
+        )
+        return False
+
+    _accepted_remote_ids[cid] = owner_task_id
+    return True
 
 
 MODELS = {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}
@@ -488,6 +519,7 @@ def parse_creation_result(
     *,
     expected_local_message_ids: set[str] | None = None,
     expected_remote_task_ids: set[str] | None = None,
+    owner_task_id: str | None = None,
 ) -> dict[str, str] | None:
     """从 chain 响应里解析视频生成结果。
 
@@ -547,7 +579,15 @@ def parse_creation_result(
         否则 v0.3.5.2(两个都 per-call)所有 first_seen 每轮重置成 `now`,
         cooldown 永远等不到 5s → 所有 task 全部 7min timeout。
     - 优先级 1 > 优先级 2 > 兜底(cooldown 后)。
+
+    v0.3.5.4 进程内 task-aware dedup:
+    - `owner_task_id` 非空时,creation.id 首次被接受即记录归属。
+    - 同 owner 可幂等接受;其他 owner 必须跳过并继续检查后续 creation。
+    - `owner_task_id=None` 保持旧调用行为,不读写归属表。
     """
+    if owner_task_id == "":
+        raise ValueError("owner_task_id 不能为空字符串")
+
     messages = response.get("downlink_body", {}).get("pull_singe_chain_downlink_body", {}).get("messages", [])
 
     # v0.3.3:同时记录 envelope id 和 decoded blocks,这样成功块扫描可以基于
@@ -581,7 +621,7 @@ def parse_creation_result(
                 if not (video.get("status") == 3 and video.get("download_url")):
                     # 非法 creation(还在生成中 / 失败 / 缺 URL)→ 不参与分类
                     continue
-                creation_id = str(creation.get("id", ""))
+                creation_id = str(creation.get("id") or "")
                 payload = {
                     "remote_task_id": creation_id,
                     "vid": str(video.get("vid", "")),
@@ -645,95 +685,75 @@ def parse_creation_result(
         sorted(expected_local_message_ids) if expected_local_message_ids else "None",
     )
 
-    # v0.3.5.3:per-call 局部 dedup —— 同一次 run 的 poll 循环内不重复 accept
-    # 同一 cid,跨 run 不 dedup。完全替换 v0.3.5 的 module-level
-    # `_seen_remote_task_ids`(实测有 bug:同账号并发场景下字节
-    # /im/chain/single 会把 A1 的 creation 反复塞给 A2 的 chain response,
-    # A2 的 candidates 列表里永远是 A1 的 cid,而 A1 的 cid 已经在前面某次
-    # task accept 时写入全局 dedup → A2 永久跳过 → 7min timeout)。
-    # 注:first_seen 仍用 module-level `_candidate_first_seen`(per-cid
-    # 跨 run 累计冷却时长),不然 cooldown 永远等不到 5s。
-    local_seen_remote_ids: set[str] = set()
-
-    # v0.3.5:优先级 1 命中 → 直接 return,不打 WARNING(强证据)。
-    if matches_remote:
-        # 把命中 id 加进 dedup set,避免同一 task 后续 poll 又被当 fallback。
-        for m in matches_remote:
-            local_seen_remote_ids.add(m["remote_task_id"])
-        return matches_remote[0]
+    # v0.3.5.4:所有成功返回路径都经过 task owner gate。不能直接取 [0],
+    # 因为同一响应的第一项可能已归属其他 task,后面仍可能有本 task 的结果。
+    for payload in matches_remote:
+        if _claim_remote_id_for_owner(payload, owner_task_id):
+            return payload
 
     # v0.3.5:优先级 2 命中 → 直接 return,不打 WARNING(envelope 匹配足以
     # 证明是我们 submit 的)。
-    # 注意:完全向后兼容路径(expected 都 None)不要写入 dedup,
-    # 否则会破坏既有调用方的 dedup 假设。
-    if matches_local:
-        if (
-            expected_remote_task_ids is not None
-            or expected_local_message_ids is not None
-        ):
-            for m in matches_local:
-                local_seen_remote_ids.add(m["remote_task_id"])
-        return matches_local[0]
+    for payload in matches_local:
+        if _claim_remote_id_for_owner(payload, owner_task_id):
+            return payload
 
-    # v0.3.5.3:兜底 candidates —— 5s cooldown(per-cid 跨 run 累计计时)
-    # + per-call dedup。first_seen 必须 module-level(否则 cooldown 永远等
-    # 不到 5s,这是 v0.3.5.2 出过的问题);dedup 必须 per-call(否则 cid 永
-    # 久跳过,这是 v0.3.5 出过的问题)。两者解耦是 v0.3.5.3 的设计核心。
+    # v0.3.5.4:兜底 candidates —— 5s cooldown(per-cid 跨 run 累计计时)
+    # + task-aware module owner。first_seen 必须 module-level(否则 cooldown 永远等
+    # 不到 5s,这是 v0.3.5.2 出过的问题);owner map 同样是 module-level,
+    # 但同 owner 可幂等接受,只阻止其他 task 重复领取同一 cid。
     if candidates and (
         expected_remote_task_ids is not None
         or expected_local_message_ids is not None
     ):
         now = time.monotonic()
-        accepted_envelope_ids: set[str] = set()
-        accepted_payload: dict | None = None
-        # 跟踪 cooldown 最早出现的 candidate 时间(用于打 WARNING 时记录
-        # 实际等多久才接受)。
-        earliest_first_seen = now
         # v0.3.5.3:first_seen 用 module-level `_candidate_first_seen`(per-cid
         # 跨 run 累计冷却时长),不是 per-call 局部 dict。v0.3.5.2 用 per-call
         # 局部导致 first_seen 每轮重置为 `now`,cooldown 永远等不到 5s。
         for envelope_ids, payload in candidates:
             cid = payload["remote_task_id"]
+            claimed_owner = (
+                _accepted_remote_ids.get(cid)
+                if owner_task_id is not None and cid
+                else None
+            )
+            if claimed_owner == owner_task_id and owner_task_id is not None:
+                # 此 cid 此前已经通过接受门槛,同 task 重试可幂等返回。
+                return payload
+            if claimed_owner is not None and claimed_owner != owner_task_id:
+                _claim_remote_id_for_owner(payload, owner_task_id)
+                continue
+
             first_seen = _candidate_first_seen.setdefault(cid, now)
-            earliest_first_seen = min(earliest_first_seen, first_seen)
-            # v0.3.5.3 DEBUG:candidates 遍历时把每个 cid + 是否在 dedup +
-            # cooldown 剩余秒数打出来。dedup 命中 = 这个 cid 在本 call 内已
-            # accept 过(per-call 局部,跨 call 不共享)。cooldown 未到 =
-            # 候选存在但 first_seen 还在 5s 窗口内。
+            # v0.3.5.4 DEBUG:candidates 遍历时把每个 cid + 当前 owner +
+            # cooldown 剩余秒数打出来。cooldown 未到 = 候选存在但 first_seen
+            # 还在 5s 窗口内;此时不能提前写入 owner。
             _LOGGER.info(
-                "[v0.3.5.3 DEBUG candidates loop] cid=%s in_dedup=%s "
+                "[v0.3.5.4 DEBUG candidates loop] cid=%s claimed_owner=%s "
                 "first_seen_age=%.2fs cooldown_left=%.2fs",
                 cid,
-                cid in local_seen_remote_ids,
+                claimed_owner,
                 now - first_seen,
                 max(0.0, _FALLBACK_COOLDOWN_S - (now - first_seen)),
             )
-            if cid in local_seen_remote_ids:
-                # 本 call 内已接受过,跳过(防止重复 deliver 同一视频)
-                continue
             if now - first_seen < _FALLBACK_COOLDOWN_S:
                 # 还没过 5s,等下一轮 poll
                 continue
-            accepted_envelope_ids = envelope_ids
-            accepted_payload = payload
-            break
-
-        if accepted_payload is not None:
-            local_seen_remote_ids.add(accepted_payload["remote_task_id"])
+            if not _claim_remote_id_for_owner(payload, owner_task_id):
+                continue
             _LOGGER.warning(
-                "v0.3.5.3 race 防御兜底:5s cooldown 后仍未命中 expected_remote_task_ids "
-                "/ expected_local_message_ids, accept candidates[0]。candidates=%d, "
+                "v0.3.5.4 race 防御兜底:5s cooldown 后仍未命中 expected_remote_task_ids "
+                "/ expected_local_message_ids, accept candidate。candidates=%d, "
                 "expected_remote=%d, expected_local=%d, drift_envelope_ids=%s, "
                 "drift_creation_id=%s, drift_vid=%s, cooldown_elapsed=%.1fs",
                 len(candidates),
                 len(expected_remote_task_ids) if expected_remote_task_ids else 0,
                 len(expected_local_message_ids) if expected_local_message_ids else 0,
-                sorted(accepted_envelope_ids),
-                accepted_payload.get("remote_task_id", ""),
-                accepted_payload.get("vid", ""),
-                now - earliest_first_seen,
+                sorted(envelope_ids),
+                payload.get("remote_task_id", ""),
+                payload.get("vid", ""),
+                now - first_seen,
             )
-            return accepted_payload
+            return payload
 
     # 2. v0.2.21:policy 关键词兜底扫描 — 任意 block 含「侵权|违规|换个主题|无法
     # 返回该内容|sensitive content」等关键词 → 抛 rejected,service 层立即 failed。

@@ -1381,6 +1381,7 @@ class VideoTaskService:
                         pc_version=settings.get("pc_version"),
                         max_reject_retries=max_reject_retries,
                         window_visible=runner_window_visible,
+                        owner_task_id=task_id,
                     )
                     self.repository.update_video_task(task_id, status="succeeded", **result)
                     self.logger.info(

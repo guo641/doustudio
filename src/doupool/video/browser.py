@@ -1255,11 +1255,14 @@ def _extract_local_message_ids_from_ack_payload(ack_payload: dict) -> set[str]:
 
     浏览器 UI 路径(`use_real_browser=True`)下 id 由前端 crypto.randomUUID
     生成,Python 侧拿不到。服务端 echo 回来的 ack_payload 通常在以下位置
-    带 id(字节不同版本字段命名略有差异,做宽口径 fallback):
+    带 id(字节不同版本字段命名略有差异,只接受显式 local 字段):
       - `ack_client_meta.local_message_id`(单值)
       - `ack_client_meta.local_message_ids`(列表)
       - `query_list[].local_message_id`(每条 query 一个)
       - `query_list[].local_message_ids`(列表)
+
+    通用 `message_id` 是服务端消息 ID(UUIDv1),不能当作浏览器生成的
+    `local_message_id`(UUIDv4),否则并发 task 会拿到错误的 expected identity。
 
     字段缺失 / 全部空 → 返回空 set,调用方走 fall through 不阻塞正常任务。
     """
@@ -1273,20 +1276,18 @@ def _extract_local_message_ids_from_ack_payload(ack_payload: dict) -> set[str]:
                 if isinstance(item, str) and item:
                     ids.add(item)
                 elif isinstance(item, dict):
-                    inner = item.get("local_message_id") or item.get("message_id")
+                    inner = item.get("local_message_id")
                     _ingest(inner)
 
     meta = ack_payload.get("ack_client_meta") or {}
     _ingest(meta.get("local_message_id"))
     _ingest(meta.get("local_message_ids"))
-    _ingest(meta.get("message_id"))
 
     for query in ack_payload.get("query_list") or []:
         if not isinstance(query, dict):
             continue
         _ingest(query.get("local_message_id"))
         _ingest(query.get("local_message_ids"))
-        _ingest(query.get("message_id"))
 
     return ids
 
@@ -1676,6 +1677,7 @@ class PlaywrightVideoRunner:
         pc_version: str | None = None,
         max_reject_retries: int = 0,
         window_visible: bool = False,
+        owner_task_id: str | None = None,
     ) -> dict[str, str]:
         """单账号一次性视频生成。
 
@@ -1784,6 +1786,7 @@ class PlaywrightVideoRunner:
                         cancel_event,
                         profile_dir,
                         use_real_browser=True,  # v0.3.2:UI click 路径
+                        owner_task_id=owner_task_id,
                     )
                 except DoubaoRateLimited as exc:
                     # v0.3.2.5:shark_admin 风控拦截 —— **不能**关浏览器。
@@ -1903,6 +1906,7 @@ class PlaywrightVideoRunner:
         use_real_browser: bool = True,
         expected_local_message_ids: set[str] | None = None,
         expected_remote_task_ids: set[str] | None = None,
+        owner_task_id: str | None = None,
     ) -> dict[str, str]:
         """v0.3.2:run() 的 submit + poll 切片,被 retry loop 复用。
 
@@ -2038,6 +2042,7 @@ class PlaywrightVideoRunner:
                 chain["data"],
                 expected_local_message_ids=expected_local_message_ids,
                 expected_remote_task_ids=expected_remote_task_ids,
+                owner_task_id=owner_task_id,
             )
             if result:
                 update(status="resolving", **result)

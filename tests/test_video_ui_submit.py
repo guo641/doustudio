@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from doupool.captcha.solver import CaptchaKind
+from doupool.video import protocol as protocol_module
 from doupool.video.browser import (
     EDITOR_SEL,
     SEND_BTN_SEL,
@@ -34,6 +35,7 @@ from doupool.video.browser import (
     _AegisUnresolvableInPoll,
     _ack_interceptor,
     _build_launch_kwargs,
+    _extract_local_message_ids_from_ack_payload,
     _handle_aegis_in_poll,
     _pre_submit_aegis_gate,
     _probe_aegis_quickly,
@@ -257,6 +259,49 @@ async def test_submit_via_ui_goto_when_on_other_page(monkeypatch):
 # ------------------------- _ack_interceptor ------------------------- #
 
 
+def test_extract_local_ids_ignores_generic_message_id_fallbacks():
+    payload = {
+        "ack_client_meta": {
+            "message_id": "meta-generic",
+            "local_message_ids": [{"message_id": "meta-list-generic"}],
+        },
+        "query_list": [{
+            "message_id": "query-generic",
+            "local_message_ids": [{"message_id": "query-list-generic"}],
+        }],
+    }
+
+    assert _extract_local_message_ids_from_ack_payload(payload) == set()
+
+
+def test_extract_local_ids_keeps_only_explicit_local_fields():
+    payload = {
+        "ack_client_meta": {
+            "local_message_id": "meta-one",
+            "local_message_ids": [
+                "meta-two",
+                {"local_message_id": "meta-three"},
+            ],
+        },
+        "query_list": [{
+            "local_message_id": "query-one",
+            "local_message_ids": [
+                "query-two",
+                {"local_message_id": "query-three"},
+            ],
+        }],
+    }
+
+    assert _extract_local_message_ids_from_ack_payload(payload) == {
+        "meta-one",
+        "meta-two",
+        "meta-three",
+        "query-one",
+        "query-two",
+        "query-three",
+    }
+
+
 @pytest.mark.asyncio
 async def test_ack_interceptor_does_not_leak_listener():
     page = _FakePage()
@@ -313,6 +358,7 @@ async def test_submit_and_poll_use_real_browser_returns_three_field_ack(monkeypa
     """
     runner = PlaywrightVideoRunner(timeout=10, poll_interval=1)
     page = MagicMock()
+    monkeypatch.setattr(protocol_module, "_accepted_remote_ids", {})
 
     async def fake_submit_via_ui(*a, **kw):
         return None
@@ -398,12 +444,14 @@ async def test_submit_and_poll_use_real_browser_returns_three_field_ack(monkeypa
         cancel,
         Path("/tmp/p"),
         use_real_browser=True,
+        owner_task_id="owner-task",
     )
 
     # 契约:result 必含 3 字段(service.py **ack 解包不会 KeyError)
     assert result["conversation_id"] == "C1"
     assert result["section_id"] == "S1"
     assert result["question_id"] == "Q1"
+    assert protocol_module._accepted_remote_ids == {"x": "owner-task"}
     # update 至少调过一次 status=generating 把 ack 写进去
     update.assert_any_call(status="generating", **result)
 
@@ -1115,12 +1163,17 @@ async def test_run_shark_admin_keepalive_solve_succeeds_then_retry_succeeds(
         duration=10,
         update=update,
         cancel_event=cancel,
+        owner_task_id="owner-task",
     )
 
     # 重试成功 → 返 ack
     assert result == final_ack
     # 两次 submit_and_poll 调用
     assert submit_and_poll_mock.await_count == 2
+    assert all(
+        call.kwargs["owner_task_id"] == "owner-task"
+        for call in submit_and_poll_mock.await_args_list
+    )
     # gate 必须被调一次(第一次冒泡风控时),**不能在第二次跑前再调**
     assert gate_mock.await_count == 1, (
         f"gate 应只在第一次风控后调一次,等弹窗 + 解完后放行重提; "
