@@ -16,6 +16,7 @@ mock 策略:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from contextlib import asynccontextmanager
@@ -454,6 +455,270 @@ async def test_submit_and_poll_use_real_browser_returns_three_field_ack(monkeypa
     assert protocol_module._accepted_remote_ids == {"x": "owner-task"}
     # update 至少调过一次 status=generating 把 ack 写进去
     update.assert_any_call(status="generating", **result)
+
+
+@pytest.mark.asyncio
+async def test_submit_and_poll_serializes_submit_ack_within_profile(
+    monkeypatch,
+    tmp_path,
+):
+    """同 profile 串行 submit→ACK,但进入 poll 后仍可并发。"""
+    import doupool.video.browser as browser_mod
+
+    runner = PlaywrightVideoRunner(timeout=10, poll_interval=1)
+    profile = tmp_path / "shared-profile"
+
+    class _ObservedLock(asyncio.Lock):
+        def __init__(self):
+            super().__init__()
+            self.acquire_calls = 0
+            self.second_attempted = asyncio.Event()
+
+        async def acquire(self):
+            self.acquire_calls += 1
+            if self.acquire_calls == 2:
+                self.second_attempted.set()
+            return await super().acquire()
+
+    observed_lock = _ObservedLock()
+    runner._submit_ack_locks[str(profile)] = observed_lock
+
+    first_submit_entered = asyncio.Event()
+    release_first_ack = asyncio.Event()
+    both_polling = asyncio.Event()
+    release_poll = asyncio.Event()
+    submit_order: list[str] = []
+    poll_order: list[str] = []
+    submit_ack_active = 0
+    max_submit_ack_active = 0
+    poll_active = 0
+    max_poll_active = 0
+
+    @asynccontextmanager
+    async def fake_interceptor(page):
+        nonlocal submit_ack_active, max_submit_ack_active
+        submit_ack_active += 1
+        max_submit_ack_active = max(max_submit_ack_active, submit_ack_active)
+        try:
+            yield {"page": page}
+        finally:
+            submit_ack_active -= 1
+
+    async def fake_submit_via_ui(page, *args, **kwargs):
+        submit_order.append(page.task_name)
+        if page.task_name == "task-1":
+            first_submit_entered.set()
+
+    async def fake_wait_for_ack(state, *, timeout):
+        page = state["page"]
+        if page.task_name == "task-1":
+            await release_first_ack.wait()
+        return page.task_name
+
+    def make_page(task_name: str):
+        page = MagicMock()
+        page.task_name = task_name
+
+        async def evaluate(*args, **kwargs):
+            nonlocal poll_active, max_poll_active
+            poll_active += 1
+            max_poll_active = max(max_poll_active, poll_active)
+            poll_order.append(task_name)
+            if poll_active == 2:
+                both_polling.set()
+            try:
+                await release_poll.wait()
+                return {"status": 200, "data": {}}
+            finally:
+                poll_active -= 1
+
+        page.evaluate = AsyncMock(side_effect=evaluate)
+        return page
+
+    result_payload = {
+        "remote_task_id": "cid",
+        "vid": "vid",
+        "fallback_result_url": "https://example/video.mp4",
+        "cover_url": "",
+    }
+
+    monkeypatch.setattr(browser_mod, "_ack_interceptor", fake_interceptor)
+    monkeypatch.setattr(browser_mod, "submit_via_ui", fake_submit_via_ui)
+    monkeypatch.setattr(browser_mod, "_wait_for_ack", fake_wait_for_ack)
+    monkeypatch.setattr(
+        browser_mod,
+        "parse_sse_ack",
+        lambda text: {
+            "conversation_id": f"conversation-{text}",
+            "section_id": f"section-{text}",
+            "question_id": f"question-{text}",
+        },
+    )
+    monkeypatch.setattr(browser_mod, "_handle_aegis_in_poll", AsyncMock())
+    monkeypatch.setattr(
+        browser_mod,
+        "parse_creation_result",
+        MagicMock(return_value=result_payload),
+    )
+    monkeypatch.setattr(
+        PlaywrightVideoRunner,
+        "_resolve_original_download",
+        AsyncMock(return_value=result_payload),
+    )
+
+    async def invoke(page):
+        return await runner._submit_and_poll(
+            page,
+            page.task_name,
+            "seedance_v2.0_mini",
+            "16:9",
+            10,
+            "fp",
+            MagicMock(),
+            "t2v",
+            [],
+            MagicMock(),
+            threading.Event(),
+            profile,
+            use_real_browser=True,
+        )
+
+    tasks: list[asyncio.Task] = []
+    try:
+        tasks.append(asyncio.create_task(invoke(make_page("task-1"))))
+        await asyncio.wait_for(first_submit_entered.wait(), timeout=2)
+
+        tasks.append(asyncio.create_task(invoke(make_page("task-2"))))
+        await asyncio.wait_for(observed_lock.second_attempted.wait(), timeout=2)
+        assert submit_order == ["task-1"]
+        assert max_submit_ack_active == 1
+
+        release_first_ack.set()
+        await asyncio.wait_for(both_polling.wait(), timeout=2)
+        assert submit_order == ["task-1", "task-2"]
+        assert set(poll_order) == {"task-1", "task-2"}
+        assert max_poll_active == 2
+
+        release_poll.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+    finally:
+        release_first_ack.set()
+        release_poll.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert observed_lock.acquire_calls == 2
+    assert max_submit_ack_active == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_and_poll_concurrent_across_profiles(monkeypatch, tmp_path):
+    """不同 profile 使用不同锁,submit→ACK 可以并发。"""
+    import doupool.video.browser as browser_mod
+
+    runner = PlaywrightVideoRunner(timeout=10, poll_interval=1)
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    both_submitting = asyncio.Event()
+    release_submits = asyncio.Event()
+    active_submits = 0
+    max_active_submits = 0
+    submit_order: list[str] = []
+
+    @asynccontextmanager
+    async def fake_interceptor(page):
+        yield {"page": page}
+
+    async def fake_submit_via_ui(page, *args, **kwargs):
+        nonlocal active_submits, max_active_submits
+        active_submits += 1
+        max_active_submits = max(max_active_submits, active_submits)
+        submit_order.append(page.task_name)
+        if active_submits == 2:
+            both_submitting.set()
+        try:
+            await release_submits.wait()
+        finally:
+            active_submits -= 1
+
+    async def fake_wait_for_ack(state, *, timeout):
+        return state["page"].task_name
+
+    result_payload = {
+        "remote_task_id": "cid",
+        "vid": "vid",
+        "fallback_result_url": "https://example/video.mp4",
+        "cover_url": "",
+    }
+    chain_response = {"status": 200, "data": {}}
+
+    monkeypatch.setattr(browser_mod, "_ack_interceptor", fake_interceptor)
+    monkeypatch.setattr(browser_mod, "submit_via_ui", fake_submit_via_ui)
+    monkeypatch.setattr(browser_mod, "_wait_for_ack", fake_wait_for_ack)
+    monkeypatch.setattr(
+        browser_mod,
+        "parse_sse_ack",
+        lambda text: {
+            "conversation_id": f"conversation-{text}",
+            "section_id": f"section-{text}",
+            "question_id": f"question-{text}",
+        },
+    )
+    monkeypatch.setattr(browser_mod, "_handle_aegis_in_poll", AsyncMock())
+    monkeypatch.setattr(
+        browser_mod,
+        "parse_creation_result",
+        MagicMock(return_value=result_payload),
+    )
+    monkeypatch.setattr(
+        PlaywrightVideoRunner,
+        "_resolve_original_download",
+        AsyncMock(return_value=result_payload),
+    )
+
+    def make_page(task_name: str):
+        page = MagicMock()
+        page.task_name = task_name
+        page.evaluate = AsyncMock(return_value=chain_response)
+        return page
+
+    async def invoke(page, profile):
+        return await runner._submit_and_poll(
+            page,
+            page.task_name,
+            "seedance_v2.0_mini",
+            "16:9",
+            10,
+            "fp",
+            MagicMock(),
+            "t2v",
+            [],
+            MagicMock(),
+            threading.Event(),
+            profile,
+            use_real_browser=True,
+        )
+
+    tasks = [
+        asyncio.create_task(invoke(make_page("task-1"), profile_a)),
+        asyncio.create_task(invoke(make_page("task-2"), profile_b)),
+    ]
+    try:
+        await asyncio.wait_for(both_submitting.wait(), timeout=2)
+        assert max_active_submits == 2
+        assert set(submit_order) == {"task-1", "task-2"}
+        assert runner._submit_ack_lock_for(profile_a) is not runner._submit_ack_lock_for(profile_b)
+
+        release_submits.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+    finally:
+        release_submits.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio

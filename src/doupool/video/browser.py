@@ -1449,6 +1449,7 @@ class PlaywrightVideoRunner:
         self._contexts: dict[str, BrowserContext] = {}
         self._tokens: dict[str, TokenBundle] = {}
         self._init_locks: dict[str, asyncio.Lock] = {}
+        self._submit_ack_locks: dict[str, asyncio.Lock] = {}
 
     def _lock_for(self, profile_dir: Path) -> asyncio.Lock:
         """v0.2.19:per-profile 异步锁 —— lazy 创建,保证同一 profile
@@ -1459,6 +1460,13 @@ class PlaywrightVideoRunner:
         if key not in self._init_locks:
             self._init_locks[key] = asyncio.Lock()
         return self._init_locks[key]
+
+    def _submit_ack_lock_for(self, profile_dir: Path) -> asyncio.Lock:
+        """同一 profile 仅串行 UI submit 到 ACK,后续 poll 继续并发。"""
+        key = str(profile_dir)
+        if key not in self._submit_ack_locks:
+            self._submit_ack_locks[key] = asyncio.Lock()
+        return self._submit_ack_locks[key]
 
     async def _ensure_playwright(self):
         if self._pw is None:
@@ -1743,6 +1751,8 @@ class PlaywrightVideoRunner:
 
             # i2v 图片上传一次性完成,retry 不重复上传(豆包图片上传有独立
             # 签名逻辑,重传会拿到不同 OSS key,反而被风控)。
+            # TODO(v0.3.5.6):同 profile 的 image upload 仍在 submit→ACK 锁外,
+            # page.evaluate 上传的并发边界留待后续单独处理。
             uploaded_images: list[dict] = []
             if mode == "i2v":
                 paths = [Path(item) for item in (image_paths or [])]
@@ -1930,17 +1940,20 @@ class PlaywrightVideoRunner:
         """
         if use_real_browser:
             # v0.3.2:UI click → /chat/completion 响应 → parse_sse_ack。
-            # 拦截器在 context 内部拿 state,exit 时自动 remove_listener。
-            async with _ack_interceptor(page) as ack_state:
-                await submit_via_ui(
-                    page,
-                    prompt,
-                    profile_dir=profile_dir,
-                    update=update,
-                )
-                text = await _wait_for_ack(
-                    ack_state, timeout=_UI_ACK_WAIT_SECONDS,
-                )
+            # v0.3.5.5:同 profile 仅串行 submit→ACK,避免并发页面拿到同一组
+            # conversation/section/question。锁在 poll 前释放,生成仍可并发。
+            async with self._submit_ack_lock_for(profile_dir):
+                # 拦截器在 context 内部拿 state,exit 时自动 remove_listener。
+                async with _ack_interceptor(page) as ack_state:
+                    await submit_via_ui(
+                        page,
+                        prompt,
+                        profile_dir=profile_dir,
+                        update=update,
+                    )
+                    text = await _wait_for_ack(
+                        ack_state, timeout=_UI_ACK_WAIT_SECONDS,
+                    )
             ack = parse_sse_ack(text)
             # v0.3.3 race 防御:浏览器侧 crypto.randomUUID 生成的 id 我们
             # Python 侧拿不到,只能从 server echo 的 SSE_ACK payload 里抽。
