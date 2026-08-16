@@ -47,7 +47,12 @@ class _FakeElement:
 
     def _text(self) -> str:
         if self.kind == "trigger":
-            return f"{self.page.display_ratio} · {self.page.display_duration}s"
+            text = (
+                f"{self.page.display_ratio} · {self.page.display_duration}s"
+            )
+            return (
+                f"{self.page.trigger_prefix}{text}{self.page.trigger_suffix}"
+            )
         return self.value or ""
 
     async def is_visible(self) -> bool:
@@ -116,6 +121,15 @@ class _FakeElement:
         self.page.schedule_trigger_update()
 
     async def inner_text(self) -> str:
+        if self.kind == "trigger":
+            self.page.trigger_inner_text_calls += 1
+            if self.page.trigger_inner_text_calls <= self.page.readback_stale_calls:
+                stale = self.page.readback_stale_duration
+                if stale is not None:
+                    return (
+                        f"{self.page.trigger_prefix}{self.page.display_ratio} · "
+                        f"{stale}s{self.page.trigger_suffix}"
+                    )
         return self._text()
 
     async def bounding_box(self):
@@ -137,9 +151,21 @@ class _FakeLocator:
     def _items(self) -> list[_FakeElement]:
         if self.selector == "button":
             items: list[_FakeElement] = []
-            if self.page.has_trigger:
+            if self.page.has_trigger and self.page.trigger_tag == "button":
                 items.append(self.page.trigger)
             items.extend(self.page.ratio_elements)
+        elif self.selector == "role=button":
+            items = []
+            if self.page.has_trigger and self.page.trigger_role:
+                items.append(self.page.trigger)
+        elif self.selector in {"[role='button'], button", "button, [role='button']"}:
+            items = []
+            if self.page.has_trigger and (
+                self.page.trigger_tag == "button" or self.page.trigger_role
+            ):
+                items.append(self.page.trigger)
+            items.extend(self.page.ratio_elements)
+            items.extend(self.page.extra_buttons)
         elif self.selector == "input[type='range']":
             items = (
                 [self.page.range_element]
@@ -187,6 +213,13 @@ class _FakePage:
         close_menu_on_ratio_click: bool = False,
         ratio: str = "自动",
         duration: int = 5,
+        trigger_tag: str = "button",
+        trigger_role: bool = True,
+        trigger_prefix: str = "",
+        trigger_suffix: str = "",
+        readback_stale_calls: int = 0,
+        readback_stale_duration: int | None = None,
+        extra_buttons: list[str] | None = None,
     ):
         self.url = "https://www.doubao.com/chat/create-image"
         self.has_trigger = has_trigger
@@ -201,6 +234,13 @@ class _FakePage:
         self.duration = duration
         self.display_ratio = ratio
         self.display_duration = duration
+        self.trigger_tag = trigger_tag
+        self.trigger_role = trigger_role
+        self.trigger_prefix = trigger_prefix
+        self.trigger_suffix = trigger_suffix
+        self.readback_stale_calls = readback_stale_calls
+        self.readback_stale_duration = readback_stale_duration
+        self.trigger_inner_text_calls = 0
         self.trigger_updates = trigger_updates
         self.trigger_update_delay_ms = trigger_update_delay_ms
         self.pending_trigger_update_ms: int | None = None
@@ -212,6 +252,10 @@ class _FakePage:
         self.slider_presses: list[str] = []
         self.slider_focused = False
         self.trigger = _FakeElement(self, "trigger")
+        self.extra_buttons = [
+            _FakeElement(self, "other", value)
+            for value in (extra_buttons or [])
+        ]
         self.ratio_elements = [
             _FakeElement(self, "ratio", value)
             for value in (
@@ -227,6 +271,10 @@ class _FakePage:
 
     def locator(self, selector: str):
         return _FakeLocator(self, selector)
+
+    def get_by_role(self, role: str):
+        assert role == "button"
+        return _FakeLocator(self, "role=button")
 
     def schedule_trigger_update(self):
         if not self.trigger_updates:
@@ -275,6 +323,86 @@ async def test_apply_video_options_selects_ratio_and_native_range_duration():
     assert page.range_fills == ["10"]
     assert page.keyboard.presses[-1] == "Escape"
     assert page.menu_open is False
+
+
+@pytest.mark.asyncio
+async def test_apply_video_options_finds_role_button_trigger_with_nested_text():
+    """The trigger may be a div[role=button] rather than a native button."""
+    page = _FakePage(
+        trigger_tag="div",
+        trigger_role=True,
+        trigger_prefix="视频生成 · ",
+        trigger_suffix=" · 默认",
+        ratio="自动",
+        duration=9,
+    )
+
+    await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert page.trigger_tag == "div"
+    assert page.trigger_role is True
+    assert page.ratio == "1:1"
+    assert page.duration == 5
+    assert page.trigger_clicks == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_video_options_retries_readback_for_prefixed_trigger(caplog):
+    """A stale first readback must enter the second independent readback phase."""
+    # The first phase polls 30 times at 50 ms. Keep the old duration for that
+    # entire phase, then expose the updated value on the retry phase.
+    page = _FakePage(
+        ratio="自动",
+        duration=9,
+        trigger_prefix="视频生成 · ",
+        trigger_suffix=" · 默认",
+        readback_stale_calls=30,
+        readback_stale_duration=9,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="doupool.video.browser"):
+        await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert page.ratio == "1:1"
+    assert page.duration == 5
+    assert page.trigger_inner_text_calls >= 31
+    assert page.trigger._text() == "视频生成 · 1:1 · 5s · 默认"
+    assert "event=video_options_readback_retry" in caplog.text
+    assert "actual='视频生成 · 1:1 · 9s · 默认'" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_apply_video_options_missing_trigger_logs_url_and_visible_buttons(caplog):
+    page = _FakePage(
+        has_trigger=False,
+        extra_buttons=["模型 · 默认", "发送"],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="doupool.video.browser"):
+        with pytest.raises(RuntimeError, match="视频参数按钮未找到"):
+            await _apply_video_options(page, ratio="1:1", duration=10)
+
+    assert "event=video_options_trigger_not_found" in caplog.text
+    assert page.url in caplog.text
+    assert "模型 · 默认" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_apply_video_options_keeps_native_button_exact_text_path():
+    page = _FakePage(
+        trigger_tag="button",
+        trigger_role=True,
+        trigger_prefix="",
+        trigger_suffix="",
+        ratio="1:1",
+        duration=9,
+    )
+
+    await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert page.ratio == "1:1"
+    assert page.duration == 5
+    assert page.trigger_clicks == 1
 
 
 @pytest.mark.asyncio

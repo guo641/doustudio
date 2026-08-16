@@ -58,12 +58,12 @@ SEND_BTN_FALLBACK_SEL = "button:has(svg path[d^='M4.93934 10.2598'])"
 CREATE_IMAGE_URL = "https://www.doubao.com/chat/create-image"
 _VIDEO_RATIO_OPTIONS = ("3:4", "4:3", "9:16", "16:9", "1:1", "21:9")
 _VIDEO_OPTIONS_TRIGGER_RE = re.compile(
-    r"^\s*(?:自动|3:4|4:3|9:16|16:9|1:1|21:9)\s*·\s*(?:[4-9]|1[0-5])s\s*$"
+    r"(?:自动|3:4|4:3|9:16|16:9|1:1|21:9)\s*·\s*(?:[4-9]|1[0-5])s"
 )
 _VIDEO_OPTIONS_MENU_WAIT_MS = 1_000
 _VIDEO_OPTIONS_READBACK_WAIT_MS = 1_500
 _VIDEO_OPTIONS_CLOSE_WAIT_MS = 1_500
-_VIDEO_OPTIONS_TRIGGER_WAIT_MS = 1_500
+_VIDEO_OPTIONS_TRIGGER_WAIT_MS = 3_000
 _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS = 4
 # v0.3.2.3:UI click 路径下的弹窗缓冲。**经验值**(用户在 v0.3.2.2 反馈):
 # 实测 aegis 弹窗在 navigate 后 3-5s 才会出现,v0.3.2.2 用的 2s 经常空等,
@@ -1374,6 +1374,28 @@ async def _visible_locators(locator) -> list:
     return visible
 
 
+async def _visible_button_texts(page: Page, *, limit: int = 5) -> list[str]:
+    """返回当前页面前几个可见按钮文本，供 selector 失败诊断使用。"""
+    texts: list[str] = []
+    try:
+        locator = page.locator("button, [role='button']")
+        for index in range(await locator.count()):
+            candidate = locator.nth(index)
+            try:
+                if not await candidate.is_visible():
+                    continue
+                text = (await candidate.inner_text()).strip()
+            except Exception:
+                continue
+            if text and text not in texts:
+                texts.append(text)
+            if len(texts) >= limit:
+                break
+    except Exception:
+        pass
+    return texts
+
+
 def _exact_video_option_button(page: Page, text: str):
     return page.locator("button").filter(
         has_text=re.compile(rf"^\s*{re.escape(text)}\s*$")
@@ -1407,7 +1429,21 @@ async def _wait_for_video_ratio_options(
 
 
 async def _find_video_options_trigger(page: Page):
-    candidates = page.locator("button").filter(has_text=_VIDEO_OPTIONS_TRIGGER_RE)
+    # 新版页面可能把组合控件渲染成 div[role=button]，优先走 a11y role，
+    # 再用原生 button / role CSS 组合选择器兼容旧版和嵌套 span 文本。
+    try:
+        candidates = page.get_by_role("button").filter(
+            has_text=_VIDEO_OPTIONS_TRIGGER_RE,
+        )
+        trigger = await _first_visible_locator(candidates)
+        if trigger is not None:
+            return trigger
+    except Exception:
+        pass
+
+    candidates = page.locator("[role='button'], button").filter(
+        has_text=_VIDEO_OPTIONS_TRIGGER_RE,
+    )
     return await _first_visible_locator(candidates)
 
 
@@ -1423,6 +1459,13 @@ async def _wait_for_video_options_trigger(page: Page):
             return trigger
         if attempt + 1 < attempts:
             await page.wait_for_timeout(step_ms)
+    _LOGGER.warning(
+        "event=video_options_trigger_not_found url=%s visible_buttons=%s "
+        "trigger_pattern=%r",
+        page.url,
+        await _visible_button_texts(page),
+        _VIDEO_OPTIONS_TRIGGER_RE.pattern,
+    )
     return None
 
 
@@ -1578,22 +1621,32 @@ async def _wait_for_video_options_readback(
     duration: int,
 ) -> str:
     expected = re.compile(
-        rf"^\s*{re.escape(ratio)}\s*·\s*{duration}s\s*$"
-    )
-    step_ms = 50
-    attempts = max(
-        1,
-        (_VIDEO_OPTIONS_READBACK_WAIT_MS + step_ms - 1) // step_ms,
+        rf"{re.escape(ratio)}\s*·\s*{duration}s"
     )
     actual = ""
-    for attempt in range(attempts):
-        trigger = await _find_video_options_trigger(page)
-        if trigger is not None:
-            actual = await trigger.inner_text()
-            if expected.fullmatch(actual):
-                return actual
-        if attempt + 1 < attempts:
-            await page.wait_for_timeout(step_ms)
+    for readback_attempt in range(2):
+        step_ms = 50
+        attempts = max(
+            1,
+            (_VIDEO_OPTIONS_READBACK_WAIT_MS + step_ms - 1) // step_ms,
+        )
+        for attempt in range(attempts):
+            trigger = await _find_video_options_trigger(page)
+            if trigger is not None:
+                actual = await trigger.inner_text()
+                if expected.search(actual):
+                    return actual
+            if attempt + 1 < attempts:
+                await page.wait_for_timeout(step_ms)
+        if readback_attempt == 0:
+            _LOGGER.warning(
+                "event=video_options_readback_retry url=%s expected=%r actual=%r "
+                "retry_after_ms=500",
+                page.url,
+                f"{ratio} · {duration}s",
+                actual,
+            )
+            await page.wait_for_timeout(500)
     _LOGGER.warning(
         "event=video_options_readback_failed url=%s expected=%r actual=%r "
         "trigger_pattern=%r",
