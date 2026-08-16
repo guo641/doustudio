@@ -10,6 +10,7 @@ from doupool.video.browser import (
     _apply_video_options,
     _click_video_tab,
     _close_video_options,
+    _diagnose_three_dot_candidates,
     _find_video_options_trigger,
     _open_video_options,
     _validate_video_tab_content,
@@ -65,6 +66,15 @@ class _FakeElement:
         title: str | None = None,
         class_name: str = "",
         svg_aria_label: str | None = None,
+        has_svg: bool = False,
+        svg_circle_count: int = 0,
+        svg_rect_count: int = 0,
+        svg_path_count: int = 0,
+        svg_use_href: str | None = None,
+        svg_class_name: str = "",
+        svg_view_box: str | None = None,
+        data_testid: str | None = None,
+        has_send_path: bool = False,
         inside_send_wrapper: bool = False,
         inside_tab: bool = False,
         adjacent_to_model: bool = False,
@@ -83,6 +93,23 @@ class _FakeElement:
         self.title = title
         self.class_name = class_name
         self.svg_aria_label = svg_aria_label
+        self.svg_circle_count = svg_circle_count
+        self.svg_rect_count = svg_rect_count
+        self.svg_path_count = svg_path_count
+        self.svg_use_href = svg_use_href
+        self.svg_class_name = svg_class_name
+        self.svg_view_box = svg_view_box
+        self.data_testid = data_testid
+        self.has_send_path = has_send_path
+        self.has_svg = bool(
+            has_svg
+            or svg_aria_label
+            or svg_circle_count
+            or svg_rect_count
+            or svg_path_count
+            or svg_use_href
+            or svg_class_name
+        )
         self.inside_send_wrapper = inside_send_wrapper
         self.inside_tab = inside_tab
         self.adjacent_to_model = adjacent_to_model
@@ -187,7 +214,11 @@ class _FakeElement:
             self.page.schedule_trigger_update()
             return None
         if "closest" in expression:
-            return self.inside_send_wrapper or self.inside_tab
+            return (
+                self.inside_send_wrapper
+                or self.inside_tab
+                or self.has_send_path
+            )
         return None
 
     async def input_value(self) -> str:
@@ -209,6 +240,8 @@ class _FakeElement:
             return self.title
         if name == "class":
             return self.class_name
+        if name == "data-testid":
+            return self.data_testid
         return None
 
     async def focus(self):
@@ -286,6 +319,8 @@ class _FakeLocator:
             return False
         if selector.startswith('[role="button"]') and item.role != "button":
             return False
+        if selector.startswith(".semi-button") and "semi-button" not in item.class_name:
+            return False
 
         selector_text = self._selector_text(selector)
         if selector_text is not None and selector_text not in item._text():
@@ -303,7 +338,7 @@ class _FakeLocator:
             if expected not in actual:
                 return False
 
-        class_match = self._contains_attr(selector, "class")
+        class_match = self._contains_attr(outer_selector, "class")
         if class_match is not None:
             expected, insensitive = class_match
             actual = item.class_name
@@ -313,19 +348,52 @@ class _FakeLocator:
                 return False
 
         if ":has(svg" in selector:
+            if not item.has_svg:
+                return False
             svg_match = re.search(
                 r"svg\[aria-label\*=['\"](.*?)['\"](\s+i)?\]",
                 selector,
                 re.IGNORECASE,
             )
-            if svg_match is None:
-                return False
-            expected = svg_match.group(1)
-            actual = item.svg_aria_label or ""
-            if svg_match.group(2):
-                expected, actual = expected.lower(), actual.lower()
-            if expected not in actual:
-                return False
+            if svg_match is not None:
+                expected = svg_match.group(1)
+                actual = item.svg_aria_label or ""
+                if svg_match.group(2):
+                    expected, actual = expected.lower(), actual.lower()
+                if expected not in actual:
+                    return False
+            shape_counts = {
+                "circle": item.svg_circle_count,
+                "rect": item.svg_rect_count,
+                "path": item.svg_path_count,
+            }
+            for shape, count in shape_counts.items():
+                if f"{shape}:nth-of-type(3)" in selector and count < 3:
+                    return False
+            use_match = re.search(
+                r"use\[href\*=['\"](.*?)['\"](\s+i)?\]",
+                selector,
+                re.IGNORECASE,
+            )
+            if use_match is not None:
+                expected = use_match.group(1)
+                actual = item.svg_use_href or ""
+                if use_match.group(2):
+                    expected, actual = expected.lower(), actual.lower()
+                if expected not in actual:
+                    return False
+            svg_class_match = re.search(
+                r"svg\[class\*=['\"](.*?)['\"](\s+i)?\]",
+                selector,
+                re.IGNORECASE,
+            )
+            if svg_class_match is not None:
+                expected = svg_class_match.group(1)
+                actual = item.svg_class_name
+                if svg_class_match.group(2):
+                    expected, actual = expected.lower(), actual.lower()
+                if expected not in actual:
+                    return False
         return True
 
     def _matches_selector(self, item: _FakeElement) -> bool:
@@ -513,6 +581,70 @@ class _FakePage:
     def get_by_role(self, role: str):
         assert role == "button"
         return _FakeLocator(self, "role=button")
+
+    def get_by_text(self, text):
+        return _FakeLocator(self, "*").filter(has_text=text)
+
+    async def evaluate(self, _expression):
+        anchors = [
+            item
+            for item in self.dom_elements
+            if re.search(r"模型|model|seedance", item._text(), re.IGNORECASE)
+        ]
+        diagnostics = []
+        for item in self.dom_elements:
+            if not item.has_svg:
+                continue
+            box = await item.bounding_box()
+            nearest = None
+            for anchor in anchors:
+                anchor_box = await anchor.bounding_box()
+                dx = round(box["x"] - (anchor_box["x"] + anchor_box["width"]))
+                dy = round(
+                    abs(
+                        box["y"]
+                        + box["height"] / 2
+                        - (anchor_box["y"] + anchor_box["height"] / 2)
+                    )
+                )
+                distance = (dx ** 2 + dy ** 2) ** 0.5
+                if nearest is None or distance < nearest["distance"]:
+                    nearest = {"dx": dx, "dy": dy, "distance": distance}
+            diagnostics.append(
+                {
+                    "aria_label": item.aria_label,
+                    "title": item.title,
+                    "class_name": item.class_name,
+                    "data_testid": item.data_testid,
+                    "inner_text": item._text()[:40],
+                    "svg_class": item.svg_class_name or None,
+                    "svg_view_box": item.svg_view_box,
+                    "circle_count": item.svg_circle_count,
+                    "rect_count": item.svg_rect_count,
+                    "path_count": item.svg_path_count,
+                    "use_href": item.svg_use_href,
+                    "bbox": {
+                        key: round(box[key])
+                        for key in ("x", "y", "width", "height")
+                    },
+                    "inside_send_wrapper": item.inside_send_wrapper,
+                    "inside_tab": item.inside_tab,
+                    "nearest_model_dx": nearest and nearest["dx"],
+                    "nearest_model_dy": nearest and nearest["dy"],
+                    "nearest_model_distance": (
+                        round(nearest["distance"]) if nearest else None
+                    ),
+                }
+            )
+        diagnostics.sort(
+            key=lambda item: (
+                item["nearest_model_distance"]
+                if item["nearest_model_distance"] is not None
+                else float("inf"),
+                int(item["inside_send_wrapper"] or item["inside_tab"]),
+            )
+        )
+        return diagnostics[:20]
 
     def schedule_trigger_update(self):
         if not self.trigger_updates:
@@ -1145,6 +1277,274 @@ async def test_find_video_options_trigger_prefers_target_over_earlier_global_mor
 
     assert trigger is page.more_elements[1]
     assert kind == "B"
+
+
+@pytest.mark.asyncio
+async def test_find_video_options_trigger_finds_anonymous_svg_near_model():
+    """无文字、无 a11y/class、非直接兄弟的 SVG 也能靠受限几何命中。"""
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_circle_count": 3,
+                "action": "toggle_menu",
+                "box": {"x": 270, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, kind = await _find_video_options_trigger(page, return_kind=True)
+
+    assert trigger is page.more_elements[0]
+    assert kind == "B"
+    assert trigger.adjacent_to_model is False
+
+
+@pytest.mark.asyncio
+async def test_anonymous_svg_finder_rejects_distractors_and_picks_three_dot():
+    """模型自身、页头、发送、TAB、近邻麦克风都不能抢走三点入口。"""
+    page = _FakePage(
+        has_trigger=False,
+        more_buttons=[
+            {
+                "value": "模型 Seedance 2.0 Mini",
+                "tag": "button",
+                "has_svg": True,
+                "svg_path_count": 1,
+                "box": {"x": 160, "y": 100, "width": 90, "height": 32},
+            },
+            {
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_circle_count": 3,
+                "box": {"x": 900, "y": 20, "width": 32, "height": 32},
+            },
+            {
+                "kind": "send",
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_path_count": 1,
+                "inside_send_wrapper": True,
+                "box": {"x": 252, "y": 100, "width": 32, "height": 32},
+            },
+            {
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_path_count": 1,
+                "inside_tab": True,
+                "box": {"x": 258, "y": 100, "width": 32, "height": 32},
+            },
+            {
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_path_count": 3,
+                "adjacent_to_model": True,
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+            {
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_circle_count": 3,
+                "action": "toggle_menu",
+                "box": {"x": 270, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, kind = await _find_video_options_trigger(page, return_kind=True)
+
+    target = page.more_elements[5]
+    assert trigger is target
+    assert kind == "B"
+    assert page.send_clicks == 0
+    assert all(
+        element.click_attempts == 0
+        for element in page.more_elements
+        if element is not target
+    )
+
+
+@pytest.mark.asyncio
+async def test_anonymous_svg_finder_requires_model_anchor():
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=False,
+        more_buttons=[
+            {
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_circle_count": 3,
+                "box": {"x": 270, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    assert await _find_video_options_trigger(page, return_kind=True) is None
+
+
+@pytest.mark.asyncio
+async def test_type_a_summary_still_precedes_anonymous_svg_candidate():
+    page = _FakePage(
+        has_trigger=True,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_circle_count": 3,
+                "action": "toggle_menu",
+                "box": {"x": 270, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, kind = await _find_video_options_trigger(page, return_kind=True)
+
+    assert trigger is page.trigger
+    assert kind == "A"
+    assert page.more_elements[0].click_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_open_and_validate_support_anonymous_svg_three_dot():
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_circle_count": 3,
+                "action": "toggle_menu",
+                "box": {"x": 270, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, visible_options, kind = await _open_video_options(page)
+
+    assert trigger is page.more_elements[0]
+    assert kind == "B"
+    assert len(visible_options) >= 4
+    assert page.more_clicks == [trigger]
+
+    await _close_video_options(page, trigger, trigger_kind=kind)
+    visible_options = await _validate_video_tab_content(page)
+    assert len(visible_options) >= 4
+    assert page.menu_open is False
+
+
+@pytest.mark.asyncio
+async def test_missing_svg_trigger_logs_complete_geometry_diagnostics(caplog):
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_circle_count": 3,
+                "svg_path_count": 2,
+                "svg_view_box": "0 0 24 24",
+                "data_testid": "far-svg-sentinel",
+                "box": {"x": 700, "y": 20, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    diagnostics = await _diagnose_three_dot_candidates(page)
+    assert diagnostics == [
+        {
+            "aria_label": None,
+            "title": None,
+            "class_name": "",
+            "data_testid": "far-svg-sentinel",
+            "inner_text": "",
+            "svg_class": None,
+            "svg_view_box": "0 0 24 24",
+            "circle_count": 3,
+            "rect_count": 0,
+            "path_count": 2,
+            "use_href": None,
+            "bbox": {"x": 700, "y": 20, "width": 32, "height": 32},
+            "inside_send_wrapper": False,
+            "inside_tab": False,
+            "nearest_model_dx": 450,
+            "nearest_model_dy": 80,
+            "nearest_model_distance": 457,
+        }
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="doupool.video.browser"):
+        with pytest.raises(RuntimeError, match="视频参数按钮未找到"):
+            await _open_video_options(page)
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "event=video_options_trigger_not_found" in record.getMessage()
+    ]
+    assert messages
+    assert "three_dot_candidates=" in messages[-1]
+    assert "'data_testid': 'far-svg-sentinel'" in messages[-1]
+    assert "'circle_count': 3" in messages[-1]
+    assert "'path_count': 2" in messages[-1]
+    assert "'bbox': {'x': 700, 'y': 20, 'width': 32, 'height': 32}" in messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_svg_diagnostics_keep_near_model_candidate_after_twenty_globals():
+    globals_before_target = [
+        {
+            "value": "",
+            "tag": "button",
+            "has_svg": True,
+            "svg_path_count": 1,
+            "data_testid": f"global-{index}",
+            "box": {
+                "x": 700 + index,
+                "y": 20,
+                "width": 32,
+                "height": 32,
+            },
+        }
+        for index in range(21)
+    ]
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            *globals_before_target,
+            {
+                "value": "",
+                "tag": "button",
+                "has_svg": True,
+                "svg_circle_count": 3,
+                "data_testid": "near-model-target",
+                "box": {"x": 270, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    diagnostics = await _diagnose_three_dot_candidates(page)
+
+    assert len(diagnostics) == 20
+    assert any(
+        item["data_testid"] == "near-model-target" for item in diagnostics
+    )
 
 
 @pytest.mark.asyncio

@@ -90,12 +90,40 @@ _VIDEO_MORE_OPTIONS_SELECTORS = (
     "button[class*='ellipsis' i], [role='button'][class*='ellipsis' i]",
     "button[class*='more' i], [role='button'][class*='more' i]",
 )
+_VIDEO_MORE_OPTIONS_GEOMETRY_SELECTORS = (
+    "button:has(svg circle:nth-of-type(3)), "
+    "[role='button']:has(svg circle:nth-of-type(3))",
+    "button:has(svg rect:nth-of-type(3)), "
+    "[role='button']:has(svg rect:nth-of-type(3))",
+    "button:has(svg path:nth-of-type(3)), "
+    "[role='button']:has(svg path:nth-of-type(3))",
+    "button:has(svg use[href*='more' i]), "
+    "[role='button']:has(svg use[href*='more' i])",
+    "button:has(svg use[href*='ellipsis' i]), "
+    "[role='button']:has(svg use[href*='ellipsis' i])",
+    "button:has(svg use[href*='kebab' i]), "
+    "[role='button']:has(svg use[href*='kebab' i])",
+    "button:has(svg[class*='more' i]), "
+    "button:has(svg[class*='ellipsis' i]), "
+    "button:has(svg[class*='kebab' i]), "
+    "[role='button']:has(svg[class*='more' i]), "
+    "[role='button']:has(svg[class*='ellipsis' i]), "
+    "[role='button']:has(svg[class*='kebab' i])",
+    "button:has(svg), [role='button']:has(svg), .semi-button:has(svg)",
+)
+_VIDEO_MORE_OPTIONS_ALL_SELECTORS = (
+    *_VIDEO_MORE_OPTIONS_SELECTORS,
+    *_VIDEO_MORE_OPTIONS_GEOMETRY_SELECTORS,
+)
 _VIDEO_MORE_OPTIONS_ANCHOR_RE = re.compile(
     r"(?:模型|model|seedance)",
     re.IGNORECASE,
 )
 _VIDEO_MORE_OPTIONS_TEXT_RE = re.compile(r"^\s*(?:⋯|…|\.{3}|•••)\s*$")
 _VIDEO_MORE_OPTIONS_MAX_ANCHOR_DISTANCE_PX = 400
+_VIDEO_MORE_OPTIONS_MAX_HORIZONTAL_GAP_PX = 160
+_VIDEO_MORE_OPTIONS_MAX_VERTICAL_DELTA_PX = 32
+_VIDEO_MORE_OPTIONS_MAX_ICON_SIZE_PX = 64
 _VIDEO_OPTIONS_MENU_WAIT_MS = 1_000
 _VIDEO_OPTIONS_READBACK_WAIT_MS = 1_500
 _VIDEO_OPTIONS_CLOSE_WAIT_MS = 1_500
@@ -1525,29 +1553,72 @@ async def _find_video_more_options_trigger(
     """找到视频工具栏的三点参数入口，并避开页头「更多」和发送按钮。"""
     excluded_signatures = excluded_signatures or set()
 
-    anchor_box = None
-    try:
-        anchors = page.locator("button, [role='button']").filter(
-            has_text=_VIDEO_MORE_OPTIONS_ANCHOR_RE,
-        )
-        anchor = await _first_visible_locator(anchors)
-        if anchor is not None:
-            anchor_box = await anchor.bounding_box()
-    except Exception:
-        anchor_box = None
-    if anchor_box is None:
-        try:
-            anchor = await _first_visible_locator(
-                page.get_by_text(_VIDEO_MORE_OPTIONS_ANCHOR_RE)
-            )
-            if anchor is not None:
-                anchor_box = await anchor.bounding_box()
-        except Exception:
-            anchor_box = None
+    anchor_entries: list[tuple[tuple, dict[str, float]]] = []
+    seen_anchor_signatures: set[tuple] = set()
 
-    ranked: list[tuple[tuple[float, ...], object]] = []
-    seen: set[tuple] = set()
-    for selector_index, selector in enumerate(_VIDEO_MORE_OPTIONS_SELECTORS):
+    async def collect_anchors(locator) -> None:
+        try:
+            anchors = await _visible_locators(locator)
+        except Exception:
+            return
+        for anchor in anchors:
+            try:
+                box = await anchor.bounding_box()
+            except Exception:
+                box = None
+            if not box:
+                continue
+            signature = await _video_options_locator_signature(anchor)
+            if signature in seen_anchor_signatures:
+                continue
+            seen_anchor_signatures.add(signature)
+            anchor_entries.append((signature, box))
+
+    try:
+        await collect_anchors(
+            page.locator("button, [role='button']").filter(
+                has_text=_VIDEO_MORE_OPTIONS_ANCHOR_RE,
+            )
+        )
+    except Exception:
+        pass
+    try:
+        await collect_anchors(page.get_by_text(_VIDEO_MORE_OPTIONS_ANCHOR_RE))
+    except Exception:
+        pass
+
+    ranked_by_signature: dict[tuple, tuple[tuple[float, ...], object]] = {}
+
+    def remember_candidate(
+        signature: tuple,
+        rank: tuple[float, ...],
+        candidate,
+    ) -> None:
+        current = ranked_by_signature.get(signature)
+        if current is None or rank < current[0]:
+            ranked_by_signature[signature] = (rank, candidate)
+
+    selector_sources = [
+        (selector_index, selector, False)
+        for selector_index, selector in enumerate(
+            _VIDEO_MORE_OPTIONS_SELECTORS
+        )
+    ]
+    selector_sources.extend(
+        (
+            len(_VIDEO_MORE_OPTIONS_SELECTORS) + selector_index,
+            selector,
+            True,
+        )
+        for selector_index, selector in enumerate(
+            _VIDEO_MORE_OPTIONS_GEOMETRY_SELECTORS
+        )
+    )
+    weak_geometry_indexes = {
+        2,  # svg path:nth-of-type(3)
+        len(_VIDEO_MORE_OPTIONS_GEOMETRY_SELECTORS) - 1,
+    }
+    for selector_index, selector, geometry_candidate in selector_sources:
         try:
             candidates = await _visible_locators(page.locator(selector))
         except Exception:
@@ -1572,7 +1643,7 @@ async def _find_video_more_options_trigger(
             except Exception:
                 candidate_class = ""
 
-            if selector_index >= 4:
+            if not geometry_candidate and selector_index >= 4:
                 label_lower = candidate_label.lower()
                 class_lower = candidate_class.lower()
                 semantic_match = bool(
@@ -1605,27 +1676,89 @@ async def _find_video_more_options_trigger(
                 continue
 
             signature = await _video_options_locator_signature(candidate)
-            if (
-                signature in seen
-                or signature in excluded_signatures
-            ):
+            if signature in excluded_signatures:
                 continue
-            seen.add(signature)
+
+            if geometry_candidate:
+                # 匿名 SVG 只能在存在「模型 / Seedance」锚点时启用；
+                # 否则页面全局图标按钮太多，误点风险不可接受。
+                if not anchor_entries or signature in seen_anchor_signatures:
+                    continue
+                candidate_box = signature[-1]
+                if not candidate_box:
+                    continue
+                candidate_x, candidate_y, candidate_width, candidate_height = (
+                    float(value) for value in candidate_box
+                )
+                if (
+                    candidate_width <= 0
+                    or candidate_height <= 0
+                    or candidate_width > _VIDEO_MORE_OPTIONS_MAX_ICON_SIZE_PX
+                    or candidate_height > _VIDEO_MORE_OPTIONS_MAX_ICON_SIZE_PX
+                ):
+                    continue
+
+                placements: list[tuple[float, float]] = []
+                candidate_center_y = candidate_y + candidate_height / 2
+                for _, anchor_box in anchor_entries:
+                    anchor_right = float(anchor_box.get("x", 0)) + float(
+                        anchor_box.get("width", 0)
+                    )
+                    anchor_center_y = float(anchor_box.get("y", 0)) + float(
+                        anchor_box.get("height", 0)
+                    ) / 2
+                    horizontal_gap = candidate_x - anchor_right
+                    vertical_delta = abs(candidate_center_y - anchor_center_y)
+                    if (
+                        -8 <= horizontal_gap
+                        <= _VIDEO_MORE_OPTIONS_MAX_HORIZONTAL_GAP_PX
+                        and vertical_delta
+                        <= _VIDEO_MORE_OPTIONS_MAX_VERTICAL_DELTA_PX
+                    ):
+                        placements.append((horizontal_gap, vertical_delta))
+                if not placements:
+                    continue
+                horizontal_gap, vertical_delta = min(placements)
+                geometry_index = (
+                    selector_index - len(_VIDEO_MORE_OPTIONS_SELECTORS)
+                )
+                # 三圆/三矩形/use/class 等结构信号优先于最终的
+                # 任意 SVG 兜底；单纯 path 数量区分不了麦克风等复杂
+                # 图标，因此与 generic 通道同级。同一可信级别内再
+                # 选择离模型最近者。
+                geometry_priority = (
+                    1.0 if geometry_index in weak_geometry_indexes else 0.0
+                )
+                remember_candidate(
+                    signature,
+                    (
+                        2.0 + geometry_priority,
+                        horizontal_gap,
+                        vertical_delta,
+                        float(selector_index),
+                    ),
+                    candidate,
+                )
+                continue
 
             candidate_box = signature[-1]
             distance = float("inf")
-            if anchor_box and candidate_box:
-                anchor_x = float(anchor_box.get("x", 0)) + float(
-                    anchor_box.get("width", 0)
-                ) / 2
-                anchor_y = float(anchor_box.get("y", 0)) + float(
-                    anchor_box.get("height", 0)
-                ) / 2
+            if anchor_entries and candidate_box:
                 candidate_x = candidate_box[0] + candidate_box[2] / 2
                 candidate_y = candidate_box[1] + candidate_box[3] / 2
-                distance = (candidate_x - anchor_x) ** 2 + (
-                    candidate_y - anchor_y
-                ) ** 2
+                distances = []
+                for _, anchor_box in anchor_entries:
+                    anchor_x = float(anchor_box.get("x", 0)) + float(
+                        anchor_box.get("width", 0)
+                    ) / 2
+                    anchor_y = float(anchor_box.get("y", 0)) + float(
+                        anchor_box.get("height", 0)
+                    ) / 2
+                    distances.append(
+                        (candidate_x - anchor_x) ** 2
+                        + (candidate_y - anchor_y) ** 2
+                    )
+                distance = min(distances)
                 if (
                     selector_index >= 4
                     and distance
@@ -1633,17 +1766,119 @@ async def _find_video_more_options_trigger(
                 ):
                     continue
 
-            # 模型按钮的相邻兄弟 selector 最可信；其余候选优先选择离
-            # 模型选择器最近的那个，避免命中页面右上角的全局「更多」。
-            sibling_priority = 0.0 if selector_index < 4 else 1.0
-            ranked.append(
-                ((sibling_priority, distance, float(selector_index)), candidate)
+            # 明确的文本/a11y/class 语义最可信。相邻兄弟只证明位置，
+            # 可能恰好是麦克风，因此排在明确三点 SVG 结构之后、任意
+            # SVG 兜底之前。同一 DOM 若被多个 selector 命中，保留其
+            # 最可信的 rank，而不是被第一个 selector 永久定级。
+            semantic_priority = 2.5 if selector_index < 4 else 1.0
+            remember_candidate(
+                signature,
+                (
+                    semantic_priority,
+                    distance,
+                    0.0,
+                    float(selector_index),
+                ),
+                candidate,
             )
 
-    if not ranked:
+    if not ranked_by_signature:
         return None
+    ranked = list(ranked_by_signature.values())
     ranked.sort(key=lambda item: item[0])
     return ranked[0][1]
+
+
+async def _diagnose_three_dot_candidates(page: Page) -> list[dict]:
+    """失败时收集可见 SVG 按钮的结构和位置，不参与正常定位。"""
+    try:
+        result = await page.evaluate(
+            """() => {
+                const visibleBox = (el) => {
+                    const box = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return box.width > 0 && box.height > 0 &&
+                        style.visibility !== 'hidden' &&
+                        style.display !== 'none'
+                        ? box : null;
+                };
+                const modelPattern = /(?:模型|model|seedance)/i;
+                const anchors = Array.from(document.querySelectorAll(
+                    'button, [role="button"]'
+                )).map(el => ({el, box: visibleBox(el)})).filter(item =>
+                    item.box && modelPattern.test(item.el.innerText || '')
+                );
+                const candidates = Array.from(document.querySelectorAll(
+                    'button, [role="button"], .semi-button'
+                )).map(el => ({el, box: visibleBox(el)})).filter(item =>
+                    item.box && item.el.querySelector('svg')
+                );
+                return candidates.map(({el, box}) => {
+                    const svg = el.querySelector('svg');
+                    const use = svg && svg.querySelector('use');
+                    let nearest = null;
+                    for (const anchor of anchors) {
+                        const dx = Math.round(
+                            box.x - (anchor.box.x + anchor.box.width)
+                        );
+                        const dy = Math.round(Math.abs(
+                            box.y + box.height / 2 -
+                            (anchor.box.y + anchor.box.height / 2)
+                        ));
+                        if (!nearest || Math.hypot(dx, dy) < nearest.distance) {
+                            nearest = {dx, dy, distance: Math.hypot(dx, dy)};
+                        }
+                    }
+                    return {
+                        aria_label: el.getAttribute('aria-label'),
+                        title: el.getAttribute('title'),
+                        class_name: el.getAttribute('class'),
+                        data_testid: el.getAttribute('data-testid'),
+                        inner_text: (el.innerText || '').trim().slice(0, 40),
+                        svg_class: svg && svg.getAttribute('class'),
+                        svg_view_box: svg && svg.getAttribute('viewBox'),
+                        circle_count: svg ? svg.querySelectorAll('circle').length : 0,
+                        rect_count: svg ? svg.querySelectorAll('rect').length : 0,
+                        path_count: svg ? svg.querySelectorAll('path').length : 0,
+                        use_href: use && (
+                            use.getAttribute('href') ||
+                            use.getAttribute('xlink:href')
+                        ),
+                        bbox: {
+                            x: Math.round(box.x),
+                            y: Math.round(box.y),
+                            width: Math.round(box.width),
+                            height: Math.round(box.height),
+                        },
+                        inside_send_wrapper: Boolean(
+                            el.closest('.send-btn-wrapper')
+                        ),
+                        inside_tab: Boolean(el.closest('[role="tab"]')),
+                        nearest_model_dx: nearest && nearest.dx,
+                        nearest_model_dy: nearest && nearest.dy,
+                        nearest_model_distance: nearest && Math.round(
+                            nearest.distance
+                        ),
+                    };
+                }).sort((left, right) => {
+                    const leftDistance = left.nearest_model_distance ?? Infinity;
+                    const rightDistance = right.nearest_model_distance ?? Infinity;
+                    if (leftDistance !== rightDistance) {
+                        return leftDistance - rightDistance;
+                    }
+                    const leftExcluded = Number(
+                        left.inside_send_wrapper || left.inside_tab
+                    );
+                    const rightExcluded = Number(
+                        right.inside_send_wrapper || right.inside_tab
+                    );
+                    return leftExcluded - rightExcluded;
+                }).slice(0, 20);
+            }"""
+        )
+    except Exception as exc:
+        return [{"error": str(exc)}]
+    return result if isinstance(result, list) else []
 
 
 async def _video_options_trigger_kind(trigger) -> str:
@@ -1706,21 +1941,24 @@ async def _wait_for_video_options_trigger(
         if attempt + 1 < attempts:
             await page.wait_for_timeout(step_ms)
     selector_matches: dict[str, int | str] = {}
-    for selector in _VIDEO_MORE_OPTIONS_SELECTORS:
+    for selector in _VIDEO_MORE_OPTIONS_ALL_SELECTORS:
         try:
             selector_matches[selector] = len(
                 await _visible_locators(page.locator(selector))
             )
         except Exception as exc:
             selector_matches[selector] = f"error:{exc}"
+    three_dot_candidates = await _diagnose_three_dot_candidates(page)
     _LOGGER.warning(
         "event=video_options_trigger_not_found url=%s visible_buttons=%s "
-        "trigger_pattern=%r more_selectors=%s selector_matches=%s",
+        "trigger_pattern=%r more_selectors=%s selector_matches=%s "
+        "three_dot_candidates=%s",
         page.url,
         await _visible_button_texts(page),
         _VIDEO_OPTIONS_TRIGGER_RE.pattern,
-        _VIDEO_MORE_OPTIONS_SELECTORS,
+        _VIDEO_MORE_OPTIONS_ALL_SELECTORS,
         selector_matches,
+        three_dot_candidates,
     )
     return None
 
@@ -1993,7 +2231,7 @@ async def _open_video_options(page: Page):
                 raise RuntimeError(
                     f"视频参数按钮未找到: {page.url}; "
                     f"visible_buttons={await _visible_button_texts(page)}; "
-                    f"more_selectors={_VIDEO_MORE_OPTIONS_SELECTORS}"
+                    f"more_selectors={_VIDEO_MORE_OPTIONS_ALL_SELECTORS}"
                 )
             break
         trigger, trigger_kind = trigger_result
