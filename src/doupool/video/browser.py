@@ -56,6 +56,14 @@ EDITOR_SEL = "div[contenteditable='true']"
 SEND_BTN_SEL = ".send-btn-wrapper button"
 SEND_BTN_FALLBACK_SEL = "button:has(svg path[d^='M4.93934 10.2598'])"
 CREATE_IMAGE_URL = "https://www.doubao.com/chat/create-image"
+_VIDEO_RATIO_OPTIONS = ("3:4", "4:3", "9:16", "16:9", "1:1", "21:9")
+_VIDEO_OPTIONS_TRIGGER_RE = re.compile(
+    r"^\s*(?:自动|3:4|4:3|9:16|16:9|1:1|21:9)\s*·\s*(?:[4-9]|1[0-5])s\s*$"
+)
+_VIDEO_OPTIONS_MENU_WAIT_MS = 1_000
+_VIDEO_OPTIONS_READBACK_WAIT_MS = 1_500
+_VIDEO_OPTIONS_TRIGGER_WAIT_MS = 1_500
+_VIDEO_OPTIONS_MIN_VISIBLE_RATIOS = 4
 # v0.3.2.3:UI click 路径下的弹窗缓冲。**经验值**(用户在 v0.3.2.2 反馈):
 # 实测 aegis 弹窗在 navigate 后 3-5s 才会出现,v0.3.2.2 用的 2s 经常空等,
 # 然后 POST 立即飞出 + 弹窗刚好弹 → shark_admin 拒绝。所以 submit 前必须
@@ -1347,14 +1355,312 @@ def _extract_remote_task_ids_from_ack_payload(ack_payload: dict) -> set[str]:
     return ids
 
 
+async def _first_visible_locator(locator):
+    """返回 locator 集合中的第一个可见元素。"""
+    visible = await _visible_locators(locator)
+    return visible[0] if visible else None
+
+
+async def _visible_locators(locator) -> list:
+    visible: list = []
+    for index in range(await locator.count()):
+        candidate = locator.nth(index)
+        try:
+            if await candidate.is_visible():
+                visible.append(candidate)
+        except Exception:
+            continue
+    return visible
+
+
+def _exact_video_option_button(page: Page, text: str):
+    return page.locator("button").filter(
+        has_text=re.compile(rf"^\s*{re.escape(text)}\s*$")
+    )
+
+
+async def _visible_video_ratio_options(page: Page) -> list[str]:
+    visible: list[str] = []
+    for value in _VIDEO_RATIO_OPTIONS:
+        locator = _exact_video_option_button(page, value)
+        if await _first_visible_locator(locator) is not None:
+            visible.append(value)
+    return visible
+
+
+async def _wait_for_video_ratio_options(
+    page: Page,
+    *,
+    timeout_ms: int = _VIDEO_OPTIONS_MENU_WAIT_MS,
+) -> list[str]:
+    step_ms = 50
+    attempts = max(1, (timeout_ms + step_ms - 1) // step_ms)
+    visible: list[str] = []
+    for attempt in range(attempts):
+        visible = await _visible_video_ratio_options(page)
+        if len(visible) >= _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+            return visible
+        if attempt + 1 < attempts:
+            await page.wait_for_timeout(step_ms)
+    return visible
+
+
+async def _find_video_options_trigger(page: Page):
+    candidates = page.locator("button").filter(has_text=_VIDEO_OPTIONS_TRIGGER_RE)
+    return await _first_visible_locator(candidates)
+
+
+async def _wait_for_video_options_trigger(page: Page):
+    step_ms = 50
+    attempts = max(
+        1,
+        (_VIDEO_OPTIONS_TRIGGER_WAIT_MS + step_ms - 1) // step_ms,
+    )
+    for attempt in range(attempts):
+        trigger = await _find_video_options_trigger(page)
+        if trigger is not None:
+            return trigger
+        if attempt + 1 < attempts:
+            await page.wait_for_timeout(step_ms)
+    return None
+
+
+async def _open_video_options(page: Page):
+    trigger = await _wait_for_video_options_trigger(page)
+    if trigger is None:
+        raise RuntimeError(f"视频参数按钮未找到: {page.url}")
+
+    last_error: Exception | None = None
+    visible_options: list[str] = []
+    for attempt in range(2):
+        try:
+            if attempt:
+                # 触发按钮是 toggle。第一次若已经打开但菜单渲染超时,
+                # 直接再点会把它关掉;先用 Escape 归一化到关闭态。
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(100)
+                trigger = await _wait_for_video_options_trigger(page)
+                if trigger is None:
+                    raise RuntimeError("重试前视频参数按钮消失")
+            await trigger.click()
+            visible_options = await _wait_for_video_ratio_options(page)
+            if len(visible_options) >= _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+                return trigger, visible_options
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        f"视频参数菜单未展开: {page.url}; "
+        f"visible_ratio_options={visible_options}; last={last_error}"
+    )
+
+
+async def _find_video_duration_control(page: Page):
+    range_inputs = await _visible_locators(page.locator("input[type='range']"))
+    aria_sliders = await _visible_locators(page.locator("[role='slider']"))
+    if len(range_inputs) + len(aria_sliders) > 1:
+        raise RuntimeError(
+            "视频时长滑块定位不唯一: "
+            f"range={len(range_inputs)} aria={len(aria_sliders)}"
+        )
+    if range_inputs:
+        return "range", range_inputs[0]
+
+    if aria_sliders:
+        return "aria", aria_sliders[0]
+    return None, None
+
+
+async def _wait_for_video_duration_control(page: Page, *, timeout_ms: int = 500):
+    step_ms = 50
+    attempts = max(1, (timeout_ms + step_ms - 1) // step_ms)
+    for attempt in range(attempts):
+        kind, control = await _find_video_duration_control(page)
+        if control is not None:
+            return kind, control
+        if attempt + 1 < attempts:
+            await page.wait_for_timeout(step_ms)
+    return None, None
+
+
+async def _set_native_range_value(control, duration: int) -> None:
+    try:
+        await control.fill(str(duration))
+    except Exception:
+        await control.evaluate(
+            """(el, value) => {
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(el, String(value));
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }""",
+            duration,
+        )
+
+    try:
+        actual = int(float(await control.input_value()))
+    except (TypeError, ValueError):
+        actual = None
+    if actual != duration:
+        raise RuntimeError(
+            f"视频时长滑块设置失败: expected={duration}s actual={actual!r}"
+        )
+
+
+async def _set_aria_slider_value(page: Page, control, duration: int) -> None:
+    min_value = int(await control.get_attribute("aria-valuemin") or 4)
+    max_value = int(await control.get_attribute("aria-valuemax") or 15)
+    if not min_value <= duration <= max_value:
+        raise ValueError(
+            f"视频时长必须在 {min_value} 到 {max_value} 秒之间: {duration}"
+        )
+
+    try:
+        await control.focus()
+        await control.press("Home")
+        for _ in range(duration - min_value):
+            await control.press("ArrowRight")
+        await page.wait_for_timeout(100)
+        now = await control.get_attribute("aria-valuenow")
+        if now is not None and int(float(now)) == duration:
+            return
+    except Exception:
+        pass
+
+    # 某些自定义 slider 不响应键盘,退回到真实鼠标拖动。
+    thumb_box = await control.bounding_box()
+    track_box = await control.locator("xpath=..").bounding_box()
+    if not thumb_box or not track_box or track_box["width"] <= 0:
+        raise RuntimeError("视频时长滑块无法定位拖动轨道")
+    start_x = thumb_box["x"] + thumb_box["width"] / 2
+    start_y = thumb_box["y"] + thumb_box["height"] / 2
+    target_x = track_box["x"] + track_box["width"] * (
+        (duration - min_value) / (max_value - min_value)
+    )
+    await page.mouse.move(start_x, start_y)
+    await page.mouse.down()
+    await page.mouse.move(target_x, start_y, steps=8)
+    await page.mouse.up()
+    await page.wait_for_timeout(100)
+
+    now = await control.get_attribute("aria-valuenow")
+    if now is not None and int(float(now)) != duration:
+        raise RuntimeError(
+            f"视频时长滑块设置失败: expected={duration}s actual={now}s"
+        )
+
+
+async def _wait_for_video_options_readback(
+    page: Page,
+    *,
+    ratio: str,
+    duration: int,
+) -> str:
+    expected = re.compile(
+        rf"^\s*{re.escape(ratio)}\s*·\s*{duration}s\s*$"
+    )
+    step_ms = 50
+    attempts = max(
+        1,
+        (_VIDEO_OPTIONS_READBACK_WAIT_MS + step_ms - 1) // step_ms,
+    )
+    actual = ""
+    for attempt in range(attempts):
+        trigger = await _find_video_options_trigger(page)
+        if trigger is not None:
+            actual = await trigger.inner_text()
+            if expected.fullmatch(actual):
+                return actual
+        if attempt + 1 < attempts:
+            await page.wait_for_timeout(step_ms)
+    raise RuntimeError(
+        f"视频参数设置后校验失败: expected={ratio} · {duration}s actual={actual!r}"
+    )
+
+
+async def _close_video_options(page: Page, trigger) -> None:
+    await page.keyboard.press("Escape")
+    await page.wait_for_timeout(100)
+    if len(await _visible_video_ratio_options(page)) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+        return
+
+    # 部分页面版本不处理 Escape,退回再次点击组合按钮关闭 toggle。
+    trigger = await _find_video_options_trigger(page) or trigger
+    await trigger.click()
+    step_ms = 50
+    for attempt in range(10):
+        visible = await _visible_video_ratio_options(page)
+        if len(visible) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+            return
+        if attempt < 9:
+            await page.wait_for_timeout(step_ms)
+    raise RuntimeError("视频参数菜单关闭失败")
+
+
+async def _apply_video_options(
+    page: Page,
+    *,
+    ratio: str,
+    duration: int,
+) -> None:
+    """点击视频参数组合按钮,在弹层中选择比例和整数秒时长。"""
+    if ratio not in _VIDEO_RATIO_OPTIONS:
+        raise RuntimeError(
+            f"视频比例选项不存在: {ratio}; 可选项={list(_VIDEO_RATIO_OPTIONS)}"
+        )
+    if not 4 <= duration <= 15:
+        raise ValueError(f"视频时长必须在 4 到 15 秒之间: {duration}")
+
+    trigger, visible_options = await _open_video_options(page)
+    if ratio not in visible_options:
+        raise RuntimeError(
+            f"视频比例选项不存在: {ratio}; 实际可见={visible_options}"
+        )
+
+    ratio_button = await _first_visible_locator(
+        _exact_video_option_button(page, ratio)
+    )
+    if ratio_button is None:
+        raise RuntimeError(
+            f"视频比例选项不可点击: {ratio}; 实际可见={visible_options}"
+        )
+    await ratio_button.click()
+    await page.wait_for_timeout(100)
+
+    kind, duration_control = await _wait_for_video_duration_control(page)
+    if duration_control is None:
+        # 比例按钮若会自动收起弹层,重新点开一次再找 slider。
+        if not await _visible_video_ratio_options(page):
+            await trigger.click()
+            await _wait_for_video_ratio_options(page)
+            kind, duration_control = await _wait_for_video_duration_control(page)
+    if duration_control is None:
+        raise RuntimeError(f"视频时长滑块未找到: {page.url}")
+
+    if kind == "range":
+        await _set_native_range_value(duration_control, duration)
+    else:
+        await _set_aria_slider_value(page, duration_control, duration)
+
+    await _close_video_options(page, trigger)
+    await _wait_for_video_options_readback(
+        page,
+        ratio=ratio,
+        duration=duration,
+    )
+
+
 async def submit_via_ui(
     page: Page,
     prompt: str,
     *,
+    ratio: str,
+    duration: int,
     profile_dir: Path,
     update: Callable[..., None],
 ) -> None:
-    """v0.3.2:真实 UI click 提交 —— 导航 → 点视频 tab → 清空 → type → 点 submit。
+    """真实 UI 提交:进入视频 tab,应用参数,粘贴 prompt,再点发送。
 
     整段在浏览器内执行,绕过 shark_admin 服务端对 page.evaluate POST 的识别。
     前后两次 aegis 兜底(进入 tab 前 + click send 前),wait 2s / 0s;
@@ -1380,10 +1686,13 @@ async def submit_via_ui(
     await try_click(page, (VIDEO_TAB_SEL,), timeout=5.0)
     await page.wait_for_timeout(300)
 
-    # 4. 清空输入框 —— retry 路径 revise 后调用,这里幂等
+    # 4. 应用任务比例 + 时长,不继承豆包页面默认或 profile 上次状态。
+    await _apply_video_options(page, ratio=ratio, duration=duration)
+
+    # 5. 清空输入框 —— retry 路径 revise 后调用,这里幂等
     await clear_prose_mirror(page)
 
-    # 5. 输入 prompt —— v0.3.2.1:改 clipboard paste(不是 keyboard.type)
+    # 6. 输入 prompt —— v0.3.2.1:改 clipboard paste(不是 keyboard.type)
     # 原因:
     # - 用户把整段提示词一次给我,需要"一次性贴入",不是一字一字打
     # - keyboard.type(prompt, delay=20) 对 500 字 prompt 要 ~10s 跑完,
@@ -1414,7 +1723,7 @@ async def submit_via_ui(
     await page.keyboard.press("Control+V")
     await page.wait_for_timeout(150)  # 等 ProseMirror 同步 internal state
 
-    # 6. v0.3.2.4:**再跑一次阻塞式 aegis 网关**(paste 后、click send 前)
+    # 7. v0.3.2.4:**再跑一次阻塞式 aegis 网关**(paste 后、click send 前)
     # v0.3.2.3 这步用 _try_solve_captcha_in_video(wait=0) 仅 fire-and-forget,
     # 用户实测中 aegis 弹窗常在 paste / click send 之间才挂上,前一次(step 2)
     # 网关捕捉不到;step 6 用 wait=0 探测也来不及。修法:step 6 直接复用
@@ -1948,6 +2257,8 @@ class PlaywrightVideoRunner:
                     await submit_via_ui(
                         page,
                         prompt,
+                        ratio=ratio,
+                        duration=duration,
                         profile_dir=profile_dir,
                         update=update,
                     )

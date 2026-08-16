@@ -203,11 +203,24 @@ async def test_clear_prose_mirror_uses_ctrl_a_delete():
 async def test_submit_via_ui_clicks_video_tab_and_send_btn(monkeypatch):
     page = _FakePage(url="https://www.doubao.com/chat/create-image")
     update = MagicMock()
+    options_mock = AsyncMock()
+    monkeypatch.setattr(
+        "doupool.video.browser._apply_video_options",
+        options_mock,
+    )
     monkeypatch.setattr(
         "doupool.video.browser._try_solve_captcha_in_video",
         AsyncMock(return_value=False),
     )
-    await submit_via_ui(page, "测试一只小狗", profile_dir=Path("/tmp/p"), update=update)
+    await submit_via_ui(
+        page,
+        "测试一只小狗",
+        ratio="16:9",
+        duration=10,
+        profile_dir=Path("/tmp/p"),
+        update=update,
+    )
+    options_mock.assert_awaited_once_with(page, ratio="16:9", duration=10)
     # 视频 tab 已 click(触发 mouse.down/up)
     assert page._elements[VIDEO_TAB_SEL] is not None
     # send button 命中(SEND_BTN_SEL 或 fallback)
@@ -238,10 +251,21 @@ async def test_submit_via_ui_skips_goto_when_already_on_create_image(monkeypatch
     """已在 create-image 页 → 不应再调 page.goto(避免重复跳转)。"""
     page = _FakePage(url="https://www.doubao.com/chat/create-image")
     monkeypatch.setattr(
+        "doupool.video.browser._apply_video_options",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
         "doupool.video.browser._try_solve_captcha_in_video",
         AsyncMock(return_value=False),
     )
-    await submit_via_ui(page, "x", profile_dir=Path("/tmp/p"), update=MagicMock())
+    await submit_via_ui(
+        page,
+        "x",
+        ratio="1:1",
+        duration=5,
+        profile_dir=Path("/tmp/p"),
+        update=MagicMock(),
+    )
     assert page.goto_calls == []
 
 
@@ -249,12 +273,97 @@ async def test_submit_via_ui_skips_goto_when_already_on_create_image(monkeypatch
 async def test_submit_via_ui_goto_when_on_other_page(monkeypatch):
     page = _FakePage(url="https://www.doubao.com/chat/123")
     monkeypatch.setattr(
+        "doupool.video.browser._apply_video_options",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
         "doupool.video.browser._try_solve_captcha_in_video",
         AsyncMock(return_value=False),
     )
-    await submit_via_ui(page, "x", profile_dir=Path("/tmp/p"), update=MagicMock())
+    await submit_via_ui(
+        page,
+        "x",
+        ratio="1:1",
+        duration=5,
+        profile_dir=Path("/tmp/p"),
+        update=MagicMock(),
+    )
     assert len(page.goto_calls) == 1
     assert page.goto_calls[0][0].startswith("https://www.doubao.com/chat/create-image")
+
+
+@pytest.mark.asyncio
+async def test_submit_via_ui_applies_options_before_paste_and_send(monkeypatch):
+    page = _FakePage()
+    events: list[str] = []
+
+    async def fake_gate(*_args, **_kwargs):
+        return True
+
+    async def fake_try_click(_page, selectors, **_kwargs):
+        events.append("video-tab" if selectors == (VIDEO_TAB_SEL,) else "send")
+
+    async def fake_apply(_page, **_kwargs):
+        events.append("options")
+
+    async def tracked_evaluate(expr, arg=None):
+        if "writeText" in str(expr):
+            events.append("paste")
+        return None
+
+    monkeypatch.setattr("doupool.video.browser._pre_submit_aegis_gate", fake_gate)
+    monkeypatch.setattr("doupool.video.browser.try_click", fake_try_click)
+    monkeypatch.setattr("doupool.video.browser._apply_video_options", fake_apply)
+    page.evaluate = tracked_evaluate
+
+    await submit_via_ui(
+        page,
+        "prompt",
+        ratio="16:9",
+        duration=10,
+        profile_dir=Path("/tmp/p"),
+        update=MagicMock(),
+    )
+
+    assert events == ["video-tab", "options", "paste", "send"]
+
+
+@pytest.mark.asyncio
+async def test_submit_via_ui_does_not_paste_or_send_when_options_fail(monkeypatch):
+    page = _FakePage()
+    events: list[str] = []
+
+    async def fake_gate(*_args, **_kwargs):
+        return True
+
+    async def fake_try_click(_page, selectors, **_kwargs):
+        events.append("video-tab" if selectors == (VIDEO_TAB_SEL,) else "send")
+
+    async def failing_apply(_page, **_kwargs):
+        events.append("options")
+        raise RuntimeError("视频参数设置失败")
+
+    async def tracked_evaluate(expr, arg=None):
+        if "writeText" in str(expr):
+            events.append("paste")
+        return None
+
+    monkeypatch.setattr("doupool.video.browser._pre_submit_aegis_gate", fake_gate)
+    monkeypatch.setattr("doupool.video.browser.try_click", fake_try_click)
+    monkeypatch.setattr("doupool.video.browser._apply_video_options", failing_apply)
+    page.evaluate = tracked_evaluate
+
+    with pytest.raises(RuntimeError, match="视频参数设置失败"):
+        await submit_via_ui(
+            page,
+            "prompt",
+            ratio="16:9",
+            duration=10,
+            profile_dir=Path("/tmp/p"),
+            update=MagicMock(),
+        )
+
+    assert events == ["video-tab", "options"]
 
 
 # ------------------------- _ack_interceptor ------------------------- #
@@ -361,8 +470,10 @@ async def test_submit_and_poll_use_real_browser_returns_three_field_ack(monkeypa
     page = MagicMock()
     monkeypatch.setattr(protocol_module, "_accepted_remote_ids", {})
 
+    submit_kwargs = {}
+
     async def fake_submit_via_ui(*a, **kw):
-        return None
+        submit_kwargs.update(kw)
 
     monkeypatch.setattr("doupool.video.browser.submit_via_ui", fake_submit_via_ui)
 
@@ -453,6 +564,8 @@ async def test_submit_and_poll_use_real_browser_returns_three_field_ack(monkeypa
     assert result["section_id"] == "S1"
     assert result["question_id"] == "Q1"
     assert protocol_module._accepted_remote_ids == {"x": "owner-task"}
+    assert submit_kwargs["ratio"] == "16:9"
+    assert submit_kwargs["duration"] == 10
     # update 至少调过一次 status=generating 把 ack 写进去
     update.assert_any_call(status="generating", **result)
 
@@ -837,11 +950,20 @@ async def test_submit_via_ui_pastes_long_prompt_in_single_op(monkeypatch):
     """
     page = _FakePage(url="https://www.doubao.com/chat/create-image")
     monkeypatch.setattr(
+        "doupool.video.browser._apply_video_options",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
         "doupool.video.browser._try_solve_captcha_in_video",
         AsyncMock(return_value=False),
     )
     await submit_via_ui(
-        page, LONG_PROMPT, profile_dir=Path("/tmp/p"), update=MagicMock(),
+        page,
+        LONG_PROMPT,
+        ratio="16:9",
+        duration=10,
+        profile_dir=Path("/tmp/p"),
+        update=MagicMock(),
     )
 
     # 1) 整段 prompt(>500 字)进了 clipboard,只有一次 writeText
@@ -1266,7 +1388,14 @@ async def test_submit_via_ui_raises_when_gate_blocks(monkeypatch, fast_gate_cons
     )
 
     with pytest.raises(RuntimeError, match="aegis 拖拽验证未通过"):
-        await submit_via_ui(page, "x", profile_dir=Path("/tmp/p"), update=update)
+        await submit_via_ui(
+            page,
+            "x",
+            ratio="1:1",
+            duration=5,
+            profile_dir=Path("/tmp/p"),
+            update=update,
+        )
 
     # 关键:raise 之后,send button 不该被 click(mouse.downs 应为 0)。
     # VIDEO_TAB_SEL 也不该被 click(还没到 step 3)。
@@ -1304,10 +1433,21 @@ async def test_submit_via_ui_step6_rechecks_aegis_after_paste(
         "doupool.video.browser._pre_submit_aegis_gate",
         gate_mock,
     )
+    monkeypatch.setattr(
+        "doupool.video.browser._apply_video_options",
+        AsyncMock(),
+    )
 
     # step 6 触发的错误文案跟 step 2 不一样(「粘贴后再次检测到...」)
     with pytest.raises(RuntimeError, match="粘贴后再次检测到拖拽验证"):
-        await submit_via_ui(page, "x", profile_dir=Path("/tmp/p"), update=update)
+        await submit_via_ui(
+            page,
+            "x",
+            ratio="1:1",
+            duration=5,
+            profile_dir=Path("/tmp/p"),
+            update=update,
+        )
 
     # step 2 通过 → step 3(点 video tab)跑了 1 次 mouse.down,
     # 但 step 6 raise → step 6 的 click(SEND_BTN_SEL)没跑 → 总 mouse.downs 应为 1
