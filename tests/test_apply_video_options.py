@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 
 import pytest
 
-from doupool.video.browser import _apply_video_options
+from doupool.video.browser import _apply_video_options, _close_video_options
 
 
 class _FakeMouse:
@@ -32,7 +33,10 @@ class _FakeKeyboard:
     async def press(self, key: str):
         self.presses.append(key)
         if key == "Escape" and self.page.escape_closes:
-            self.page.menu_open = False
+            if self.page.escape_close_delay_ms > 0 and self.page.menu_open:
+                self.page.pending_escape_close_ms = self.page.escape_close_delay_ms
+            else:
+                self.page.menu_open = False
 
 
 class _FakeElement:
@@ -176,6 +180,7 @@ class _FakePage:
         has_trigger: bool = True,
         menu_opens: bool = True,
         escape_closes: bool = True,
+        escape_close_delay_ms: int = 0,
         open_delays: list[int] | None = None,
         trigger_updates: bool = True,
         trigger_update_delay_ms: int = 0,
@@ -187,6 +192,8 @@ class _FakePage:
         self.has_trigger = has_trigger
         self.menu_opens = menu_opens
         self.escape_closes = escape_closes
+        self.escape_close_delay_ms = escape_close_delay_ms
+        self.pending_escape_close_ms: int | None = None
         self.open_delays = list(open_delays or [])
         self.render_delay_ms = 0
         self.menu_open = False
@@ -231,6 +238,15 @@ class _FakePage:
             self.pending_trigger_update_ms = None
 
     async def wait_for_timeout(self, milliseconds: int):
+        if self.pending_escape_close_ms is not None:
+            real_wait_ms = min(milliseconds, self.pending_escape_close_ms)
+            await asyncio.sleep(real_wait_ms / 1_000)
+            self.pending_escape_close_ms -= real_wait_ms
+            if self.pending_escape_close_ms == 0:
+                self.menu_open = False
+                self.pending_escape_close_ms = None
+        else:
+            await asyncio.sleep(0)
         self.render_delay_ms = max(0, self.render_delay_ms - milliseconds)
         if self.pending_trigger_update_ms is not None:
             self.pending_trigger_update_ms = max(
@@ -241,7 +257,6 @@ class _FakePage:
                 self.display_ratio = self.ratio
                 self.display_duration = self.duration
                 self.pending_trigger_update_ms = None
-        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -374,3 +389,57 @@ async def test_apply_video_options_reopens_menu_when_ratio_click_closes_it():
 
     assert page.trigger_clicks == 2
     assert page.duration == 10
+
+
+@pytest.mark.asyncio
+async def test_apply_video_options_waits_for_delayed_escape_close_without_toggle():
+    page = _FakePage(
+        ratio_options=["3:4", "4:3", "9:16", "16:9", "1:1"],
+        escape_close_delay_ms=800,
+        duration=10,
+    )
+    started = asyncio.get_running_loop().time()
+
+    await _apply_video_options(page, ratio="1:1", duration=10)
+
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed >= 0.8
+    assert page.keyboard.presses == ["Escape"]
+    assert page.trigger_clicks == 1
+    assert page.menu_open is False
+
+
+@pytest.mark.asyncio
+async def test_close_video_options_logs_when_escape_and_toggle_both_fail(caplog):
+    page = _FakePage(escape_closes=False, menu_opens=False)
+    page.menu_open = True
+    expected_visible = ["3:4", "4:3", "9:16", "16:9", "1:1", "21:9"]
+
+    with caplog.at_level(logging.WARNING, logger="doupool.video.browser"):
+        with pytest.raises(RuntimeError) as exc_info:
+            await _close_video_options(page, page.trigger)
+
+    message = str(exc_info.value)
+    assert "trigger_text='自动 · 5s'" in message
+    assert f"visible={expected_visible!r}" in message
+    assert page.keyboard.presses == ["Escape"]
+    assert page.trigger_clicks == 1
+    assert "event=video_options_close_failed" in caplog.text
+    assert page.url in caplog.text
+    assert "trigger_text='自动 · 5s'" in caplog.text
+    assert f"visible_after_escape={expected_visible!r}" in caplog.text
+    assert f"visible_after_toggle={expected_visible!r}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_video_options_readback_failure_logs_expected_and_actual(caplog):
+    page = _FakePage(trigger_updates=False, ratio="自动", duration=10)
+
+    with caplog.at_level(logging.WARNING, logger="doupool.video.browser"):
+        with pytest.raises(RuntimeError, match="视频参数设置后校验失败"):
+            await _apply_video_options(page, ratio="1:1", duration=10)
+
+    assert "event=video_options_readback_failed" in caplog.text
+    assert "actual='自动 · 10s'" in caplog.text
+    assert "expected='1:1 · 10s'" in caplog.text
+    assert page.url in caplog.text

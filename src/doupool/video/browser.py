@@ -62,6 +62,7 @@ _VIDEO_OPTIONS_TRIGGER_RE = re.compile(
 )
 _VIDEO_OPTIONS_MENU_WAIT_MS = 1_000
 _VIDEO_OPTIONS_READBACK_WAIT_MS = 1_500
+_VIDEO_OPTIONS_CLOSE_WAIT_MS = 1_500
 _VIDEO_OPTIONS_TRIGGER_WAIT_MS = 1_500
 _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS = 4
 # v0.3.2.3:UI click 路径下的弹窗缓冲。**经验值**(用户在 v0.3.2.2 反馈):
@@ -1551,6 +1552,25 @@ async def _set_aria_slider_value(page: Page, control, duration: int) -> None:
         )
 
 
+async def _wait_for_video_options_closed(
+    page: Page,
+    *,
+    timeout_ms: int = _VIDEO_OPTIONS_CLOSE_WAIT_MS,
+) -> list[str]:
+    step_ms = 50
+    elapsed_ms = 0
+    visible: list[str] = []
+    while True:
+        visible = await _visible_video_ratio_options(page)
+        if len(visible) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+            return visible
+        if elapsed_ms >= timeout_ms:
+            return visible
+        wait_ms = min(step_ms, timeout_ms - elapsed_ms)
+        await page.wait_for_timeout(wait_ms)
+        elapsed_ms += wait_ms
+
+
 async def _wait_for_video_options_readback(
     page: Page,
     *,
@@ -1574,6 +1594,14 @@ async def _wait_for_video_options_readback(
                 return actual
         if attempt + 1 < attempts:
             await page.wait_for_timeout(step_ms)
+    _LOGGER.warning(
+        "event=video_options_readback_failed url=%s expected=%r actual=%r "
+        "trigger_pattern=%r",
+        page.url,
+        f"{ratio} · {duration}s",
+        actual,
+        _VIDEO_OPTIONS_TRIGGER_RE.pattern,
+    )
     raise RuntimeError(
         f"视频参数设置后校验失败: expected={ratio} · {duration}s actual={actual!r}"
     )
@@ -1581,21 +1609,31 @@ async def _wait_for_video_options_readback(
 
 async def _close_video_options(page: Page, trigger) -> None:
     await page.keyboard.press("Escape")
-    await page.wait_for_timeout(100)
-    if len(await _visible_video_ratio_options(page)) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+    visible_after_escape = await _wait_for_video_options_closed(page)
+    if len(visible_after_escape) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
         return
 
     # 部分页面版本不处理 Escape,退回再次点击组合按钮关闭 toggle。
     trigger = await _find_video_options_trigger(page) or trigger
+    trigger_text = await trigger.inner_text()
     await trigger.click()
-    step_ms = 50
-    for attempt in range(10):
-        visible = await _visible_video_ratio_options(page)
-        if len(visible) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
-            return
-        if attempt < 9:
-            await page.wait_for_timeout(step_ms)
-    raise RuntimeError("视频参数菜单关闭失败")
+    visible_after_toggle = await _wait_for_video_options_closed(page)
+    if len(visible_after_toggle) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+        return
+
+    _LOGGER.warning(
+        "event=video_options_close_failed url=%s trigger_text=%r "
+        "trigger_pattern=%r visible_after_escape=%s visible_after_toggle=%s",
+        page.url,
+        trigger_text,
+        _VIDEO_OPTIONS_TRIGGER_RE.pattern,
+        visible_after_escape,
+        visible_after_toggle,
+    )
+    raise RuntimeError(
+        "视频参数菜单关闭失败: "
+        f"trigger_text={trigger_text!r} visible={visible_after_toggle}"
+    )
 
 
 async def _apply_video_options(
