@@ -78,6 +78,7 @@ def _claim_remote_id_for_owner(payload: dict[str, str], owner_task_id: str | Non
 
 MODELS = {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}
 RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}
+_VIDEO_BOT_ID = "7338286299411103781"
 # v0.2.29:豆包接受任意整数 4..10 秒时长,放宽白名单(原 {5,10} 太严)。
 DURATIONS = set(range(4, 11))
 TASK_MODES = {"t2v", "i2v"}
@@ -345,7 +346,7 @@ def build_completion_payload(
         "client_meta": {
             "local_conversation_id": local_conversation_id,
             "conversation_id": "",
-            "bot_id": "7338286299411103781",
+            "bot_id": _VIDEO_BOT_ID,
             "last_section_id": "",
             "last_message_index": None,
             # v0.2.17:WebMSSDK / TeaSDK 真实指纹(从登录 profile 抽)。
@@ -514,6 +515,127 @@ def scan_sse_for_policy_rejection(sse_text: str) -> str | None:
     return None
 
 
+def _scan_chain_response_for_rejection(response: dict) -> str | None:
+    """扫描 chain message envelope 中已确认承载拒绝文案的四个字段。
+
+    /im/chain/single 的 JSON 响应会把拒绝正文直接放在 message envelope，
+    不一定写入旧解析路径使用的 message.content JSON 字符串。这里只检查
+    真机确认过的文本字段，避免宽口径遍历误判其他元数据。
+    """
+    if not isinstance(response, dict):
+        return None
+    downlink = response.get("downlink_body")
+    if not isinstance(downlink, dict):
+        return None
+    chain = downlink.get("pull_singe_chain_downlink_body")
+    if not isinstance(chain, dict):
+        return None
+    messages = chain.get("messages")
+    if not isinstance(messages, list):
+        return None
+
+    # chain 会先回显用户消息，再把 bot 回复插到 messages[0]。真机响应里
+    # 用户消息的 ext.bot_id 与 bot 回复的 sender_id 相同；先收集该身份，
+    # 避免把用户 prompt 自己包含的「无法生成 / 版权限制」误判成平台拒绝。
+    bot_sender_ids = {_VIDEO_BOT_ID}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        ext = message.get("ext")
+        if not isinstance(ext, dict):
+            continue
+        bot_id = ext.get("bot_id")
+        if isinstance(bot_id, str) and bot_id:
+            bot_sender_ids.add(bot_id)
+
+    def _match(text: object, path: str) -> str | None:
+        if not isinstance(text, str) or not text:
+            return None
+        candidate = text[:_MAX_TEXT_LEN]
+        for pattern in _POLICY_PATTERNS:
+            match = pattern.search(candidate)
+            if match is None:
+                continue
+            reason = match.group(0)[:200]
+            snippet = " ".join(candidate.split())[:200]
+            _LOGGER.warning(
+                "event=video_chain_policy_rejected path=%s snippet=%s",
+                path,
+                snippet,
+            )
+            return reason
+        return None
+
+    indexed_messages = [
+        (message_index, message)
+        for message_index, message in enumerate(messages)
+        if isinstance(message, dict)
+    ]
+    messages_with_conv_index: list[tuple[int, int, dict]] = []
+    for message_index, message in indexed_messages:
+        try:
+            index_in_conv = int(message.get("index_in_conv"))
+        except (TypeError, ValueError):
+            continue
+        messages_with_conv_index.append((index_in_conv, message_index, message))
+
+    if messages_with_conv_index:
+        _, latest_message_index, latest_message = max(
+            messages_with_conv_index,
+            key=lambda item: item[0],
+        )
+        messages_to_scan = [(latest_message_index, latest_message)]
+    else:
+        # 当前 chain 按新到旧排序。旧版本没有 index_in_conv 时只检查首条，
+        # 不回扫历史 bot 拒绝，避免改写重试被上一轮响应再次打断。
+        messages_to_scan = indexed_messages[:1]
+
+    root = "$.downlink_body.pull_singe_chain_downlink_body.messages"
+    for message_index, message in messages_to_scan:
+        sender_id = message.get("sender_id")
+        if not isinstance(sender_id, str) or sender_id not in bot_sender_ids:
+            # 现场用户回显 sender_id == receiver_id；bot 回复的 sender_id
+            # 则等于 ext.bot_id / 当前视频 bot id。身份不明时保守跳过，避免
+            # 把用户输入当作拒绝文案。
+            continue
+        message_path = f"{root}[{message_index}]"
+
+        content_blocks = message.get("content_block")
+        if isinstance(content_blocks, list):
+            for block_index, block in enumerate(content_blocks):
+                if not isinstance(block, dict):
+                    continue
+                content = block.get("content")
+                if not isinstance(content, dict):
+                    continue
+                text_block = content.get("text_block")
+                if not isinstance(text_block, dict):
+                    continue
+                hit = _match(
+                    text_block.get("text"),
+                    f"{message_path}.content_block[{block_index}]"
+                    ".content.text_block.text",
+                )
+                if hit is not None:
+                    return hit
+
+        hit = _match(message.get("tts_content"), f"{message_path}.tts_content")
+        if hit is not None:
+            return hit
+
+        ext = message.get("ext")
+        if isinstance(ext, dict):
+            hit = _match(ext.get("brief"), f"{message_path}.ext.brief")
+            if hit is not None:
+                return hit
+
+        hit = _match(message.get("brief"), f"{message_path}.brief")
+        if hit is not None:
+            return hit
+
+    return None
+
+
 def parse_creation_result(
     response: dict,
     *,
@@ -525,7 +647,7 @@ def parse_creation_result(
 
     两条返回路径:
     1. 成功 — `creation_block.creations[].video.status == 3` 且有 download_url → dict
-    2. v0.2.21:内容审核拒绝 — 任意 message 的 text 含 policy 关键词 → 抛
+    2. v0.2.21:内容审核拒绝 — 最新 bot message 的 text 含 policy 关键词 → 抛
        DoubaoContentRejected(reason, response_text=...)。
 
     顺序:**先扫成功块**(若已成功直接 return),再扫拒绝关键词。避免已成功的任务
@@ -755,9 +877,11 @@ def parse_creation_result(
             )
             return payload
 
-    # 2. v0.2.21:policy 关键词兜底扫描 — 任意 block 含「侵权|违规|换个主题|无法
-    # 返回该内容|sensitive content」等关键词 → 抛 rejected,service 层立即 failed。
-    rejected_reason = _find_policy_rejection(decoded_blocks)
+    # 2. policy 关键词兜底扫描。v0.3.5.8:先检查真机确认的 chain message
+    # envelope 四个字段，再兼容旧版 message.content JSON blocks。
+    rejected_reason = _scan_chain_response_for_rejection(response)
+    if rejected_reason is None:
+        rejected_reason = _find_policy_rejection(decoded_blocks)
     if rejected_reason is not None:
         raise DoubaoContentRejected(rejected_reason, response_text=_truncate_response(response))
 

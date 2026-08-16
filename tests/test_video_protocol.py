@@ -329,6 +329,281 @@ def _wrap(content_blocks: list[dict]) -> dict:
     }
 
 
+_CHAIN_COPYRIGHT_REJECTION = (
+    "抱歉，由于版权相关限制，暂时无法创作对应的内容，换其他主题试试吧。"
+)
+
+
+def _wrap_chain_envelope(message_fields: dict) -> dict:
+    """构造真机 /im/chain/single 的 message envelope 形状。"""
+    message = {
+        "content": "",
+        "local_message_id": "local-chain-rejection",
+        "sender_id": "7338286299411103781",
+        "receiver_id": "user-1",
+        "index_in_conv": "2",
+        **message_fields,
+    }
+    return {
+        "downlink_body": {
+            "pull_singe_chain_downlink_body": {
+                "messages": [message],
+            }
+        }
+    }
+
+
+def _pending_direct_content_blocks(*, rejection_text: str | None = None) -> list[dict]:
+    blocks: list[dict] = []
+    if rejection_text is not None:
+        blocks.append({
+            "block_type": 10000,
+            "content": {"text_block": {"text": rejection_text}},
+        })
+    blocks.append({
+        "block_type": 2074,
+        "content": {
+            "creation_block": {
+                "creations": [{
+                    "id": "pending-chain-task",
+                    "video": {"status": 1},
+                }]
+            }
+        },
+    })
+    return blocks
+
+
+@pytest.mark.parametrize(
+    ("message_fields", "expected_path"),
+    [
+        (
+            {
+                "content_block": _pending_direct_content_blocks(
+                    rejection_text=_CHAIN_COPYRIGHT_REJECTION,
+                ),
+            },
+            ".content_block[0].content.text_block.text",
+        ),
+        (
+            {
+                "content_block": _pending_direct_content_blocks(),
+                "tts_content": _CHAIN_COPYRIGHT_REJECTION,
+            },
+            ".tts_content",
+        ),
+        (
+            {
+                "content_block": _pending_direct_content_blocks(),
+                "ext": {"brief": _CHAIN_COPYRIGHT_REJECTION},
+            },
+            ".ext.brief",
+        ),
+        (
+            {
+                "content_block": _pending_direct_content_blocks(),
+                "brief": _CHAIN_COPYRIGHT_REJECTION,
+            },
+            ".brief",
+        ),
+    ],
+)
+def test_parse_creation_result_rejects_four_observed_chain_envelope_paths(
+    message_fields,
+    expected_path,
+    caplog,
+):
+    response = _wrap_chain_envelope(message_fields)
+
+    with caplog.at_level("WARNING", logger="doupool.video.protocol"):
+        with pytest.raises(DoubaoContentRejected) as excinfo:
+            parse_creation_result(response, owner_task_id="owner-chain-reject")
+
+    assert "版权" in excinfo.value.error_message
+    assert _CHAIN_COPYRIGHT_REJECTION in excinfo.value.response_text
+    assert "event=video_chain_policy_rejected" in caplog.text
+    assert expected_path in caplog.text
+    assert _CHAIN_COPYRIGHT_REJECTION in caplog.text
+
+
+def test_chain_envelope_rejection_raises_again_for_same_owner():
+    """每次改写重提复用同一 owner，后续拒绝也必须继续抛出。"""
+    response = _wrap_chain_envelope({
+        "content_block": _pending_direct_content_blocks(
+            rejection_text=_CHAIN_COPYRIGHT_REJECTION,
+        ),
+        "tts_content": _CHAIN_COPYRIGHT_REJECTION,
+        "ext": {"brief": _CHAIN_COPYRIGHT_REJECTION},
+        "brief": _CHAIN_COPYRIGHT_REJECTION,
+    })
+
+    for _ in range(2):
+        with pytest.raises(DoubaoContentRejected):
+            parse_creation_result(response, owner_task_id="owner-same-retry")
+
+    assert protocol_module._accepted_remote_ids == {}
+    assert protocol_module._candidate_first_seen == {}
+
+
+def test_chain_rejection_helper_matches_generic_refusal_text():
+    response = _wrap_chain_envelope({
+        "content_block": _pending_direct_content_blocks(),
+        "tts_content": "我暂时无法生成你要求的内容，请尝试输入其他要求，我会尽力为你提供帮助。",
+    })
+
+    reason = protocol_module._scan_chain_response_for_rejection(response)
+
+    assert reason is not None
+    assert "无法生成" in reason
+
+
+@pytest.mark.parametrize(
+    "message_fields",
+    [
+        {},
+        {"content_block": []},
+        {"content_block": {"content": {"text_block": {"text": "无法创作"}}}},
+        {
+            "content_block": [{"content": {"image_block": {"url": "x"}}}],
+            "tts_content": 10,
+            "ext": "not-a-dict",
+            "brief": [],
+        },
+    ],
+)
+def test_chain_envelope_rejection_scan_ignores_missing_or_wrong_types(message_fields):
+    response = _wrap_chain_envelope(message_fields)
+
+    assert parse_creation_result(response, owner_task_id="owner-malformed") is None
+
+
+def test_chain_envelope_rejection_scan_ignores_benign_text():
+    response = _wrap_chain_envelope({
+        "content_block": _pending_direct_content_blocks(
+            rejection_text="正在为你生成原创城市夜景视频，请稍候。",
+        ),
+        "tts_content": "视频仍在生成中",
+        "ext": {"brief": "预计很快完成"},
+        "brief": "正常生成任务",
+    })
+
+    assert parse_creation_result(response, owner_task_id="owner-benign") is None
+    assert protocol_module._scan_chain_response_for_rejection(response) is None
+
+
+def test_chain_rejection_scan_ignores_user_prompt_echo_before_bot_reply():
+    """首轮 chain 只有用户回显时，prompt 中的拒绝词不能触发自动改写。"""
+    response = _wrap_chain_envelope({
+        "sender_id": "user-1",
+        "receiver_id": "user-1",
+        "ext": {"bot_id": "bot-1"},
+        "content_block": _pending_direct_content_blocks(
+            rejection_text="请生成一段讲解为什么平台无法生成版权受限内容的视频。",
+        ),
+    })
+
+    assert parse_creation_result(response, owner_task_id="owner-user-echo") is None
+    assert protocol_module._scan_chain_response_for_rejection(response) is None
+
+
+def test_chain_rejection_scan_uses_bot_id_from_sibling_user_envelope():
+    """bot 回复自身可不带 bot_id，使用同一 chain 用户消息的 ext.bot_id 识别。"""
+    bot_message = {
+        "content": "",
+        "sender_id": "bot-1",
+        "receiver_id": "user-1",
+        "index_in_conv": "2",
+        "content_block": _pending_direct_content_blocks(
+            rejection_text=_CHAIN_COPYRIGHT_REJECTION,
+        ),
+    }
+    user_message = {
+        "content": "",
+        "sender_id": "user-1",
+        "receiver_id": "user-1",
+        "index_in_conv": "1",
+        "ext": {"bot_id": "bot-1"},
+        "content_block": _pending_direct_content_blocks(
+            rejection_text="请解释无法生成版权相关内容的原因。",
+        ),
+    }
+    response = {
+        "downlink_body": {
+            "pull_singe_chain_downlink_body": {
+                "messages": [bot_message, user_message],
+            }
+        }
+    }
+
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_creation_result(response, owner_task_id="owner-bot-reply")
+
+    assert "版权" in excinfo.value.error_message
+
+
+def test_chain_rejection_scan_does_not_reuse_historical_bot_rejection():
+    """最新消息仍是用户提交时，不得重新命中上一轮 bot 拒绝。"""
+    old_bot_message = {
+        "content": "",
+        "sender_id": "bot-1",
+        "receiver_id": "user-1",
+        "index_in_conv": "2",
+        "content_block": _pending_direct_content_blocks(
+            rejection_text=_CHAIN_COPYRIGHT_REJECTION,
+        ),
+    }
+    latest_user_message = {
+        "content": "",
+        "sender_id": "user-1",
+        "receiver_id": "user-1",
+        "index_in_conv": "3",
+        "ext": {"bot_id": "bot-1"},
+        "content_block": _pending_direct_content_blocks(
+            rejection_text="把这段提示词修改成不涉及版权的提示词并生成视频。",
+        ),
+    }
+    response = {
+        "downlink_body": {
+            "pull_singe_chain_downlink_body": {
+                "messages": [latest_user_message, old_bot_message],
+            }
+        }
+    }
+
+    assert parse_creation_result(response, owner_task_id="owner-new-attempt") is None
+    assert protocol_module._scan_chain_response_for_rejection(response) is None
+
+
+def test_chain_envelope_success_still_wins_over_rejection():
+    success = json.dumps([{
+        "block_type": 2074,
+        "content": {"creation_block": {"creations": [{
+            "id": "successful-chain-task",
+            "video": {
+                "status": 3,
+                "vid": "successful-vid",
+                "download_url": "https://example.test/success.mp4",
+            },
+        }]}},
+    }])
+    response = _wrap_chain_envelope({
+        "content": success,
+        "content_block": _pending_direct_content_blocks(
+            rejection_text=_CHAIN_COPYRIGHT_REJECTION,
+        ),
+    })
+
+    assert parse_creation_result(
+        response,
+        owner_task_id="owner-success",
+    ) == {
+        "remote_task_id": "successful-chain-task",
+        "vid": "successful-vid",
+        "fallback_result_url": "https://example.test/success.mp4",
+        "cover_url": "",
+    }
+
+
 def test_parse_creation_result_raises_on_text_block_rejection():
     """v0.2.21:豆包把「无法返回该内容」塞 text_block.text 时,parse_creation_result
     必须抛 DoubaoContentRejected —— 之前默默返 None,polling 卡到 5min timeout。"""
