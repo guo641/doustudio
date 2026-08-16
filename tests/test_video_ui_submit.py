@@ -146,6 +146,26 @@ class _FakePage:
         self._removed_handlers.append((event, handler))
 
 
+@pytest.fixture(autouse=True)
+def _stub_video_tab_switch_for_submit_contracts(monkeypatch):
+    """这些测试聚焦 submit 后半段，用旧 fake click 模拟已验证的 TAB 切换。
+
+    `_click_video_tab` 的 selector/挂载校验由 test_apply_video_options.py 的
+    专门用例覆盖；这里保留原有 mouse.down/up 和 monkeypatch try_click 断言。
+    """
+    async def fake_click(page):
+        # Resolve through the module at call time so tests that monkeypatch
+        # `browser.try_click` still observe the synthetic TAB click.
+        import doupool.video.browser as browser_mod
+
+        await browser_mod.try_click(page, (VIDEO_TAB_SEL,), timeout=5.0)
+
+    monkeypatch.setattr(
+        "doupool.video.browser._click_video_tab",
+        fake_click,
+    )
+
+
 # ------------------------- try_click ------------------------- #
 
 

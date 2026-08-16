@@ -6,7 +6,11 @@ import re
 
 import pytest
 
-from doupool.video.browser import _apply_video_options, _close_video_options
+from doupool.video.browser import (
+    _apply_video_options,
+    _click_video_tab,
+    _close_video_options,
+)
 
 
 class _FakeMouse:
@@ -307,6 +311,154 @@ class _FakePage:
                 self.pending_trigger_update_ms = None
 
 
+class _FakeTabElement:
+    """Small DOM element used by the video-tab selector contract tests."""
+
+    def __init__(self, page, *, text: str, tag: str = "div",
+                 role: str | None = None, aria_label: str | None = None,
+                 semi: bool = False, kind: str = "tab"):
+        self.page = page
+        self.text = text
+        self.tag = tag
+        self.role = role
+        self.aria_label = aria_label
+        self.semi = semi
+        self.kind = kind
+
+    async def is_visible(self) -> bool:
+        if self.kind == "ratio":
+            return self.page.ratio_options_mounted
+        return True
+
+    async def inner_text(self) -> str:
+        return self.text
+
+    async def get_attribute(self, name: str) -> str | None:
+        if name == "role":
+            return self.role
+        if name == "aria-label":
+            return self.aria_label
+        return None
+
+    async def click(self) -> None:
+        if self.kind == "tab":
+            self.page.tab_clicks += 1
+            self.page.clicked_tabs.append(self.text)
+            self.page.ratio_options_mounted = self.page.mounts_ratio_options
+
+
+class _FakeTabLocator:
+    def __init__(self, page, selector: str, text_filter=None):
+        self.page = page
+        self.selector = selector
+        self.text_filter = text_filter
+
+    @staticmethod
+    def _selector_text(selector: str) -> str | None:
+        match = re.search(r":has-text\((?:['\"])(.*?)(?:['\"])\)", selector)
+        return match.group(1) if match else None
+
+    def _matches_selector(self, item: _FakeTabElement) -> bool:
+        selector = self.selector
+        selector_text = self._selector_text(selector)
+        if selector_text is not None and selector_text not in item.text:
+            return False
+        if "[aria-label*='视频']" in selector and "视频" not in (item.aria_label or ""):
+            return False
+        if selector.startswith(".semi-tabs-tab") and not item.semi:
+            return False
+        if "[role='tab']" in selector and item.role != "tab":
+            return False
+        if selector in {"[role='tab']", "role=tab"} and item.role != "tab":
+            return False
+        if selector in {"button, [role='button']", "[role='button'], button"}:
+            if item.tag != "button" and item.role != "button":
+                return False
+        elif selector.startswith("button") and item.tag != "button":
+            return False
+        elif selector.startswith("[role='button']") and item.role != "button":
+            return False
+        return True
+
+    def _items(self) -> list[_FakeTabElement]:
+        items = self.page.all_elements
+        selected = [item for item in items if self._matches_selector(item)]
+        if self.text_filter is None:
+            return selected
+        if isinstance(self.text_filter, re.Pattern):
+            return [item for item in selected if self.text_filter.search(item.text)]
+        return [item for item in selected if str(self.text_filter) in item.text]
+
+    def filter(self, *, has_text):
+        return _FakeTabLocator(self.page, self.selector, has_text)
+
+    async def count(self) -> int:
+        return len(self._items())
+
+    def nth(self, index: int):
+        return self._items()[index]
+
+    @property
+    def first(self):
+        return self.nth(0)
+
+    async def all_text_contents(self) -> list[str]:
+        return [item.text for item in self._items()]
+
+
+class _FakeTabPage:
+    """Fake Playwright page for `_click_video_tab` selector/validation tests.
+
+    Ratio controls become visible after a successful tab click. This models
+    the contract requested by the production helper; real-page menu visibility
+    remains a separate integration concern.
+    """
+
+    def __init__(
+        self,
+        *,
+        tabs: list[_FakeTabElement] | None = None,
+        buttons: list[_FakeTabElement] | None = None,
+        ratio_options: list[str] | None = None,
+        mounts_ratio_options: bool = True,
+        url: str = "https://www.doubao.com/chat/create-image",
+    ):
+        self.url = url
+        self.tab_clicks = 0
+        self.clicked_tabs: list[str] = []
+        self.mounts_ratio_options = mounts_ratio_options
+        self.ratio_options_mounted = False
+        self.tabs = tabs or []
+        self.buttons = buttons or []
+        for item in [*self.tabs, *self.buttons]:
+            item.page = self
+        self.ratio_elements = [
+            _FakeTabElement(self, text=value, tag="button", kind="ratio")
+            for value in (ratio_options or ["自动", "3:4", "4:3", "9:16"])
+        ]
+
+    @property
+    def all_elements(self) -> list[_FakeTabElement]:
+        return [*self.tabs, *self.buttons, *self.ratio_elements]
+
+    def locator(self, selector: str):
+        return _FakeTabLocator(self, selector)
+
+    def get_by_role(self, role: str, name=None):
+        if role == "tab":
+            locator = _FakeTabLocator(self, "role=tab")
+            return locator.filter(has_text=name) if name is not None else locator
+        if role == "button":
+            # Playwright's role locator includes native buttons and divs with
+            # role=button; ratio options are included only after mount.
+            locator = _FakeTabLocator(self, "button, [role='button']")
+            return locator.filter(has_text=name) if name is not None else locator
+        raise AssertionError(role)
+
+    async def wait_for_timeout(self, _milliseconds: int):
+        return None
+
+
 @pytest.mark.asyncio
 async def test_apply_video_options_selects_ratio_and_native_range_duration():
     page = _FakePage(
@@ -571,3 +723,97 @@ async def test_video_options_readback_failure_logs_expected_and_actual(caplog):
     assert "actual='自动 · 10s'" in caplog.text
     assert "expected='1:1 · 10s'" in caplog.text
     assert page.url in caplog.text
+
+
+def _tab(*, text: str, tag: str = "div", role: str | None = None,
+         aria_label: str | None = None, semi: bool = False) -> _FakeTabElement:
+    """Construct a tab/button before its fake page is available."""
+    return _FakeTabElement(
+        None,
+        text=text,
+        tag=tag,
+        role=role,
+        aria_label=aria_label,
+        semi=semi,
+    )
+
+
+@pytest.mark.asyncio
+async def test_click_video_tab_accepts_role_tab_with_nested_text():
+    """A role tab may say ``视频生成`` and contain nested span text."""
+    page = _FakeTabPage(
+        tabs=[_tab(text="视频生成", role="tab")],
+        ratio_options=["3:4", "4:3", "9:16", "16:9"],
+    )
+
+    await _click_video_tab(page)
+
+    assert page.tab_clicks >= 1
+    assert page.clicked_tabs == ["视频生成"]
+    assert page.ratio_options_mounted is True
+
+
+@pytest.mark.asyncio
+async def test_click_video_tab_falls_back_to_native_button_without_role_tab():
+    """Newer markup may expose the video tab as a plain button."""
+    page = _FakeTabPage(
+        buttons=[_tab(text="视频生成", tag="button")],
+        ratio_options=["3:4", "4:3", "9:16", "16:9"],
+    )
+
+    await _click_video_tab(page)
+
+    assert page.tab_clicks >= 1
+    assert page.clicked_tabs == ["视频生成"]
+    assert page.ratio_options_mounted is True
+
+
+@pytest.mark.asyncio
+async def test_click_video_tab_fails_loudly_and_logs_visible_tabs(caplog):
+    """A missing video tab must stop before prompt paste/send."""
+    page = _FakeTabPage(
+        tabs=[_tab(text="图像", role="tab"), _tab(text="AI 创作", role="tab")],
+        buttons=[_tab(text="发送", tag="button")],
+    )
+
+    with caplog.at_level(logging.INFO, logger="doupool.video.browser"):
+        with pytest.raises(RuntimeError, match="视频 TAB 未切换") as exc_info:
+            await _click_video_tab(page)
+
+    message = str(exc_info.value)
+    assert page.url in message
+    assert "图像" in message
+    assert "AI 创作" in message
+    assert page.tab_clicks == 0
+    assert page.url in caplog.text
+    assert "图像" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_click_video_tab_keeps_legacy_role_tab_path():
+    """The original [role=tab] text=视频 markup remains supported."""
+    page = _FakeTabPage(
+        tabs=[_tab(text="视频", role="tab")],
+        ratio_options=["3:4", "4:3", "9:16", "16:9"],
+    )
+
+    await _click_video_tab(page)
+
+    assert page.clicked_tabs == ["视频"]
+    assert page.ratio_options_mounted is True
+
+
+@pytest.mark.asyncio
+async def test_click_video_tab_rejects_unmounted_video_content():
+    """Clicking a tab is insufficient when its video controls never mount."""
+    page = _FakeTabPage(
+        tabs=[_tab(text="视频", role="tab")],
+        ratio_options=["3:4", "16:9"],
+        mounts_ratio_options=False,
+    )
+
+    with pytest.raises(RuntimeError, match="视频 TAB 未切换"):
+        await _click_video_tab(page)
+
+    assert page.tab_clicks >= 1
+    assert page.ratio_options_mounted is False

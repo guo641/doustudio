@@ -52,6 +52,15 @@ _CAPTCHA_DETECT_WAIT_BEFORE_SUBMIT_SECONDS = 4.0
 # v0.3.2:UI click 路径 selector 常量。类名稳定优先,SVG path 兜底。
 # 视频 tab 用 a11y role + 文本(豆包前端 aria 标签就是「视频」)。
 VIDEO_TAB_SEL = "[role='tab']:has-text('视频')"
+_VIDEO_TAB_SELECTORS = (
+    VIDEO_TAB_SEL,
+    "[role='tab'][aria-label*='视频']",
+    "button:has-text('视频')",
+    "button[aria-label*='视频']",
+    ".semi-tabs-tab:has-text('视频')",
+)
+_VIDEO_TAB_MOUNT_WAIT_MS = 800
+_VIDEO_TAB_RATIO_WAIT_MS = 2_000
 EDITOR_SEL = "div[contenteditable='true']"
 SEND_BTN_SEL = ".send-btn-wrapper button"
 SEND_BTN_FALLBACK_SEL = "button:has(svg path[d^='M4.93934 10.2598'])"
@@ -1469,6 +1478,242 @@ async def _wait_for_video_options_trigger(page: Page):
     return None
 
 
+async def _visible_texts_for_locator(locator) -> list[str]:
+    """读取 locator 中可见元素的文本，失败时退回 all_text_contents。"""
+    texts: list[str] = []
+    try:
+        for index in range(await locator.count()):
+            candidate = locator.nth(index)
+            if not await candidate.is_visible():
+                continue
+            text = " ".join((await candidate.inner_text()).split())
+            if text and text not in texts:
+                texts.append(text)
+        return texts
+    except Exception:
+        pass
+    try:
+        for value in await locator.all_text_contents():
+            text = " ".join(value.split())
+            if text and text not in texts:
+                texts.append(text)
+    except Exception:
+        pass
+    return texts
+
+
+async def _visible_video_tab_texts(page: Page) -> list[str]:
+    """收集 tab 和视频相关按钮文本，供切换失败诊断使用。"""
+    locators = []
+    try:
+        locators.append(page.locator("[role='tab']"))
+    except Exception:
+        pass
+    try:
+        locators.append(page.get_by_role("tab"))
+    except Exception:
+        pass
+    try:
+        locators.append(page.locator(".semi-tabs-tab"))
+    except Exception:
+        pass
+    try:
+        locators.append(
+            page.locator("button").filter(
+                has_text=re.compile(r"视频|video", re.IGNORECASE),
+            )
+        )
+    except Exception:
+        pass
+    try:
+        locators.append(
+            page.locator("[role='button']").filter(
+                has_text=re.compile(r"视频|video", re.IGNORECASE),
+            )
+        )
+    except Exception:
+        pass
+
+    texts: list[str] = []
+    for locator in locators:
+        for text in await _visible_texts_for_locator(locator):
+            if text not in texts:
+                texts.append(text)
+    # 即使页面没有任何 tab，也保留前几个可见按钮，便于识别仍停在
+    # 侧边栏/登录页等错误状态。
+    for text in await _visible_button_texts(page, limit=10):
+        if text not in texts:
+            texts.append(text)
+    return texts
+
+
+async def _wait_for_visible_video_tab_candidate(page: Page, selector: str):
+    """在短窗口内寻找 selector 对应的第一个可见元素。"""
+    step_ms = 50
+    attempts = max(1, (3_000 + step_ms - 1) // step_ms)
+    for attempt in range(attempts):
+        try:
+            candidate = await _first_visible_locator(page.locator(selector))
+        except Exception:
+            candidate = None
+        if candidate is not None:
+            return candidate
+        if attempt + 1 < attempts:
+            await page.wait_for_timeout(step_ms)
+    return None
+
+
+async def _best_effort_escape_video_options(page: Page) -> None:
+    """关闭 TAB 校验临时打开的参数菜单，不让后续 apply 再次 toggle 错状态。"""
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(100)
+    except Exception:
+        pass
+
+
+async def _validate_video_tab_content(page: Page) -> list[str]:
+    """确认视频内容已经 mount，并返回至少四个可见比例选项。"""
+    visible_options = await _wait_for_video_ratio_options(
+        page,
+        timeout_ms=_VIDEO_TAB_RATIO_WAIT_MS,
+    )
+    if len(visible_options) >= _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+        trigger = await _find_video_options_trigger(page)
+        if trigger is not None:
+            try:
+                await _close_video_options(page, trigger)
+            except Exception as exc:
+                await _best_effort_escape_video_options(page)
+                raise RuntimeError("视频 TAB 校验后参数菜单未关闭") from exc
+        else:
+            await _best_effort_escape_video_options(page)
+        return visible_options
+
+    # 比例按钮通常在组合参数弹层内。切 TAB 后若弹层尚未打开，临时
+    # 打开一次完成真实内容校验，再关闭它交给 _apply_video_options 重开。
+    trigger = await _find_video_options_trigger(page)
+    if trigger is None:
+        return visible_options
+
+    menu_opened = False
+    try:
+        await trigger.click()
+        menu_opened = True
+        visible_options = await _wait_for_video_ratio_options(
+            page,
+            timeout_ms=_VIDEO_TAB_RATIO_WAIT_MS,
+        )
+        return visible_options
+    finally:
+        if menu_opened:
+            try:
+                await _close_video_options(page, trigger)
+            except Exception as exc:
+                await _best_effort_escape_video_options(page)
+                raise RuntimeError("视频 TAB 校验后参数菜单未关闭") from exc
+
+
+async def _click_video_tab_candidate(page: Page, candidate) -> None:
+    """用与 try_click 相同的鼠标路径点击已选中的 TAB 元素。"""
+    try:
+        box = await candidate.bounding_box()
+    except Exception:
+        box = None
+    if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+        try:
+            cx = box["x"] + box["width"] / 2
+            cy = box["y"] + box["height"] / 2
+            await page.mouse.move(cx, cy, steps=3)
+            await page.mouse.down()
+            await page.wait_for_timeout(50 + random.randint(0, 80))
+            await page.mouse.up()
+            await page.wait_for_timeout(150)
+            return
+        except Exception:
+            # 坐标点击失败时继续走 locator click，保留 selector 兜底。
+            pass
+    try:
+        await candidate.click(timeout=3_000)
+    except TypeError:
+        await candidate.click()
+
+
+async def _video_tab_candidate_signature(candidate) -> tuple:
+    """生成签名，避免 role/button 兜底重复点击同一个 DOM 节点。"""
+    try:
+        text = " ".join((await candidate.inner_text()).split())
+    except Exception:
+        text = ""
+    try:
+        box = await candidate.bounding_box()
+    except Exception:
+        box = None
+    if box:
+        position = tuple(
+            round(float(box.get(key, 0)), 1)
+            for key in ("x", "y", "width", "height")
+        )
+    else:
+        position = ()
+    return text, position
+
+
+async def _click_video_tab(page: Page) -> None:
+    """点击视频 TAB，并确认视频参数内容已经真正挂载。"""
+    initial_tabs = await _visible_video_tab_texts(page)
+    _LOGGER.info(
+        "event=video_tab_click_start url=%s tabs=%s",
+        page.url,
+        initial_tabs,
+    )
+
+    errors: list[str] = []
+    seen_candidates: set[tuple] = set()
+    for selector in _VIDEO_TAB_SELECTORS:
+        candidate = await _wait_for_visible_video_tab_candidate(page, selector)
+        if candidate is None:
+            errors.append(f"{selector}:not_found")
+            continue
+        signature = await _video_tab_candidate_signature(candidate)
+        if signature in seen_candidates:
+            errors.append(f"{selector}:duplicate_candidate")
+            continue
+        seen_candidates.add(signature)
+        candidate_clicked = False
+        try:
+            await _click_video_tab_candidate(page, candidate)
+            candidate_clicked = True
+            await page.wait_for_timeout(_VIDEO_TAB_MOUNT_WAIT_MS)
+            visible_options = await _validate_video_tab_content(page)
+            if len(visible_options) >= _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+                _LOGGER.info(
+                    "event=video_tab_click_ok url=%s selector=%s "
+                    "ratio_options=%s",
+                    page.url,
+                    selector,
+                    visible_options,
+                )
+                return
+            errors.append(f"{selector}:ratio_options={visible_options}")
+            await _best_effort_escape_video_options(page)
+        except Exception as exc:
+            errors.append(f"{selector}:{exc}")
+            if candidate_clicked:
+                await _best_effort_escape_video_options(page)
+
+    final_tabs = await _visible_video_tab_texts(page)
+    _LOGGER.warning(
+        "event=video_tab_click_failed url=%s tabs=%s attempts=%s",
+        page.url,
+        final_tabs,
+        errors,
+    )
+    raise RuntimeError(
+        f"视频 TAB 未切换: 当前可见 tabs={final_tabs}, url={page.url}"
+    )
+
+
 async def _open_video_options(page: Page):
     trigger = await _wait_for_video_options_trigger(page)
     if trigger is None:
@@ -1773,9 +2018,9 @@ async def submit_via_ui(
             "请稍候 30s 重试,或确认图鉴打码平台账号配额。"
         )
 
-    # 3. 点视频 tab(create-image 默认是图像 tab)
-    await try_click(page, (VIDEO_TAB_SEL,), timeout=5.0)
-    await page.wait_for_timeout(300)
+    # 3. 点视频 tab(create-image 默认是图像 tab),并确认视频内容已挂载。
+    # 切换失败必须在粘贴 prompt 前终止,避免把内容写进错误的图像页。
+    await _click_video_tab(page)
 
     # 4. 应用任务比例 + 时长,不继承豆包页面默认或 profile 上次状态。
     await _apply_video_options(page, ratio=ratio, duration=duration)
