@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from doupool.prompt_reviser import (
+    FailureInfo,
     FailureKind,
     classify_failure,
     revise_prompt,
@@ -24,6 +25,42 @@ class TestClassifyFailure:
     def test_policy_violation_short(self):
         info = classify_failure("换个主题再试试")
         assert info.kind == FailureKind.POLICY_VIOLATION
+
+    def test_policy_violation_copyright_creation_rejection(self):
+        msg = "抱歉，由于版权相关限制，暂时无法创作对应的内容，换其他主题试试吧。"
+
+        info = classify_failure(msg)
+
+        assert info.kind == FailureKind.POLICY_VIOLATION
+        assert info.retryable is True
+        assert info.revise_prompt is True
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "抱歉，该内容涉及版权，请换一种描述。",
+            "抱歉，存在版权问题，请更换内容。",
+        ],
+    )
+    def test_policy_violation_copyright_variants(self, msg):
+        info = classify_failure(msg)
+
+        assert info.kind == FailureKind.POLICY_VIOLATION
+        assert info.retryable is True
+        assert info.revise_prompt is True
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "生成内容中疑似包含侵权内容,无法返回该内容,换个主题再试试",
+            "换个主题再试试",
+        ],
+    )
+    def test_copyright_patterns_preserve_existing_policy_rejections(self, msg):
+        info = classify_failure(msg)
+
+        assert info.kind == FailureKind.POLICY_VIOLATION
+        assert info.revise_prompt is True
 
     # v0.2.23:豆包新文案「我暂时无法生成你要求的内容,请尝试输入其他要求」
     # 此前不在 _POLICY_PATTERNS → polling 一直 None,5min 后才 timeout。
@@ -165,7 +202,9 @@ class TestClassifyFailure:
 # 追加一句固定指令,让豆包自己改写并重生成。每次重试都由浏览器层 retry 循环
 # 把上次的 new_prompt 写回 prompt_to_send → 后缀自然累积(累计 N 次失败 → 末尾
 # 出现 N 段指令)。
-_INSTRUCTION = "把这段提示词修改成不违反平台规则的提示词,并生成视频"
+_INSTRUCTION = (
+    "把这段提示词修改成不违反平台规则、不涉及版权或知名IP形象的提示词,并生成视频"
+)
 
 
 class TestRevisePrompt:
@@ -186,6 +225,25 @@ class TestRevisePrompt:
         assert _INSTRUCTION in revised
         # 不再做任何关键词剥离 — 原内容应保留
         assert "风景" in revised
+
+    def test_policy_violation_instruction_mentions_copyright(self):
+        failure = FailureInfo(
+            FailureKind.POLICY_VIOLATION,
+            retryable=True,
+            revise_prompt=True,
+            detail="版权相关限制",
+        )
+
+        revised = revise_prompt("画一只猫", failure, attempt=1)
+
+        assert "不涉及版权" in revised
+        assert "知名IP形象" in revised
+
+    def test_revision_instruction_is_not_itself_a_policy_rejection(self):
+        info = classify_failure(_INSTRUCTION)
+
+        assert info.kind == FailureKind.UNKNOWN
+        assert info.revise_prompt is False
 
     def test_policy_violation_attempt_2_keeps_accumulating(self):
         # v0.2.25:attempt=2 也走同一策略(累积),不再 attempt>=2 切换安全模板

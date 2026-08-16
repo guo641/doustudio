@@ -462,6 +462,25 @@ def test_scan_sse_for_policy_rejection_detects_text_message():
     assert excinfo.value.response_text == text
 
 
+def test_scan_sse_for_policy_rejection_detects_copyright_creation_message():
+    """版权拒绝必须同时贯通直接扫描与 parse_sse_ack 异常路径。"""
+    text = (
+        'event: TEXT_MESSAGE\ndata: {"content_block":[{"content":{'
+        '"text_block":{"text":"抱歉，由于版权相关限制，暂时无法创作对应的内容，换其他主题试试吧。"'
+        '}}}]}\n\n'
+        'event: SSE_ACK\ndata: {"ack_client_meta":{"conversation_id":"c1",'
+        '"section_id":"s1"},"query_list":[{"question_id":"q1"}]}\n\n'
+    )
+
+    reason = protocol_module.scan_sse_for_policy_rejection(text)
+    assert reason is not None
+    assert "版权" in reason or "创作" in reason
+
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_sse_ack(text)
+    assert "版权" in excinfo.value.error_message or "创作" in excinfo.value.error_message
+
+
 def test_scan_sse_for_policy_rejection_does_not_false_positive_on_benign_text():
     """正常生成中消息(无 policy 关键词)必须不被误判为拒绝。"""
     text = (

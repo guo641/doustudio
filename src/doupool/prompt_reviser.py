@@ -45,7 +45,16 @@ _POLICY_PATTERNS = [
     re.compile(r"疑似包含.*?(?:侵权|违规)", re.DOTALL),
     re.compile(r"(?:侵权|违规)内容.*?(?:无法返回|不能返回|换个主题)", re.DOTALL),
     re.compile(r"无法返回该内容"),
-    re.compile(r"换个主题再试试"),
+    re.compile(
+        r"版权(?:相关)?(?:限制|问题|风险)[\s\S]{0,30}?"
+        r"(?:无法|不能|不支持|请(?:换|更换|修改|重新)|更换|换(?:个|其他).{0,6}?主题)"
+    ),
+    re.compile(
+        r"(?<!不)(?<!不应)(?<!不要)(?<!不得)(?<!避免)(?<!请勿)涉及版权"
+        r"[\s\S]{0,30}?(?:无法|不能|不支持|请(?:换|更换|修改|重新)|更换|"
+        r"换(?:个|其他).{0,6}?主题)"
+    ),
+    re.compile(r"换(?:个|其他).{0,6}?主题.{0,4}?试试"),
     re.compile(r"内容可能违反.*?(?:规定|政策|法律)"),
     re.compile(r"sensitive content", re.IGNORECASE),
     re.compile(r"content.{0,20}violat", re.IGNORECASE),
@@ -54,11 +63,12 @@ _POLICY_PATTERNS = [
     # 走 polling 一直返 None,要 5min 后才被 timeout 兜住,期间用户视角
     # 「永远生成中」。把这些补上 → 立即触发 DoubaoContentRejected →
     # max_reject_retries(默认 2)自动改写重试,而不是直接失败。
-    # 注:第一行覆盖「我无法生成/满足/响应/提供 / 抱歉我无法... / 暂时无法...」
+    # 注:第一行覆盖「我无法生成/创作/制作/满足/响应/提供 / 抱歉我无法...
+    # / 暂时无法...」
     # 等各种组合 —— 在豆包对话上下文里这几个动词基本只出现在拒绝场景,
     # 误判代价低(改写一次不成功就 fall back safe template),漏判代价高(用户
     # 卡 5 分钟),值得放宽。
-    re.compile(r"(?:我|抱歉.{0,30})?(?:暂时)?无法[\s\S]{0,5}?(?:生成|满足|响应|提供|返回)"),
+    re.compile(r"(?:我|抱歉.{0,30})?(?:暂时)?无法[\s\S]{0,5}?(?:生成|创作|制作|满足|响应|提供|返回)"),
     re.compile(r"不符合.*?(?:规范|准则|要求|政策|规定)"),
     re.compile(r"涉及.*?敏感"),
     re.compile(r"重新描述.{0,8}?试试"),
@@ -171,7 +181,9 @@ def classify_failure(error_message: str, status_code: Optional[int] = None) -> F
 #   attempt 2 (原文 + 后缀) + 后缀
 #   attempt 3 (原文 + 后缀 + 后缀) + 后缀
 # 不再做关键词剥离 / 软化前缀 / 安全模板兜底 — 全部交给豆包自己改写。
-_REVISION_INSTRUCTION = "把这段提示词修改成不违反平台规则的提示词,并生成视频"
+_REVISION_INSTRUCTION = (
+    "把这段提示词修改成不违反平台规则、不涉及版权或知名IP形象的提示词,并生成视频"
+)
 
 
 def revise_prompt(prompt: str, failure: FailureInfo, attempt: int = 1) -> str:
