@@ -69,9 +69,37 @@ _VIDEO_RATIO_OPTIONS = ("3:4", "4:3", "9:16", "16:9", "1:1", "21:9")
 _VIDEO_OPTIONS_TRIGGER_RE = re.compile(
     r"(?:自动|3:4|4:3|9:16|16:9|1:1|21:9)\s*·\s*(?:[4-9]|1[0-5])s"
 )
+_VIDEO_MORE_OPTIONS_SELECTORS = (
+    # 部分灰度账号把视频参数收进模型选择器右侧的三点按钮。优先走
+    # 相邻兄弟关系，避免误点页面右上角同样名为「更多」的全局按钮。
+    "button:has-text('模型') + button",
+    "[role='button']:has-text('模型') + [role='button']",
+    "button:has-text('Seedance') + button",
+    "[role='button']:has-text('Seedance') + [role='button']",
+    "button:has-text('⋯'), [role='button']:has-text('⋯')",
+    "button:has-text('…'), [role='button']:has-text('…')",
+    "button:has-text('...'), [role='button']:has-text('...')",
+    "button:has-text('•••'), [role='button']:has-text('•••')",
+    "button[aria-label*='更多'], [role='button'][aria-label*='更多']",
+    "button[aria-label*='more' i], [role='button'][aria-label*='more' i]",
+    "button[aria-label*='option' i], [role='button'][aria-label*='option' i]",
+    "button:has(svg[aria-label*='更多']), "
+    "[role='button']:has(svg[aria-label*='更多'])",
+    "button:has(svg[aria-label*='more' i]), "
+    "[role='button']:has(svg[aria-label*='more' i])",
+    "button[class*='ellipsis' i], [role='button'][class*='ellipsis' i]",
+    "button[class*='more' i], [role='button'][class*='more' i]",
+)
+_VIDEO_MORE_OPTIONS_ANCHOR_RE = re.compile(
+    r"(?:模型|model|seedance)",
+    re.IGNORECASE,
+)
+_VIDEO_MORE_OPTIONS_TEXT_RE = re.compile(r"^\s*(?:⋯|…|\.{3}|•••)\s*$")
+_VIDEO_MORE_OPTIONS_MAX_ANCHOR_DISTANCE_PX = 400
 _VIDEO_OPTIONS_MENU_WAIT_MS = 1_000
 _VIDEO_OPTIONS_READBACK_WAIT_MS = 1_500
 _VIDEO_OPTIONS_CLOSE_WAIT_MS = 1_500
+_VIDEO_OPTIONS_CLOSED_STABLE_MS = 200
 _VIDEO_OPTIONS_TRIGGER_WAIT_MS = 3_000
 _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS = 4
 # v0.3.2.3:UI click 路径下的弹窗缓冲。**经验值**(用户在 v0.3.2.2 反馈):
@@ -1383,7 +1411,7 @@ async def _visible_locators(locator) -> list:
     return visible
 
 
-async def _visible_button_texts(page: Page, *, limit: int = 5) -> list[str]:
+async def _visible_button_texts(page: Page, *, limit: int = 20) -> list[str]:
     """返回当前页面前几个可见按钮文本，供 selector 失败诊断使用。"""
     texts: list[str] = []
     try:
@@ -1394,6 +1422,12 @@ async def _visible_button_texts(page: Page, *, limit: int = 5) -> list[str]:
                 if not await candidate.is_visible():
                     continue
                 text = (await candidate.inner_text()).strip()
+                if not text:
+                    for attribute in ("aria-label", "title"):
+                        value = await candidate.get_attribute(attribute)
+                        if value and value.strip():
+                            text = f"[{attribute}={value.strip()}]"
+                            break
             except Exception:
                 continue
             if text and text not in texts:
@@ -1437,7 +1471,7 @@ async def _wait_for_video_ratio_options(
     return visible
 
 
-async def _find_video_options_trigger(page: Page):
+async def _find_video_options_summary_trigger(page: Page):
     # 新版页面可能把组合控件渲染成 div[role=button]，优先走 a11y role，
     # 再用原生 button / role CSS 组合选择器兼容旧版和嵌套 span 文本。
     try:
@@ -1456,24 +1490,237 @@ async def _find_video_options_trigger(page: Page):
     return await _first_visible_locator(candidates)
 
 
-async def _wait_for_video_options_trigger(page: Page):
+async def _video_options_locator_signature(locator) -> tuple:
+    """为三点候选生成稳定签名，避免多个 selector 重复点击同一元素。"""
+    try:
+        text = " ".join((await locator.inner_text()).split())
+    except Exception:
+        text = ""
+    attributes: list[str] = []
+    for name in ("aria-label", "title", "class"):
+        try:
+            attributes.append((await locator.get_attribute(name)) or "")
+        except Exception:
+            attributes.append("")
+    try:
+        box = await locator.bounding_box()
+    except Exception:
+        box = None
+    position = (
+        tuple(
+            round(float(box.get(key, 0)), 1)
+            for key in ("x", "y", "width", "height")
+        )
+        if box
+        else ()
+    )
+    return text, *attributes, position
+
+
+async def _find_video_more_options_trigger(
+    page: Page,
+    *,
+    excluded_signatures: set[tuple] | None = None,
+):
+    """找到视频工具栏的三点参数入口，并避开页头「更多」和发送按钮。"""
+    excluded_signatures = excluded_signatures or set()
+
+    anchor_box = None
+    try:
+        anchors = page.locator("button, [role='button']").filter(
+            has_text=_VIDEO_MORE_OPTIONS_ANCHOR_RE,
+        )
+        anchor = await _first_visible_locator(anchors)
+        if anchor is not None:
+            anchor_box = await anchor.bounding_box()
+    except Exception:
+        anchor_box = None
+    if anchor_box is None:
+        try:
+            anchor = await _first_visible_locator(
+                page.get_by_text(_VIDEO_MORE_OPTIONS_ANCHOR_RE)
+            )
+            if anchor is not None:
+                anchor_box = await anchor.bounding_box()
+        except Exception:
+            anchor_box = None
+
+    ranked: list[tuple[tuple[float, ...], object]] = []
+    seen: set[tuple] = set()
+    for selector_index, selector in enumerate(_VIDEO_MORE_OPTIONS_SELECTORS):
+        try:
+            candidates = await _visible_locators(page.locator(selector))
+        except Exception:
+            continue
+        for candidate in candidates:
+            try:
+                candidate_text = " ".join(
+                    (await candidate.inner_text()).split()
+                )
+            except Exception:
+                candidate_text = ""
+            try:
+                candidate_label = (
+                    (await candidate.get_attribute("aria-label")) or ""
+                )
+            except Exception:
+                candidate_label = ""
+            try:
+                candidate_class = (
+                    (await candidate.get_attribute("class")) or ""
+                )
+            except Exception:
+                candidate_class = ""
+
+            if selector_index >= 4:
+                label_lower = candidate_label.lower()
+                class_lower = candidate_class.lower()
+                semantic_match = bool(
+                    _VIDEO_MORE_OPTIONS_TEXT_RE.fullmatch(candidate_text)
+                    or "更多" in candidate_label
+                    or "more" in label_lower
+                    or "option" in label_lower
+                    or "more" in class_lower
+                    or "ellipsis" in class_lower
+                    or (
+                        ":has(svg" in selector
+                        and not candidate_text
+                    )
+                )
+                if not semantic_match:
+                    continue
+            try:
+                excluded = await candidate.evaluate(
+                    """el => Boolean(
+                        el.closest('.send-btn-wrapper') ||
+                        el.closest('[role="tab"]') ||
+                        el.querySelector(
+                            "svg path[d^='M4.93934 10.2598']"
+                        )
+                    )"""
+                )
+            except Exception:
+                excluded = False
+            if excluded:
+                continue
+
+            signature = await _video_options_locator_signature(candidate)
+            if (
+                signature in seen
+                or signature in excluded_signatures
+            ):
+                continue
+            seen.add(signature)
+
+            candidate_box = signature[-1]
+            distance = float("inf")
+            if anchor_box and candidate_box:
+                anchor_x = float(anchor_box.get("x", 0)) + float(
+                    anchor_box.get("width", 0)
+                ) / 2
+                anchor_y = float(anchor_box.get("y", 0)) + float(
+                    anchor_box.get("height", 0)
+                ) / 2
+                candidate_x = candidate_box[0] + candidate_box[2] / 2
+                candidate_y = candidate_box[1] + candidate_box[3] / 2
+                distance = (candidate_x - anchor_x) ** 2 + (
+                    candidate_y - anchor_y
+                ) ** 2
+                if (
+                    selector_index >= 4
+                    and distance
+                    > _VIDEO_MORE_OPTIONS_MAX_ANCHOR_DISTANCE_PX ** 2
+                ):
+                    continue
+
+            # 模型按钮的相邻兄弟 selector 最可信；其余候选优先选择离
+            # 模型选择器最近的那个，避免命中页面右上角的全局「更多」。
+            sibling_priority = 0.0 if selector_index < 4 else 1.0
+            ranked.append(
+                ((sibling_priority, distance, float(selector_index)), candidate)
+            )
+
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
+async def _video_options_trigger_kind(trigger) -> str:
+    try:
+        text = await trigger.inner_text()
+    except Exception:
+        text = ""
+    return "A" if _VIDEO_OPTIONS_TRIGGER_RE.search(text or "") else "B"
+
+
+async def _find_video_options_trigger(
+    page: Page,
+    *,
+    prefer_more: bool = False,
+    excluded_more_signatures: set[tuple] | None = None,
+    return_kind: bool = False,
+):
+    if prefer_more:
+        trigger = await _find_video_more_options_trigger(
+            page,
+            excluded_signatures=excluded_more_signatures,
+        )
+        if trigger is not None and return_kind:
+            return trigger, "B"
+        return trigger
+
+    trigger = await _find_video_options_summary_trigger(page)
+    if trigger is not None:
+        return (trigger, "A") if return_kind else trigger
+    trigger = await _find_video_more_options_trigger(
+        page,
+        excluded_signatures=excluded_more_signatures,
+    )
+    if trigger is not None and return_kind:
+        return trigger, "B"
+    return trigger
+
+
+async def _wait_for_video_options_trigger(
+    page: Page,
+    *,
+    excluded_more_signatures: set[tuple] | None = None,
+    return_kind: bool = False,
+    prefer_more: bool = False,
+):
     step_ms = 50
     attempts = max(
         1,
         (_VIDEO_OPTIONS_TRIGGER_WAIT_MS + step_ms - 1) // step_ms,
     )
     for attempt in range(attempts):
-        trigger = await _find_video_options_trigger(page)
+        trigger = await _find_video_options_trigger(
+            page,
+            prefer_more=prefer_more,
+            excluded_more_signatures=excluded_more_signatures,
+            return_kind=return_kind,
+        )
         if trigger is not None:
             return trigger
         if attempt + 1 < attempts:
             await page.wait_for_timeout(step_ms)
+    selector_matches: dict[str, int | str] = {}
+    for selector in _VIDEO_MORE_OPTIONS_SELECTORS:
+        try:
+            selector_matches[selector] = len(
+                await _visible_locators(page.locator(selector))
+            )
+        except Exception as exc:
+            selector_matches[selector] = f"error:{exc}"
     _LOGGER.warning(
         "event=video_options_trigger_not_found url=%s visible_buttons=%s "
-        "trigger_pattern=%r",
+        "trigger_pattern=%r more_selectors=%s selector_matches=%s",
         page.url,
         await _visible_button_texts(page),
         _VIDEO_OPTIONS_TRIGGER_RE.pattern,
+        _VIDEO_MORE_OPTIONS_SELECTORS,
+        selector_matches,
     )
     return None
 
@@ -1579,10 +1826,24 @@ async def _validate_video_tab_content(page: Page) -> list[str]:
         timeout_ms=_VIDEO_TAB_RATIO_WAIT_MS,
     )
     if len(visible_options) >= _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
-        trigger = await _find_video_options_trigger(page)
-        if trigger is not None:
+        trigger_result = await _find_video_options_trigger(
+            page,
+            prefer_more=True,
+            return_kind=True,
+        )
+        if trigger_result is None:
+            trigger_result = await _find_video_options_trigger(
+                page,
+                return_kind=True,
+            )
+        if trigger_result is not None:
+            trigger, trigger_kind = trigger_result
             try:
-                await _close_video_options(page, trigger)
+                await _close_video_options(
+                    page,
+                    trigger,
+                    trigger_kind=trigger_kind,
+                )
             except Exception as exc:
                 await _best_effort_escape_video_options(page)
                 raise RuntimeError("视频 TAB 校验后参数菜单未关闭") from exc
@@ -1590,25 +1851,23 @@ async def _validate_video_tab_content(page: Page) -> list[str]:
             await _best_effort_escape_video_options(page)
         return visible_options
 
-    # 比例按钮通常在组合参数弹层内。切 TAB 后若弹层尚未打开，临时
-    # 打开一次完成真实内容校验，再关闭它交给 _apply_video_options 重开。
-    trigger = await _find_video_options_trigger(page)
-    if trigger is None:
-        return visible_options
-
-    menu_opened = False
+    # 比例按钮通常在参数弹层内。复用正式打开流程，同时兼容「三点 →
+    # 参数摘要 → 比例」两级菜单；校验完成后关闭，交给 apply 重开。
+    trigger = None
+    trigger_kind = None
     try:
-        await trigger.click()
-        menu_opened = True
-        visible_options = await _wait_for_video_ratio_options(
-            page,
-            timeout_ms=_VIDEO_TAB_RATIO_WAIT_MS,
-        )
+        trigger, visible_options, trigger_kind = await _open_video_options(page)
+        return visible_options
+    except RuntimeError:
         return visible_options
     finally:
-        if menu_opened:
+        if trigger is not None:
             try:
-                await _close_video_options(page, trigger)
+                await _close_video_options(
+                    page,
+                    trigger,
+                    trigger_kind=trigger_kind,
+                )
             except Exception as exc:
                 await _best_effort_escape_video_options(page)
                 raise RuntimeError("视频 TAB 校验后参数菜单未关闭") from exc
@@ -1715,31 +1974,111 @@ async def _click_video_tab(page: Page) -> None:
 
 
 async def _open_video_options(page: Page):
-    trigger = await _wait_for_video_options_trigger(page)
-    if trigger is None:
-        raise RuntimeError(f"视频参数按钮未找到: {page.url}")
-
     last_error: Exception | None = None
     visible_options: list[str] = []
-    for attempt in range(2):
+    attempt_errors: list[str] = []
+    more_attempts: dict[tuple, int] = {}
+    excluded_more_signatures: set[tuple] = set()
+    summary_attempts = 0
+    prefer_more = False
+    for attempt in range(10):
+        trigger_result = await _wait_for_video_options_trigger(
+            page,
+            excluded_more_signatures=excluded_more_signatures,
+            return_kind=True,
+            prefer_more=prefer_more,
+        )
+        if trigger_result is None:
+            if attempt == 0:
+                raise RuntimeError(
+                    f"视频参数按钮未找到: {page.url}; "
+                    f"visible_buttons={await _visible_button_texts(page)}; "
+                    f"more_selectors={_VIDEO_MORE_OPTIONS_SELECTORS}"
+                )
+            break
+        trigger, trigger_kind = trigger_result
+        trigger_signature = (
+            await _video_options_locator_signature(trigger)
+            if trigger_kind == "B"
+            else None
+        )
+        candidate_clicked = False
         try:
-            if attempt:
-                # 触发按钮是 toggle。第一次若已经打开但菜单渲染超时,
-                # 直接再点会把它关掉;先用 Escape 归一化到关闭态。
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(100)
-                trigger = await _wait_for_video_options_trigger(page)
-                if trigger is None:
-                    raise RuntimeError("重试前视频参数按钮消失")
             await trigger.click()
+            candidate_clicked = True
             visible_options = await _wait_for_video_ratio_options(page)
+
+            # 少数灰度 UI 是两级菜单：三点先展开外层，再点外层中的
+            # 「自动 · 10s」摘要项才出现比例 chips。
+            if (
+                trigger_kind == "B"
+                and len(visible_options) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS
+            ):
+                summary = await _find_video_options_summary_trigger(page)
+                if summary is not None:
+                    await summary.click()
+                    visible_options = await _wait_for_video_ratio_options(page)
+
             if len(visible_options) >= _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
-                return trigger, visible_options
+                try:
+                    aria_label = await trigger.get_attribute("aria-label")
+                except Exception:
+                    aria_label = None
+                _LOGGER.info(
+                    "event=video_options_trigger_kind kind=%s "
+                    "aria_label=%r signature=%r url=%s",
+                    trigger_kind,
+                    aria_label,
+                    trigger_signature,
+                    page.url,
+                )
+                return trigger, visible_options, trigger_kind
+            attempt_errors.append(
+                f"kind={trigger_kind} signature={trigger_signature!r} "
+                f"visible_ratio_options={visible_options}"
+            )
         except Exception as exc:
             last_error = exc
+            attempt_errors.append(
+                f"kind={trigger_kind} signature={trigger_signature!r} "
+                f"error={exc}"
+            )
+
+        # 只有确认旧参数面板完成退场，才允许尝试下一个候选；否则旧
+        # chips 会让错误的全局「更多」看起来像打开成功。
+        if candidate_clicked:
+            try:
+                await _close_video_options(
+                    page,
+                    trigger,
+                    trigger_kind=trigger_kind,
+                )
+                remaining = await _wait_for_video_options_closed(page)
+                if len(remaining) >= _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+                    raise RuntimeError(f"visible_ratio_options={remaining}")
+            except Exception as exc:
+                raise RuntimeError(
+                    "视频参数候选失败后菜单未关闭: "
+                    f"kind={trigger_kind} url={page.url}"
+                ) from exc
+            await page.wait_for_timeout(300)
+        else:
+            await _best_effort_escape_video_options(page)
+
+        if trigger_kind == "B" and trigger_signature is not None:
+            more_attempts[trigger_signature] = (
+                more_attempts.get(trigger_signature, 0) + 1
+            )
+            if more_attempts[trigger_signature] >= 2:
+                excluded_more_signatures.add(trigger_signature)
+        else:
+            summary_attempts += 1
+            if summary_attempts >= 2:
+                prefer_more = True
     raise RuntimeError(
         f"视频参数菜单未展开: {page.url}; "
-        f"visible_ratio_options={visible_options}; last={last_error}"
+        f"visible_ratio_options={visible_options}; attempts={attempt_errors}; "
+        f"last={last_error}"
     )
 
 
@@ -1847,16 +2186,22 @@ async def _wait_for_video_options_closed(
 ) -> list[str]:
     step_ms = 50
     elapsed_ms = 0
+    closed_stable_ms = 0
     visible: list[str] = []
     while True:
         visible = await _visible_video_ratio_options(page)
         if len(visible) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
-            return visible
+            if closed_stable_ms >= _VIDEO_OPTIONS_CLOSED_STABLE_MS:
+                return visible
+        else:
+            closed_stable_ms = 0
         if elapsed_ms >= timeout_ms:
             return visible
         wait_ms = min(step_ms, timeout_ms - elapsed_ms)
         await page.wait_for_timeout(wait_ms)
         elapsed_ms += wait_ms
+        if len(visible) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+            closed_stable_ms += wait_ms
 
 
 async def _wait_for_video_options_readback(
@@ -1864,10 +2209,139 @@ async def _wait_for_video_options_readback(
     *,
     ratio: str,
     duration: int,
+    trigger=None,
+    trigger_kind: str = "A",
 ) -> str:
     expected = re.compile(
         rf"{re.escape(ratio)}\s*·\s*{duration}s"
     )
+
+    if trigger_kind == "B":
+        # 三点入口本身永远不会变成「1:1 · 5s」。重新打开菜单，若灰度
+        # UI 提供了组合摘要项，就对摘要做同样的严格 readback；直接展示
+        # chips、没有摘要项的版本则依赖前面已完成的 ratio click 和 slider
+        # value/aria-valuenow 校验，避免把恒定的「⋯」误判为失败。
+        if trigger is None:
+            raise RuntimeError("三点视频参数入口丢失，无法完成设置后校验")
+        actual = ""
+        summary_seen = False
+        try:
+            await trigger.click()
+        except Exception:
+            trigger = await _find_video_options_trigger(
+                page,
+                prefer_more=True,
+            )
+            if trigger is None:
+                raise RuntimeError("三点视频参数入口丢失，无法完成设置后校验")
+            await trigger.click()
+        try:
+            visible_options = await _wait_for_video_ratio_options(page)
+            for readback_attempt in range(2):
+                step_ms = 50
+                attempts = max(
+                    1,
+                    (
+                        _VIDEO_OPTIONS_READBACK_WAIT_MS + step_ms - 1
+                    ) // step_ms,
+                )
+                for attempt in range(attempts):
+                    summary = await _find_video_options_summary_trigger(page)
+                    if summary is not None:
+                        summary_seen = True
+                        actual = await summary.inner_text()
+                        if expected.search(actual):
+                            return actual
+                    if attempt + 1 < attempts:
+                        await page.wait_for_timeout(step_ms)
+                if readback_attempt == 0:
+                    if not summary_seen:
+                        visible_options = await _wait_for_video_ratio_options(
+                            page,
+                            timeout_ms=_VIDEO_OPTIONS_MENU_WAIT_MS,
+                        )
+                        if (
+                            len(visible_options)
+                            >= _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS
+                        ):
+                            actual_duration: int | None = None
+                            duration_step_ms = 50
+                            duration_attempts = max(
+                                1,
+                                (
+                                    _VIDEO_OPTIONS_READBACK_WAIT_MS
+                                    + duration_step_ms
+                                    - 1
+                                ) // duration_step_ms,
+                            )
+                            for duration_attempt in range(duration_attempts):
+                                control_kind, control = (
+                                    await _find_video_duration_control(page)
+                                )
+                                raw_duration = None
+                                if control is not None:
+                                    if control_kind == "range":
+                                        raw_duration = await control.input_value()
+                                    else:
+                                        raw_duration = await control.get_attribute(
+                                            "aria-valuenow"
+                                        )
+                                try:
+                                    actual_duration = int(float(raw_duration))
+                                except (TypeError, ValueError):
+                                    actual_duration = None
+                                if actual_duration == duration:
+                                    break
+                                if duration_attempt + 1 < duration_attempts:
+                                    await page.wait_for_timeout(duration_step_ms)
+                            if actual_duration != duration:
+                                _LOGGER.warning(
+                                    "event=video_options_readback_failed "
+                                    "kind=B url=%s expected=%r "
+                                    "actual_duration=%r",
+                                    page.url,
+                                    f"{ratio} · {duration}s",
+                                    actual_duration,
+                                )
+                                raise RuntimeError(
+                                    "视频参数设置后校验失败: "
+                                    f"expected_duration={duration}s "
+                                    f"actual_duration={actual_duration!r}s"
+                                )
+                            _LOGGER.info(
+                                "event=video_options_readback_by_controls "
+                                "kind=B url=%s expected=%r "
+                                "actual_duration=%ss",
+                                page.url,
+                                f"{ratio} · {duration}s",
+                                actual_duration,
+                            )
+                            return actual
+                        raise RuntimeError(
+                            "三点视频参数菜单重开失败，无法完成设置后校验: "
+                            f"url={page.url}"
+                        )
+                    await page.wait_for_timeout(500)
+
+            _LOGGER.warning(
+                "event=video_options_readback_failed kind=B url=%s "
+                "expected=%r actual=%r trigger_pattern=%r",
+                page.url,
+                f"{ratio} · {duration}s",
+                actual,
+                _VIDEO_OPTIONS_TRIGGER_RE.pattern,
+            )
+            raise RuntimeError(
+                "视频参数设置后校验失败: "
+                f"expected={ratio} · {duration}s actual={actual!r}"
+            )
+        finally:
+            await _close_video_options(
+                page,
+                trigger,
+                trigger_kind="B",
+            )
+
     actual = ""
     for readback_attempt in range(2):
         step_ms = 50
@@ -1905,7 +2379,65 @@ async def _wait_for_video_options_readback(
     )
 
 
-async def _close_video_options(page: Page, trigger) -> None:
+async def _close_video_options(
+    page: Page,
+    trigger,
+    *,
+    trigger_kind: str | None = None,
+) -> None:
+    trigger_kind = trigger_kind or await _video_options_trigger_kind(trigger)
+    if trigger_kind == "B":
+        # 两级菜单下 Escape 可能只关闭比例内层而保留三点外层。B 型入口
+        # 的根三点是确定的 toggle，优先点原 locator 一次关闭整个外层。
+        try:
+            trigger_text = await trigger.inner_text()
+        except Exception:
+            trigger_text = ""
+        toggle_error: Exception | None = None
+        try:
+            await trigger.click()
+        except Exception as first_error:
+            try:
+                trigger = (
+                    await _find_video_options_trigger(page, prefer_more=True)
+                    or trigger
+                )
+                await trigger.click()
+            except Exception as second_error:
+                toggle_error = second_error
+                _LOGGER.debug(
+                    "video options B toggle failed twice: first=%r second=%r",
+                    first_error,
+                    second_error,
+                )
+        if toggle_error is None:
+            await page.wait_for_timeout(100)
+            visible_after_toggle = await _wait_for_video_options_closed(page)
+            if len(visible_after_toggle) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+                return
+        else:
+            visible_after_toggle = await _visible_video_ratio_options(page)
+
+        await page.keyboard.press("Escape")
+        visible_after_escape = await _wait_for_video_options_closed(page)
+        if len(visible_after_escape) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
+            return
+
+        _LOGGER.warning(
+            "event=video_options_close_failed url=%s trigger_text=%r "
+            "trigger_kind=B toggle_error=%r visible_after_toggle=%s "
+            "visible_after_escape=%s",
+            page.url,
+            trigger_text,
+            toggle_error,
+            visible_after_toggle,
+            visible_after_escape,
+        )
+        raise RuntimeError(
+            "视频参数菜单关闭失败: "
+            f"trigger_text={trigger_text!r} visible={visible_after_escape}"
+        )
+
     await page.keyboard.press("Escape")
     visible_after_escape = await _wait_for_video_options_closed(page)
     if len(visible_after_escape) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
@@ -1948,7 +2480,9 @@ async def _apply_video_options(
     if not 4 <= duration <= 15:
         raise ValueError(f"视频时长必须在 4 到 15 秒之间: {duration}")
 
-    trigger, visible_options = await _open_video_options(page)
+    trigger, visible_options, trigger_kind = await _open_video_options(page)
+    root_trigger = trigger
+    root_trigger_kind = trigger_kind
     if ratio not in visible_options:
         raise RuntimeError(
             f"视频比例选项不存在: {ratio}; 实际可见={visible_options}"
@@ -1968,8 +2502,10 @@ async def _apply_video_options(
     if duration_control is None:
         # 比例按钮若会自动收起弹层,重新点开一次再找 slider。
         if not await _visible_video_ratio_options(page):
-            await trigger.click()
-            await _wait_for_video_ratio_options(page)
+            trigger, _, trigger_kind = await _open_video_options(page)
+            if root_trigger_kind != "B":
+                root_trigger = trigger
+                root_trigger_kind = trigger_kind
             kind, duration_control = await _wait_for_video_duration_control(page)
     if duration_control is None:
         raise RuntimeError(f"视频时长滑块未找到: {page.url}")
@@ -1979,11 +2515,17 @@ async def _apply_video_options(
     else:
         await _set_aria_slider_value(page, duration_control, duration)
 
-    await _close_video_options(page, trigger)
+    await _close_video_options(
+        page,
+        root_trigger,
+        trigger_kind=root_trigger_kind,
+    )
     await _wait_for_video_options_readback(
         page,
         ratio=ratio,
         duration=duration,
+        trigger=root_trigger,
+        trigger_kind=root_trigger_kind,
     )
 
 

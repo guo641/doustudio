@@ -10,7 +10,13 @@ from doupool.video.browser import (
     _apply_video_options,
     _click_video_tab,
     _close_video_options,
+    _find_video_options_trigger,
+    _open_video_options,
+    _validate_video_tab_content,
 )
+
+
+_UNSET = object()
 
 
 class _FakeMouse:
@@ -41,13 +47,51 @@ class _FakeKeyboard:
                 self.page.pending_escape_close_ms = self.page.escape_close_delay_ms
             else:
                 self.page.menu_open = False
+                self.page.outer_menu_open = False
+                self.page.pending_more_close_ms = None
+                self.page.closing_more = None
 
 
 class _FakeElement:
-    def __init__(self, page, kind: str, value: str | None = None):
+    def __init__(
+        self,
+        page,
+        kind: str,
+        value: str | None = None,
+        *,
+        tag: str = "button",
+        role: str | None = None,
+        aria_label: str | None = None,
+        title: str | None = None,
+        class_name: str = "",
+        svg_aria_label: str | None = None,
+        inside_send_wrapper: bool = False,
+        inside_tab: bool = False,
+        adjacent_to_model: bool = False,
+        box: dict[str, float] | None = None,
+        action: str = "none",
+        open_delays: list[int] | None = None,
+        close_delay_ms: int = 0,
+        click_error: str | None = None,
+    ):
         self.page = page
         self.kind = kind
         self.value = value
+        self.tag = tag
+        self.role = role
+        self.aria_label = aria_label
+        self.title = title
+        self.class_name = class_name
+        self.svg_aria_label = svg_aria_label
+        self.inside_send_wrapper = inside_send_wrapper
+        self.inside_tab = inside_tab
+        self.adjacent_to_model = adjacent_to_model
+        self.box = box
+        self.action = action
+        self.open_delays = list(open_delays or [])
+        self.close_delay_ms = close_delay_ms
+        self.click_error = click_error
+        self.click_attempts = 0
 
     def _text(self) -> str:
         if self.kind == "trigger":
@@ -57,6 +101,8 @@ class _FakeElement:
             return (
                 f"{self.page.trigger_prefix}{text}{self.page.trigger_suffix}"
             )
+        if self.kind == "summary":
+            return f"{self.page.display_ratio} · {self.page.display_duration}s >"
         return self.value or ""
 
     async def is_visible(self) -> bool:
@@ -64,12 +110,19 @@ class _FakeElement:
             return self.page.has_trigger
         if self.kind in {"ratio", "range", "aria"}:
             return self.page.menu_open and self.page.render_delay_ms <= 0
+        if self.kind == "summary":
+            return self.page.outer_menu_open
+        if self.kind == "more" and self.page.closing_more is self:
+            return False
         return True
 
     async def click(self):
+        self.click_attempts += 1
+        if self.click_error is not None:
+            raise RuntimeError(self.click_error)
         if self.kind == "trigger":
             self.page.trigger_clicks += 1
-            if self.page.menu_opens:
+            if self.page.summary_trigger_opens:
                 if self.page.menu_open:
                     self.page.menu_open = False
                 else:
@@ -79,6 +132,39 @@ class _FakeElement:
                         if self.page.open_delays
                         else 0
                     )
+        elif self.kind == "more":
+            self.page.more_clicks.append(self)
+            if self.action == "toggle_menu" and self.page.menu_opens:
+                if self.page.menu_open:
+                    if self.close_delay_ms > 0:
+                        self.page.pending_more_close_ms = self.close_delay_ms
+                        self.page.closing_more = self
+                    else:
+                        self.page.menu_open = False
+                        self.page.outer_menu_open = False
+                else:
+                    self.page.menu_open = True
+                    self.page.outer_menu_open = True
+                    if (
+                        self.page.duration_has_been_set
+                        and self.page.duration_revert_on_reopen is not None
+                    ):
+                        self.page.duration = self.page.duration_revert_on_reopen
+                        self.page.display_duration = self.page.duration
+                        self.page.duration_revert_on_reopen = None
+                    self.page.render_delay_ms = (
+                        self.open_delays.pop(0) if self.open_delays else 0
+                    )
+            elif self.action == "toggle_outer":
+                self.page.outer_menu_open = not self.page.outer_menu_open
+                if not self.page.outer_menu_open:
+                    self.page.menu_open = False
+        elif self.kind == "summary":
+            self.page.summary_clicks += 1
+            if self.page.menu_opens:
+                self.page.menu_open = True
+        elif self.kind == "send":
+            self.page.send_clicks += 1
         elif self.kind == "ratio":
             self.page.ratio_clicks.append(self.value)
             self.page.ratio = str(self.value)
@@ -91,24 +177,38 @@ class _FakeElement:
             raise RuntimeError("not a range input")
         self.page.range_fills.append(value)
         self.page.duration = int(value)
+        self.page.duration_has_been_set = True
         self.page.schedule_trigger_update()
 
-    async def evaluate(self, _expression, value):
-        self.page.duration = int(value)
-        self.page.schedule_trigger_update()
+    async def evaluate(self, expression, value=_UNSET):
+        if value is not _UNSET:
+            self.page.duration = int(value)
+            self.page.duration_has_been_set = True
+            self.page.schedule_trigger_update()
+            return None
+        if "closest" in expression:
+            return self.inside_send_wrapper or self.inside_tab
+        return None
 
     async def input_value(self) -> str:
         return str(self.page.duration)
 
     async def get_attribute(self, name: str) -> str | None:
-        if self.kind != "aria":
-            return None
-        if name == "aria-valuemin":
-            return "4"
-        if name == "aria-valuemax":
-            return "15"
-        if name == "aria-valuenow":
-            return str(self.page.duration)
+        if self.kind == "aria":
+            if name == "aria-valuemin":
+                return "4"
+            if name == "aria-valuemax":
+                return "15"
+            if name == "aria-valuenow":
+                return str(self.page.duration)
+        if name == "role":
+            return self.role
+        if name == "aria-label":
+            return self.aria_label
+        if name == "title":
+            return self.title
+        if name == "class":
+            return self.class_name
         return None
 
     async def focus(self):
@@ -139,6 +239,8 @@ class _FakeElement:
     async def bounding_box(self):
         if self.kind == "track":
             return {"x": 100, "y": 100, "width": 220, "height": 20}
+        if self.box is not None:
+            return self.box
         return {"x": 200, "y": 100, "width": 16, "height": 16}
 
     def locator(self, selector: str):
@@ -152,25 +254,88 @@ class _FakeLocator:
         self.selector = selector
         self.text_filter = text_filter
 
+    @staticmethod
+    def _selector_text(selector: str) -> str | None:
+        match = re.search(r":has-text\((?:['\"])(.*?)(?:['\"])\)", selector)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _contains_attr(selector: str, attribute: str) -> tuple[str, bool] | None:
+        match = re.search(
+            rf"\[{re.escape(attribute)}\*=['\"](.*?)['\"](\s+i)?\]",
+            selector,
+            re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        return match.group(1), bool(match.group(2))
+
+    def _matches_selector_group(self, item: _FakeElement, selector: str) -> bool:
+        selector = selector.strip()
+        if " + " in selector:
+            _left, right = selector.split(" + ", 1)
+            if not item.adjacent_to_model:
+                return False
+            selector = right.strip()
+
+        if selector == "role=button":
+            return item.tag == "button" or item.role == "button"
+        if selector.startswith("button") and item.tag != "button":
+            return False
+        if selector.startswith("[role='button']") and item.role != "button":
+            return False
+        if selector.startswith('[role="button"]') and item.role != "button":
+            return False
+
+        selector_text = self._selector_text(selector)
+        if selector_text is not None and selector_text not in item._text():
+            return False
+
+        # ``:has(svg[aria-label*=...])`` describes the child SVG, not the
+        # outer button's aria-label.
+        outer_selector = selector.split(":has(svg", 1)[0]
+        aria_match = self._contains_attr(outer_selector, "aria-label")
+        if aria_match is not None:
+            expected, insensitive = aria_match
+            actual = item.aria_label or ""
+            if insensitive:
+                expected, actual = expected.lower(), actual.lower()
+            if expected not in actual:
+                return False
+
+        class_match = self._contains_attr(selector, "class")
+        if class_match is not None:
+            expected, insensitive = class_match
+            actual = item.class_name
+            if insensitive:
+                expected, actual = expected.lower(), actual.lower()
+            if expected not in actual:
+                return False
+
+        if ":has(svg" in selector:
+            svg_match = re.search(
+                r"svg\[aria-label\*=['\"](.*?)['\"](\s+i)?\]",
+                selector,
+                re.IGNORECASE,
+            )
+            if svg_match is None:
+                return False
+            expected = svg_match.group(1)
+            actual = item.svg_aria_label or ""
+            if svg_match.group(2):
+                expected, actual = expected.lower(), actual.lower()
+            if expected not in actual:
+                return False
+        return True
+
+    def _matches_selector(self, item: _FakeElement) -> bool:
+        return any(
+            self._matches_selector_group(item, group)
+            for group in self.selector.split(",")
+        )
+
     def _items(self) -> list[_FakeElement]:
-        if self.selector == "button":
-            items: list[_FakeElement] = []
-            if self.page.has_trigger and self.page.trigger_tag == "button":
-                items.append(self.page.trigger)
-            items.extend(self.page.ratio_elements)
-        elif self.selector == "role=button":
-            items = []
-            if self.page.has_trigger and self.page.trigger_role:
-                items.append(self.page.trigger)
-        elif self.selector in {"[role='button'], button", "button, [role='button']"}:
-            items = []
-            if self.page.has_trigger and (
-                self.page.trigger_tag == "button" or self.page.trigger_role
-            ):
-                items.append(self.page.trigger)
-            items.extend(self.page.ratio_elements)
-            items.extend(self.page.extra_buttons)
-        elif self.selector == "input[type='range']":
+        if self.selector == "input[type='range']":
             items = (
                 [self.page.range_element]
                 if self.page.slider_kind in {"range", "both"}
@@ -183,7 +348,11 @@ class _FakeLocator:
                 else []
             )
         else:
-            items = []
+            items = [
+                item
+                for item in self.page.dom_elements
+                if self._matches_selector(item)
+            ]
 
         if self.text_filter is None:
             return items
@@ -224,18 +393,33 @@ class _FakePage:
         readback_stale_calls: int = 0,
         readback_stale_duration: int | None = None,
         extra_buttons: list[str] | None = None,
+        more_buttons: list[dict] | None = None,
+        model_anchor: bool = False,
+        menu_summary: bool = False,
+        summary_trigger_opens: bool | None = None,
+        duration_revert_on_reopen: int | None = None,
     ):
         self.url = "https://www.doubao.com/chat/create-image"
         self.has_trigger = has_trigger
         self.menu_opens = menu_opens
+        self.summary_trigger_opens = (
+            menu_opens
+            if summary_trigger_opens is None
+            else summary_trigger_opens
+        )
         self.escape_closes = escape_closes
         self.escape_close_delay_ms = escape_close_delay_ms
         self.pending_escape_close_ms: int | None = None
         self.open_delays = list(open_delays or [])
         self.render_delay_ms = 0
         self.menu_open = False
+        self.outer_menu_open = False
+        self.pending_more_close_ms: int | None = None
+        self.closing_more: _FakeElement | None = None
         self.ratio = ratio
         self.duration = duration
+        self.duration_has_been_set = False
+        self.duration_revert_on_reopen = duration_revert_on_reopen
         self.display_ratio = ratio
         self.display_duration = duration
         self.trigger_tag = trigger_tag
@@ -251,13 +435,49 @@ class _FakePage:
         self.close_menu_on_ratio_click = close_menu_on_ratio_click
         self.slider_kind = slider_kind
         self.trigger_clicks = 0
+        self.more_clicks: list[_FakeElement] = []
+        self.summary_clicks = 0
+        self.send_clicks = 0
         self.ratio_clicks: list[str | None] = []
         self.range_fills: list[str] = []
         self.slider_presses: list[str] = []
         self.slider_focused = False
-        self.trigger = _FakeElement(self, "trigger")
+        self.trigger = _FakeElement(
+            self,
+            "trigger",
+            tag=self.trigger_tag,
+            role="button" if self.trigger_role else None,
+            box={"x": 260, "y": 100, "width": 90, "height": 32},
+        )
+        self.model_anchor = (
+            _FakeElement(
+                self,
+                "other",
+                "模型 Seedance 2.0 Mini",
+                tag="button",
+                box={"x": 160, "y": 100, "width": 90, "height": 32},
+            )
+            if model_anchor
+            else None
+        )
+        self.more_elements = [
+            _FakeElement(self, spec.pop("kind", "more"), **spec)
+            for raw_spec in (more_buttons or [])
+            for spec in [dict(raw_spec)]
+        ]
+        self.summary_element = (
+            _FakeElement(
+                self,
+                "summary",
+                tag="button",
+                role="button",
+                box={"x": 310, "y": 160, "width": 120, "height": 32},
+            )
+            if menu_summary
+            else None
+        )
         self.extra_buttons = [
-            _FakeElement(self, "other", value)
+            _FakeElement(self, "other", value, tag="button")
             for value in (extra_buttons or [])
         ]
         self.ratio_elements = [
@@ -272,6 +492,20 @@ class _FakePage:
         self.aria_element = _FakeElement(self, "aria")
         self.keyboard = _FakeKeyboard(self)
         self.mouse = _FakeMouse()
+
+    @property
+    def dom_elements(self) -> list[_FakeElement]:
+        elements: list[_FakeElement] = []
+        if self.has_trigger:
+            elements.append(self.trigger)
+        if self.model_anchor is not None:
+            elements.append(self.model_anchor)
+        elements.extend(self.more_elements)
+        if self.summary_element is not None:
+            elements.append(self.summary_element)
+        elements.extend(self.extra_buttons)
+        elements.extend(self.ratio_elements)
+        return elements
 
     def locator(self, selector: str):
         return _FakeLocator(self, selector)
@@ -296,9 +530,20 @@ class _FakePage:
             self.pending_escape_close_ms -= real_wait_ms
             if self.pending_escape_close_ms == 0:
                 self.menu_open = False
+                self.outer_menu_open = False
                 self.pending_escape_close_ms = None
         else:
             await asyncio.sleep(0)
+        if self.pending_more_close_ms is not None:
+            self.pending_more_close_ms = max(
+                0,
+                self.pending_more_close_ms - milliseconds,
+            )
+            if self.pending_more_close_ms == 0:
+                self.menu_open = False
+                self.outer_menu_open = False
+                self.pending_more_close_ms = None
+                self.closing_more = None
         self.render_delay_ms = max(0, self.render_delay_ms - milliseconds)
         if self.pending_trigger_update_ms is not None:
             self.pending_trigger_update_ms = max(
@@ -723,6 +968,555 @@ async def test_video_options_readback_failure_logs_expected_and_actual(caplog):
     assert "actual='自动 · 10s'" in caplog.text
     assert "expected='1:1 · 10s'" in caplog.text
     assert page.url in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_find_video_options_trigger_prefers_summary_over_more_button():
+    """类型 A 和 B 同时存在时，原组合按钮必须保持最高优先级。"""
+    page = _FakePage(
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, kind = await _find_video_options_trigger(page, return_kind=True)
+
+    assert trigger is page.trigger
+    assert kind == "A"
+    assert page.more_clicks == []
+
+
+@pytest.mark.asyncio
+async def test_find_video_options_trigger_accepts_chinese_more_aria_label():
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "",
+                "tag": "div",
+                "role": "button",
+                "aria_label": "更多选项",
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, kind = await _find_video_options_trigger(page, return_kind=True)
+
+    assert trigger is page.more_elements[0]
+    assert kind == "B"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aria_label", ["More options", "Video options"])
+async def test_find_video_options_trigger_accepts_english_more_or_options_label(
+    aria_label,
+):
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "",
+                "tag": "button",
+                "aria_label": aria_label,
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, kind = await _find_video_options_trigger(page, return_kind=True)
+
+    assert trigger is page.more_elements[0]
+    assert kind == "B"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "more_spec",
+    [
+        {
+            "value": "",
+            "tag": "button",
+            "svg_aria_label": "更多",
+        },
+        {
+            "value": "⋯",
+            "tag": "button",
+            "class_name": "semi-button",
+        },
+        {
+            "value": "…",
+            "tag": "div",
+            "role": "button",
+            "class_name": "toolbar-ellipsis",
+        },
+    ],
+    ids=["nested-svg", "ellipsis-text", "ellipsis-class"],
+)
+async def test_find_video_options_trigger_accepts_svg_and_ellipsis_variants(
+    more_spec,
+):
+    spec = {
+        **more_spec,
+        "action": "toggle_menu",
+        "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+    }
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[spec],
+    )
+
+    trigger, kind = await _find_video_options_trigger(page, return_kind=True)
+
+    assert trigger is page.more_elements[0]
+    assert kind == "B"
+
+
+@pytest.mark.asyncio
+async def test_find_video_options_trigger_excludes_send_wrapper_candidate():
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "kind": "send",
+                "value": "⋯",
+                "tag": "button",
+                "aria_label": "更多选项",
+                "inside_send_wrapper": True,
+                "adjacent_to_model": True,
+                "box": {"x": 255, "y": 100, "width": 32, "height": 32},
+            },
+            {
+                "value": "⋯",
+                "tag": "button",
+                "class_name": "toolbar-ellipsis",
+                "action": "toggle_menu",
+                "box": {"x": 300, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, kind = await _find_video_options_trigger(page, return_kind=True)
+
+    assert trigger is page.more_elements[1]
+    assert kind == "B"
+    assert page.send_clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_find_video_options_trigger_prefers_target_over_earlier_global_more():
+    """DOM 中页头“更多”在前，也必须选择模型按钮旁的视频入口。"""
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "aria_label": "更多",
+                "action": "none",
+                "box": {"x": 900, "y": 20, "width": 32, "height": 32},
+            },
+            {
+                "value": "⋯",
+                "tag": "button",
+                "aria_label": "更多选项",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, kind = await _find_video_options_trigger(page, return_kind=True)
+
+    assert trigger is page.more_elements[1]
+    assert kind == "B"
+
+
+@pytest.mark.asyncio
+async def test_open_video_options_clicks_more_and_waits_for_ratio_options():
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, visible_options, kind = await _open_video_options(page)
+
+    assert trigger is page.more_elements[0]
+    assert kind == "B"
+    assert len(visible_options) >= 4
+    assert page.more_clicks == [trigger]
+    assert page.menu_open is True
+
+
+@pytest.mark.asyncio
+async def test_open_video_options_supports_two_stage_more_then_summary_menu():
+    """截图所示灰度页可能先开三点外层，再点“自动 · 10s”摘要。"""
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        menu_summary=True,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_outer",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, visible_options, kind = await _open_video_options(page)
+
+    assert trigger is page.more_elements[0]
+    assert kind == "B"
+    assert len(visible_options) >= 4
+    assert page.more_clicks == [trigger]
+    assert page.summary_clicks == 1
+    assert page.menu_open is True
+
+
+@pytest.mark.asyncio
+async def test_apply_video_options_type_b_accepts_verified_controls_without_summary():
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        duration=9,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert page.ratio == "1:1"
+    assert page.duration == 5
+    assert page.ratio_clicks == ["1:1"]
+    assert page.range_fills == ["5"]
+    assert len(page.more_clicks) == 4
+    assert all(clicked is page.more_elements[0] for clicked in page.more_clicks)
+    assert page.menu_open is False
+
+
+@pytest.mark.asyncio
+async def test_apply_video_options_type_b_reads_back_two_stage_summary():
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        menu_summary=True,
+        duration=9,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_outer",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert page.ratio == "1:1"
+    assert page.duration == 5
+    assert len(page.more_clicks) == 4
+    assert all(clicked is page.more_elements[0] for clicked in page.more_clicks)
+    assert page.summary_clicks == 1
+    assert page.menu_open is False
+    assert page.outer_menu_open is False
+
+
+@pytest.mark.asyncio
+async def test_close_type_b_uses_original_more_toggle_when_escape_fails():
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        escape_closes=False,
+        duration=9,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    await _apply_video_options(page, ratio="1:1", duration=5)
+
+    target = page.more_elements[0]
+    assert len(page.more_clicks) == 4
+    assert all(clicked is target for clicked in page.more_clicks)
+    assert page.trigger_clicks == 0
+    assert page.menu_open is False
+
+
+@pytest.mark.asyncio
+async def test_validate_video_tab_content_supports_two_stage_type_b_menu():
+    """TAB 校验也必须走通“三点 → 摘要 → 比例”两级结构。"""
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        menu_summary=True,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_outer",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    visible_options = await _validate_video_tab_content(page)
+
+    root = page.more_elements[0]
+    assert len(visible_options) >= 4
+    assert page.more_clicks == [root, root]
+    assert page.summary_clicks == 1
+    assert page.menu_open is False
+    assert page.outer_menu_open is False
+
+
+@pytest.mark.asyncio
+async def test_open_video_options_retries_same_type_b_after_cold_render_delay():
+    """首开渲染 1.1s 超过单次等待时，同一个正确候选应再试一次。"""
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "open_delays": [1_100, 0],
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, visible_options, kind = await _open_video_options(page)
+
+    root = page.more_elements[0]
+    assert trigger is root
+    assert kind == "B"
+    assert len(visible_options) >= 4
+    # 首开 + 首次失败后的关闭 + 同一 root 重开。
+    assert page.more_clicks == [root, root, root]
+
+
+@pytest.mark.asyncio
+async def test_open_waits_for_previous_ratio_exit_before_trying_global_more():
+    """旧 chips 退场期间不能让下一个全局“更多”借尸还魂为成功候选。"""
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "open_delays": [1_100, 1_100],
+                "close_delay_ms": 800,
+                "box": {"x": 255, "y": 100, "width": 32, "height": 32},
+            },
+            {
+                "value": "⋯",
+                "tag": "button",
+                "aria_label": "页面顶部更多",
+                "action": "none",
+                "box": {"x": 270, "y": 20, "width": 32, "height": 32},
+            },
+            {
+                "value": "⋯",
+                "tag": "button",
+                "aria_label": "视频更多选项",
+                "action": "toggle_menu",
+                "box": {"x": 450, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, visible_options, kind = await _open_video_options(page)
+
+    target = page.more_elements[2]
+    global_more = page.more_elements[1]
+    assert trigger is target
+    assert trigger is not global_more
+    assert kind == "B"
+    assert len(visible_options) >= 4
+
+
+@pytest.mark.asyncio
+async def test_open_falls_back_to_type_b_after_summary_fails_twice():
+    page = _FakePage(
+        has_trigger=True,
+        summary_trigger_opens=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    trigger, visible_options, kind = await _open_video_options(page)
+
+    assert trigger is page.more_elements[0]
+    assert kind == "B"
+    assert len(visible_options) >= 4
+    assert page.trigger_clicks == 2
+    assert page.more_clicks == [page.more_elements[0]]
+
+
+@pytest.mark.asyncio
+async def test_type_b_ratio_auto_close_reuses_root_more_for_reopen_and_readback():
+    """比例点击收起内层后，duration 重开、关闭和回读都不能换成摘要/全局按钮。"""
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        close_menu_on_ratio_click=True,
+        duration=9,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+            {
+                "value": "⋯",
+                "tag": "button",
+                "aria_label": "页面顶部更多",
+                "action": "none",
+                "box": {"x": 900, "y": 20, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    await _apply_video_options(page, ratio="1:1", duration=5)
+
+    root = page.more_elements[0]
+    assert page.ratio == "1:1"
+    assert page.duration == 5
+    # 正常完整 B apply 为 4 次 root toggle；本例比例点击额外收起，
+    # duration 阶段需再重开一次，所以合计 5 次。
+    assert len(page.more_clicks) == 5
+    assert all(clicked is root for clicked in page.more_clicks)
+    assert page.menu_open is False
+    assert page.outer_menu_open is False
+
+
+@pytest.mark.asyncio
+async def test_type_b_controls_readback_rejects_duration_rollback(caplog):
+    """setter 当场成功也不够；关闭后重开读到回滚值必须主动失败。"""
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        duration=9,
+        duration_revert_on_reopen=9,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="doupool.video.browser"):
+        with pytest.raises(RuntimeError, match="视频参数设置后校验失败"):
+            await _apply_video_options(page, ratio="1:1", duration=5)
+
+    root = page.more_elements[0]
+    assert page.range_fills == ["5"]
+    assert page.duration == 9
+    assert len(page.more_clicks) == 4
+    assert all(clicked is root for clicked in page.more_clicks)
+    assert "event=video_options_readback_failed" in caplog.text
+    assert "actual_duration=9" in caplog.text
+    assert page.menu_open is False
+
+
+@pytest.mark.asyncio
+async def test_close_type_b_uses_escape_when_original_and_refind_click_fail():
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "click_error": "refind click failed",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+    page.menu_open = True
+    page.outer_menu_open = True
+    original = _FakeElement(
+        page,
+        "more",
+        "⋯",
+        tag="button",
+        action="toggle_menu",
+        click_error="original click failed",
+        box={"x": 260, "y": 100, "width": 32, "height": 32},
+    )
+
+    await _close_video_options(page, original, trigger_kind="B")
+
+    refound = page.more_elements[0]
+    assert original.click_attempts == 1
+    assert refound.click_attempts == 1
+    assert page.keyboard.presses == ["Escape"]
+    assert page.menu_open is False
+    assert page.outer_menu_open is False
 
 
 def _tab(*, text: str, tag: str = "div", role: str | None = None,
