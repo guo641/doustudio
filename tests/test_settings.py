@@ -1,61 +1,18 @@
 import sqlite3
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from doupool.settings.service import (
+    DownloadDirPickerUnavailable,
     SettingsService,
-    _pick_dir_linux,
-    _pick_dir_macos,
-    _pick_dir_windows,
     open_directory,
-    pick_directory,
 )
 
 
-def test_pick_directory_windows_uses_constant_script_and_returns_path():
-    result = SimpleNamespace(returncode=0, stdout="C:\\Videos\\Selected\r\n")
-    with patch("doupool.settings.service.subprocess.run", return_value=result) as run:
-        with patch("doupool.settings.service.os.environ", {"PATH": "test"}):
-            selected = _pick_dir_windows("C:\\Videos")
-    assert selected == "C:\\Videos\\Selected"
-    command = run.call_args.args[0]
-    assert command[:3] == ["powershell", "-NoProfile", "-STA"]
-    # The start path is supplied through the environment, never interpolated
-    # into the PowerShell source.
-    assert "C:\\Videos" not in command[-1]
-    assert run.call_args.kwargs["env"]["DOUPOOL_PICK_START_DIR"] == "C:\\Videos"
-
-
-def test_pick_directory_macos_passes_start_as_argv_and_cancel_is_none():
-    result = SimpleNamespace(returncode=0, stdout="")
-    with patch("doupool.settings.service.subprocess.run", return_value=result) as run:
-        assert _pick_dir_macos("/tmp/start") is None
-    command = run.call_args.args[0]
-    assert command[0:2] == ["osascript", "-e"]
-    assert command[-1] == "/tmp/start"
-
-
-def test_pick_directory_linux_falls_back_to_kdialog():
-    missing = FileNotFoundError()
-    selected = SimpleNamespace(returncode=0, stdout="/home/user/Videos\n")
-    with patch(
-        "doupool.settings.service.subprocess.run",
-        side_effect=[missing, selected],
-    ) as run:
-        assert _pick_dir_linux("/home/user") == "/home/user/Videos"
-    assert run.call_args_list[0].args[0][0] == "zenity"
-    assert run.call_args_list[1].args[0][0] == "kdialog"
-
-
-def test_pick_directory_dispatches_by_platform():
-    with patch("doupool.settings.service.platform.system", return_value="Windows"):
-        with patch("doupool.settings.service._pick_dir_windows", return_value="C:\\Videos") as pick:
-            assert pick_directory("C:\\Start") == "C:\\Videos"
-            pick.assert_called_once_with("C:\\Start")
-    with patch("doupool.settings.service.platform.system", return_value="Unknown"):
-        assert pick_directory("/tmp") is None
+def test_download_dir_picker_unavailable_is_typed_runtime_error():
+    assert issubclass(DownloadDirPickerUnavailable, RuntimeError)
+    assert str(DownloadDirPickerUnavailable("webview window not ready")) == "webview window not ready"
 
 
 def test_open_directory_rejects_nonexistent_path(tmp_path):

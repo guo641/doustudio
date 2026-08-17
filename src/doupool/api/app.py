@@ -11,6 +11,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import httpx
 from playwright.sync_api import sync_playwright
@@ -28,7 +29,7 @@ from doupool.login.browser_sessions import (
 )
 from doupool.login.service import LoginAlreadyRunning
 from doupool.logging.setup import set_log_level
-from doupool.settings.service import open_directory, pick_directory
+from doupool.settings.service import DownloadDirPickerUnavailable, open_directory
 from doupool.updater import check_for_update
 from doupool.video.browser import TokenBundleUnavailable, extract_webmssdk_tokens
 from doupool.video.service import NoAvailableAccount, quota_window
@@ -228,6 +229,7 @@ def create_app(
     video_service=None,
     settings_service=None,
     current_version: str = "0.1.0",
+    download_dir_picker: Callable[[str], str | None] | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app):
@@ -263,6 +265,10 @@ def create_app(
 
     app = FastAPI(title="DouPool", docs_url=None, redoc_url=None, lifespan=lifespan)
     frontend_dir = Path(frontend_dir)
+    # Native file dialogs are modal and only one may be open at a time.  The
+    # API runs in worker threads, so serialize calls while leaving the rest of
+    # the app concurrent.
+    _pick_lock = threading.Lock()
 
     def authorize(
         x_doupool_token: str | None = Header(default=None),
@@ -609,14 +615,24 @@ def create_app(
         start = str(payload.get("start_dir", "") or "").strip()
         if not start:
             start = str(settings_service.get().get("download_dir", "") or "")
+        if download_dir_picker is None:
+            raise HTTPException(status_code=503, detail="桌面窗口未就绪,无法打开目录选择器")
+        if not _pick_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="目录选择器已在使用中")
         try:
-            path = pick_directory(start)
+            path = download_dir_picker(start)
+        except DownloadDirPickerUnavailable as exc:
+            raise HTTPException(status_code=503, detail="桌面窗口未就绪,无法打开目录选择器") from exc
+        except HTTPException:
+            raise
         except Exception as exc:  # native helpers are optional desktop integrations
             logging.getLogger("doupool.api").warning(
                 "目录选择器调用失败: %s", exc,
                 extra={"event": "settings_pick_download_dir_failed"},
             )
             path = None
+        finally:
+            _pick_lock.release()
         return {"path": path}
 
     @app.post("/api/settings/open-dir")

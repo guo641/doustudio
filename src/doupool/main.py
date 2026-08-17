@@ -77,7 +77,7 @@ from doupool.api.app import create_app
 from doupool.config import Settings
 from doupool.db.database import DatabaseManager
 from doupool.db.repository import AccountRepository
-from doupool.desktop import DesktopRuntime
+from doupool.desktop import DesktopRuntime, _pick_download_dir
 from doupool.login.browser import PlaywrightLoginRunner
 from doupool.login.service import LoginService
 from doupool.logging.setup import configure_logging
@@ -130,6 +130,7 @@ def main() -> None:
     app = create_app(
         _resolve_api_token(), settings.frontend_dir, repository, service,
         video_service, settings_service,
+        download_dir_picker=_pick_download_dir,
         current_version=settings.version,
     )
     try:
