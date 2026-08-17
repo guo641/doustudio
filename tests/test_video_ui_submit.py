@@ -26,16 +26,21 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from doupool.video import protocol as protocol_module
+from doupool.video import browser as browser_module
 from doupool.video.browser import (
     EDITOR_SEL,
     SEND_BTN_SEL,
     SEND_BTN_FALLBACK_SEL,
     VIDEO_TAB_SEL,
     PlaywrightVideoRunner,
+    _AckWaitTimeout,
     _AegisUnresolvableInPoll,
     _ack_interceptor,
     _build_launch_kwargs,
+    _build_video_prompt,
+    _enter_video_generation_mode,
     _extract_local_message_ids_from_ack_payload,
+    _wait_for_visible_exact_text,
     _wait_for_ack,
     clear_prose_mirror,
     submit_via_ui,
@@ -142,22 +147,16 @@ class _FakePage:
 
 
 @pytest.fixture(autouse=True)
-def _stub_video_tab_switch_for_submit_contracts(monkeypatch):
-    """这些测试聚焦 submit 后半段，用旧 fake click 模拟已验证的 TAB 切换。
-
-    `_click_video_tab` 的 selector/挂载校验由 test_apply_video_options.py 的
-    专门用例覆盖；这里保留原有 mouse.down/up 和 monkeypatch try_click 断言。
-    """
-    async def fake_click(page):
-        # Resolve through the module at call time so tests that monkeypatch
-        # `browser.try_click` still observe the synthetic TAB click.
-        import doupool.video.browser as browser_mod
-
-        await browser_mod.try_click(page, (VIDEO_TAB_SEL,), timeout=5.0)
-
+def _stub_video_mode_entry_for_submit_contracts(monkeypatch):
+    """多数 submit 测试聚焦粘贴/发送；新入口细节在顺序用例中单独覆盖。"""
+    model_button = MagicMock()
     monkeypatch.setattr(
-        "doupool.video.browser._click_video_tab",
-        fake_click,
+        "doupool.video.browser._enter_video_generation_mode",
+        AsyncMock(return_value=model_button),
+    )
+    monkeypatch.setattr(
+        "doupool.video.browser._select_video_model",
+        AsyncMock(),
     )
 
 
@@ -215,7 +214,200 @@ async def test_clear_prose_mirror_uses_ctrl_a_delete():
 
 
 @pytest.mark.asyncio
-async def test_submit_via_ui_clicks_video_tab_and_send_btn(monkeypatch):
+async def test_video_entry_waits_for_delayed_react_menu_mount(monkeypatch):
+    candidate = MagicMock()
+    candidate.is_enabled = AsyncMock(return_value=True)
+    attempts = 0
+
+    async def delayed_visible(_page, _selector, _text):
+        nonlocal attempts
+        attempts += 1
+        return candidate if attempts == 3 else None
+
+    monkeypatch.setattr(browser_module, "_first_visible_exact_text", delayed_visible)
+    monkeypatch.setattr(browser_module.asyncio, "sleep", AsyncMock())
+
+    result = await _wait_for_visible_exact_text(
+        MagicMock(),
+        ("strict-selector",),
+        "视频生成",
+        timeout_ms=1_000,
+        require_enabled=True,
+    )
+
+    assert result is candidate
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_video_entry_uses_skill_item_exact_text_fallback(monkeypatch):
+    candidate = MagicMock()
+    candidate.is_enabled = AsyncMock(return_value=True)
+    seen_selectors: list[str] = []
+
+    async def fallback_visible(_page, selector, _text):
+        seen_selectors.append(selector)
+        return candidate if selector == "skill-item-fallback" else None
+
+    monkeypatch.setattr(browser_module, "_first_visible_exact_text", fallback_visible)
+
+    result = await _wait_for_visible_exact_text(
+        MagicMock(),
+        ("strict-selector", "skill-item-fallback"),
+        "视频生成",
+        require_enabled=True,
+    )
+
+    assert result is candidate
+    assert seen_selectors == ["strict-selector", "skill-item-fallback"]
+
+
+@pytest.mark.asyncio
+async def test_video_entry_keeps_new_skill_path_primary(monkeypatch):
+    page = _FakePage(url="https://www.doubao.com/chat")
+    new_conversation = _FakeElement()
+    more = _FakeElement()
+    video_generation = _FakeElement()
+    model_button = MagicMock()
+    ready = AsyncMock(return_value=model_button)
+    legacy_tab = AsyncMock()
+    candidates = iter((new_conversation, more, video_generation))
+
+    monkeypatch.setattr(
+        browser_module,
+        "_wait_for_visible_exact_text",
+        AsyncMock(side_effect=lambda *_args, **_kwargs: next(candidates)),
+    )
+    monkeypatch.setattr(browser_module, "_wait_for_video_generation_mode_ready", ready)
+    monkeypatch.setattr(browser_module, "_activate_legacy_video_tab", legacy_tab)
+
+    result = await _enter_video_generation_mode(page)
+
+    assert result is model_button
+    assert new_conversation.clicks == 1
+    assert more.clicks == 1
+    assert video_generation.clicks == 1
+    assert page.goto_calls == []
+    legacy_tab.assert_not_awaited()
+    ready.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_video_entry_falls_back_to_legacy_tab_only_after_menu_missing(
+    monkeypatch,
+):
+    page = _FakePage(url="https://www.doubao.com/chat")
+    new_conversation = _FakeElement()
+    more = _FakeElement()
+    model_button = MagicMock()
+    legacy_ready = AsyncMock(return_value=model_button)
+    legacy_tab = AsyncMock()
+    menu_checks = 0
+
+    async def wait_exact(_page, _selectors, text, **_kwargs):
+        nonlocal menu_checks
+        if text == "新对话":
+            return new_conversation
+        if text == "更多":
+            return more
+        assert text == "视频生成"
+        menu_checks += 1
+        return None
+
+    monkeypatch.setattr(browser_module, "_wait_for_visible_exact_text", wait_exact)
+    monkeypatch.setattr(
+        browser_module,
+        "_wait_for_legacy_video_generation_ready",
+        legacy_ready,
+    )
+    monkeypatch.setattr(browser_module, "_activate_legacy_video_tab", legacy_tab)
+
+    result = await _enter_video_generation_mode(page)
+
+    assert result is model_button
+    assert menu_checks == 2
+    assert more.clicks == 2
+    assert page.keyboard.presses == ["Escape", "Escape"]
+    assert page.goto_calls == [
+        (
+            browser_module.CREATE_IMAGE_URL,
+            {"wait_until": "domcontentloaded", "timeout": 30_000},
+        )
+    ]
+    legacy_tab.assert_awaited_once_with(page)
+    legacy_ready.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_legacy_tab_activation_does_not_open_video_options(monkeypatch):
+    page = _FakePage(url=browser_module.CREATE_IMAGE_URL)
+    candidate = MagicMock()
+    candidate.get_attribute = AsyncMock(return_value="false")
+    monkeypatch.setattr(
+        browser_module,
+        "_wait_for_visible_video_tab_candidate",
+        AsyncMock(return_value=candidate),
+    )
+    monkeypatch.setattr(
+        browser_module,
+        "_video_tab_candidate_signature",
+        AsyncMock(return_value=("视频", (1, 2, 3, 4))),
+    )
+    click = AsyncMock()
+    validate_options = AsyncMock()
+    monkeypatch.setattr(browser_module, "_click_video_tab_candidate", click)
+    monkeypatch.setattr(browser_module, "_validate_video_tab_content", validate_options)
+
+    await browser_module._activate_legacy_video_tab(page)
+
+    click.assert_awaited_once_with(page, candidate)
+    validate_options.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_tab_activation_keeps_already_selected_tab(monkeypatch):
+    page = _FakePage(url=browser_module.CREATE_IMAGE_URL)
+    candidate = MagicMock()
+
+    async def selected_attribute(name):
+        return "true" if name == "aria-selected" else None
+
+    candidate.get_attribute = selected_attribute
+    monkeypatch.setattr(
+        browser_module,
+        "_wait_for_visible_video_tab_candidate",
+        AsyncMock(return_value=candidate),
+    )
+    monkeypatch.setattr(
+        browser_module,
+        "_video_tab_candidate_signature",
+        AsyncMock(return_value=("视频", (1, 2, 3, 4))),
+    )
+    click = AsyncMock()
+    monkeypatch.setattr(browser_module, "_click_video_tab_candidate", click)
+
+    await browser_module._activate_legacy_video_tab(page)
+
+    click.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_video_mode_ready_requires_editor_and_model(monkeypatch):
+    page = _FakePage(url=browser_module.CREATE_IMAGE_URL)
+    editor = MagicMock()
+    model_button = MagicMock()
+    model_button.inner_text = AsyncMock(return_value="模型\nSeedance 2.0 Mini")
+    visible = AsyncMock(side_effect=(editor, model_button))
+    monkeypatch.setattr(browser_module, "_first_visible_locator", visible)
+
+    result = await browser_module._wait_for_legacy_video_generation_ready(page)
+
+    assert result is model_button
+    assert visible.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_submit_via_ui_enters_video_mode_selects_model_and_sends(monkeypatch):
     page = _FakePage(url="https://www.doubao.com/chat/create-image")
     update = MagicMock()
     options_mock = AsyncMock()
@@ -227,14 +419,20 @@ async def test_submit_via_ui_clicks_video_tab_and_send_btn(monkeypatch):
     await submit_via_ui(
         page,
         "测试一只小狗",
+        model="seedance_v2.0_mini",
         ratio="16:9",
         duration=10,
         profile_dir=Path("/tmp/p"),
         update=update,
     )
-    options_mock.assert_awaited_once_with(page, ratio="16:9", duration=10)
-    # 视频 tab 已 click(触发 mouse.down/up)
-    assert page._elements[VIDEO_TAB_SEL] is not None
+    options_mock.assert_not_awaited()
+    from doupool.video import browser as browser_mod
+    browser_mod._enter_video_generation_mode.assert_awaited_once_with(page)
+    browser_mod._select_video_model.assert_awaited_once_with(
+        page,
+        browser_mod._enter_video_generation_mode.return_value,
+        "seedance_v2.0_mini",
+    )
     # send button 命中(SEND_BTN_SEL 或 fallback)
     send_hit = (
         page._elements.get(SEND_BTN_SEL) is not None
@@ -247,7 +445,7 @@ async def test_submit_via_ui_clicks_video_tab_and_send_btn(monkeypatch):
         e for e in page.evaluates
         if "writeText" in str(e[0])
     ]
-    assert any(arg == "测试一只小狗" for _expr, arg in write_calls), (
+    assert any(arg == "测试一只小狗。时长10秒，比例16:9" for _expr, arg in write_calls), (
         f"prompt 必须整段传给 clipboard.writeText; 实际 evaluates={page.evaluates}"
     )
     # 2) keyboard.type 不该被调用(整段贴,不是逐字打)
@@ -259,27 +457,7 @@ async def test_submit_via_ui_clicks_video_tab_and_send_btn(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_submit_via_ui_skips_goto_when_already_on_create_image(monkeypatch):
-    """已在 create-image 页 → 不应再调 page.goto(避免重复跳转)。"""
-    page = _FakePage(url="https://www.doubao.com/chat/create-image")
-    monkeypatch.setattr(
-        "doupool.video.browser._apply_video_options",
-        AsyncMock(),
-    )
-    monkeypatch.setattr("doupool.video.browser._pre_submit_aegis_gate", AsyncMock())
-    await submit_via_ui(
-        page,
-        "x",
-        ratio="1:1",
-        duration=5,
-        profile_dir=Path("/tmp/p"),
-        update=MagicMock(),
-    )
-    assert page.goto_calls == []
-
-
-@pytest.mark.asyncio
-async def test_submit_via_ui_goto_when_on_other_page(monkeypatch):
+async def test_submit_via_ui_uses_sidebar_entry_without_direct_navigation(monkeypatch):
     page = _FakePage(url="https://www.doubao.com/chat/123")
     monkeypatch.setattr(
         "doupool.video.browser._apply_video_options",
@@ -289,28 +467,40 @@ async def test_submit_via_ui_goto_when_on_other_page(monkeypatch):
     await submit_via_ui(
         page,
         "x",
+        model="seedance_v2.0_mini",
         ratio="1:1",
-        duration=5,
+        duration=10,
         profile_dir=Path("/tmp/p"),
         update=MagicMock(),
     )
-    assert len(page.goto_calls) == 1
-    assert page.goto_calls[0][0].startswith("https://www.doubao.com/chat/create-image")
+    assert page.goto_calls == []
 
 
 @pytest.mark.asyncio
-async def test_submit_via_ui_applies_options_before_paste_and_send(monkeypatch):
+async def test_submit_via_ui_new_entry_order_before_paste_and_send(monkeypatch):
     page = _FakePage()
     events: list[str] = []
 
     async def fake_gate(*_args, **_kwargs):
         events.append("aegis-gate")
 
-    async def fake_try_click(_page, selectors, **_kwargs):
-        events.append("video-tab" if selectors == (VIDEO_TAB_SEL,) else "send")
+    model_button = MagicMock()
 
-    async def fake_apply(_page, **_kwargs):
-        events.append("options")
+    async def fake_enter(_page):
+        events.extend(["new-conversation", "more", "video-generation", "mode-ready"])
+        return model_button
+
+    async def fake_model(_page, button, task_model):
+        assert button is model_button
+        assert task_model == "seedance_v2.0_std"
+        events.extend(["model-selected", "model-readback"])
+
+    async def fake_clear(_page):
+        events.append("clear")
+
+    async def fake_try_click(_page, selectors, **_kwargs):
+        assert selectors[0] == SEND_BTN_SEL
+        events.append("send")
 
     async def tracked_evaluate(expr, arg=None):
         if "writeText" in str(expr):
@@ -319,12 +509,15 @@ async def test_submit_via_ui_applies_options_before_paste_and_send(monkeypatch):
 
     monkeypatch.setattr("doupool.video.browser._pre_submit_aegis_gate", fake_gate)
     monkeypatch.setattr("doupool.video.browser.try_click", fake_try_click)
-    monkeypatch.setattr("doupool.video.browser._apply_video_options", fake_apply)
+    monkeypatch.setattr("doupool.video.browser._enter_video_generation_mode", fake_enter)
+    monkeypatch.setattr("doupool.video.browser._select_video_model", fake_model)
+    monkeypatch.setattr("doupool.video.browser.clear_prose_mirror", fake_clear)
     page.evaluate = tracked_evaluate
 
     await submit_via_ui(
         page,
         "prompt",
+        model="seedance_v2.0_std",
         ratio="16:9",
         duration=10,
         profile_dir=Path("/tmp/p"),
@@ -332,9 +525,14 @@ async def test_submit_via_ui_applies_options_before_paste_and_send(monkeypatch):
     )
 
     assert events == [
+        "new-conversation",
+        "more",
+        "video-generation",
+        "mode-ready",
+        "model-selected",
+        "model-readback",
         "aegis-gate",
-        "video-tab",
-        "options",
+        "clear",
         "paste",
         "aegis-gate",
         "send",
@@ -342,7 +540,7 @@ async def test_submit_via_ui_applies_options_before_paste_and_send(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_submit_via_ui_does_not_paste_or_send_when_options_fail(monkeypatch):
+async def test_submit_via_ui_does_not_paste_or_send_when_model_readback_fails(monkeypatch):
     page = _FakePage()
     events: list[str] = []
 
@@ -350,11 +548,11 @@ async def test_submit_via_ui_does_not_paste_or_send_when_options_fail(monkeypatc
         return True
 
     async def fake_try_click(_page, selectors, **_kwargs):
-        events.append("video-tab" if selectors == (VIDEO_TAB_SEL,) else "send")
+        events.append("send")
 
-    async def failing_apply(_page, **_kwargs):
-        events.append("options")
-        raise RuntimeError("视频参数设置失败")
+    async def failing_model(*_args, **_kwargs):
+        events.append("model")
+        raise RuntimeError("视频模型选中状态回读失败")
 
     async def tracked_evaluate(expr, arg=None):
         if "writeText" in str(expr):
@@ -363,20 +561,33 @@ async def test_submit_via_ui_does_not_paste_or_send_when_options_fail(monkeypatc
 
     monkeypatch.setattr("doupool.video.browser._pre_submit_aegis_gate", fake_gate)
     monkeypatch.setattr("doupool.video.browser.try_click", fake_try_click)
-    monkeypatch.setattr("doupool.video.browser._apply_video_options", failing_apply)
+    monkeypatch.setattr("doupool.video.browser._select_video_model", failing_model)
     page.evaluate = tracked_evaluate
 
-    with pytest.raises(RuntimeError, match="视频参数设置失败"):
+    with pytest.raises(RuntimeError, match="视频模型选中状态回读失败"):
         await submit_via_ui(
             page,
             "prompt",
+            model="seedance_v2.0_mini",
             ratio="16:9",
             duration=10,
             profile_dir=Path("/tmp/p"),
             update=MagicMock(),
         )
 
-    assert events == ["video-tab", "options"]
+    assert events == ["model"]
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("橘猫伸懒腰", "橘猫伸懒腰。时长10秒，比例9:16"),
+        ("城市夜景。", "城市夜景。时长10秒，比例16:9"),
+        ("海浪!  ", "海浪!时长10秒，比例1:1"),
+    ],
+)
+def test_build_video_prompt_appends_suffix_once(prompt, expected):
+    assert _build_video_prompt(prompt, ratio=expected.rsplit("比例", 1)[1], duration=10) == expected
 
 
 # ------------------------- _ack_interceptor ------------------------- #
@@ -428,12 +639,19 @@ def test_extract_local_ids_keeps_only_explicit_local_fields():
 @pytest.mark.asyncio
 async def test_ack_interceptor_does_not_leak_listener():
     page = _FakePage()
-    async with _ack_interceptor(page):
-        assert len(page._added_handlers) == 1
-        assert page._added_handlers[0][0] == "response"
+    async with _ack_interceptor(page) as state:
+        assert len(page._added_handlers) == 2
+        assert [event for event, _handler in page._added_handlers] == [
+            "request",
+            "response",
+        ]
+        assert state["request_seen"] is False
+        request_handler = page._added_handlers[0][1]
+        request_handler(MagicMock(url="https://www.doubao.com/chat/completion"))
+        assert state["request_seen"] is True
         assert len(page._removed_handlers) == 0
-    assert len(page._removed_handlers) == 1
-    assert page._added_handlers[0][1] is page._removed_handlers[0][1]
+    assert len(page._removed_handlers) == 2
+    assert page._added_handlers == page._removed_handlers
 
 
 @pytest.mark.asyncio
@@ -442,7 +660,7 @@ async def test_ack_interceptor_removes_listener_even_on_exception():
     with pytest.raises(RuntimeError):
         async with _ack_interceptor(page):
             raise RuntimeError("boom")
-    assert len(page._removed_handlers) == 1
+    assert len(page._removed_handlers) == 2
 
 
 # ------------------------- _wait_for_ack ------------------------- #
@@ -462,8 +680,9 @@ async def test_wait_for_ack_timeout_raises(monkeypatch):
 
     monkeypatch.setattr(browser_mod, "_UI_ACK_WAIT_SECONDS", 0.1)
     state: dict = {}
-    with pytest.raises(RuntimeError, match="等待 /chat/completion 响应超时"):
+    with pytest.raises(_AckWaitTimeout, match="等待 /chat/completion 响应超时") as exc_info:
         await _wait_for_ack(state, timeout=0.1)
+    assert exc_info.value.request_seen is False
 
 
 # ------------------------- _submit_and_poll 契约 ------------------------- #
@@ -574,10 +793,150 @@ async def test_submit_and_poll_use_real_browser_returns_three_field_ack(monkeypa
     assert result["section_id"] == "S1"
     assert result["question_id"] == "Q1"
     assert protocol_module._accepted_remote_ids == {"x": "owner-task"}
+    assert submit_kwargs["model"] == "seedance_v2.0_mini"
     assert submit_kwargs["ratio"] == "16:9"
     assert submit_kwargs["duration"] == 10
     # update 至少调过一次 status=generating 把 ack 写进去
     update.assert_any_call(status="generating", **result)
+
+
+@pytest.mark.asyncio
+async def test_submit_and_poll_retries_once_only_when_request_was_not_seen(
+    monkeypatch,
+    tmp_path,
+):
+    import doupool.video.browser as browser_mod
+
+    runner = PlaywrightVideoRunner(timeout=10, poll_interval=1)
+    submits: list[dict] = []
+    wait_calls = 0
+
+    @asynccontextmanager
+    async def fake_interceptor(_page):
+        yield {"request_seen": False}
+
+    async def fake_submit(_page, _prompt, **kwargs):
+        submits.append(kwargs)
+
+    async def fake_wait(state, *, timeout):
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 1:
+            raise _AckWaitTimeout(timeout, request_seen=False)
+        return "ack"
+
+    result_payload = {
+        "remote_task_id": "cid",
+        "vid": "vid",
+        "fallback_result_url": "https://example/video.mp4",
+        "cover_url": "",
+    }
+    page = MagicMock()
+    page.evaluate = AsyncMock(return_value={"status": 200, "data": {}})
+    monkeypatch.setattr(browser_mod, "_ack_interceptor", fake_interceptor)
+    monkeypatch.setattr(browser_mod, "submit_via_ui", fake_submit)
+    monkeypatch.setattr(browser_mod, "_wait_for_ack", fake_wait)
+    monkeypatch.setattr(browser_mod, "_handle_aegis_in_poll", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        browser_mod,
+        "parse_sse_ack",
+        lambda _text: {"conversation_id": "c", "section_id": "s", "question_id": "q"},
+    )
+    monkeypatch.setattr(browser_mod, "parse_creation_result", MagicMock(return_value=result_payload))
+    monkeypatch.setattr(
+        PlaywrightVideoRunner,
+        "_resolve_original_download",
+        AsyncMock(return_value=result_payload),
+    )
+
+    await runner._submit_and_poll(
+        page,
+        "base prompt",
+        "seedance_v2.0_mini",
+        "9:16",
+        10,
+        "fp",
+        MagicMock(),
+        "t2v",
+        [],
+        MagicMock(),
+        threading.Event(),
+        tmp_path / "profile",
+        use_real_browser=True,
+    )
+
+    assert len(submits) == 2
+    assert all(call["model"] == "seedance_v2.0_mini" for call in submits)
+    assert wait_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_submit_and_poll_does_not_resend_after_ambiguous_request_timeout(
+    monkeypatch,
+    tmp_path,
+):
+    import doupool.video.browser as browser_mod
+
+    runner = PlaywrightVideoRunner(timeout=10, poll_interval=1)
+    submit = AsyncMock()
+
+    @asynccontextmanager
+    async def fake_interceptor(_page):
+        yield {"request_seen": True}
+
+    monkeypatch.setattr(browser_mod, "_ack_interceptor", fake_interceptor)
+    monkeypatch.setattr(browser_mod, "submit_via_ui", submit)
+    monkeypatch.setattr(
+        browser_mod,
+        "_wait_for_ack",
+        AsyncMock(side_effect=_AckWaitTimeout(0.1, request_seen=True)),
+    )
+    monkeypatch.setattr(browser_mod, "_handle_aegis_in_poll", AsyncMock(return_value=False))
+
+    with pytest.raises(_AckWaitTimeout) as exc_info:
+        await runner._submit_and_poll(
+            MagicMock(), "prompt", "seedance_v2.0_mini", "1:1", 10,
+            "fp", MagicMock(), "t2v", [], MagicMock(), threading.Event(),
+            tmp_path / "profile", use_real_browser=True,
+        )
+    assert exc_info.value.request_seen is True
+    assert submit.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_and_poll_aegis_after_send_timeout_never_resends(
+    monkeypatch,
+    tmp_path,
+):
+    import doupool.video.browser as browser_mod
+
+    runner = PlaywrightVideoRunner(timeout=10, poll_interval=1)
+    submit = AsyncMock()
+
+    @asynccontextmanager
+    async def fake_interceptor(_page):
+        yield {"request_seen": False}
+
+    monkeypatch.setattr(browser_mod, "_ack_interceptor", fake_interceptor)
+    monkeypatch.setattr(browser_mod, "submit_via_ui", submit)
+    monkeypatch.setattr(
+        browser_mod,
+        "_wait_for_ack",
+        AsyncMock(side_effect=_AckWaitTimeout(0.1, request_seen=False)),
+    )
+    monkeypatch.setattr(
+        browser_mod,
+        "_handle_aegis_in_poll",
+        AsyncMock(side_effect=_AegisUnresolvableInPoll("aegis")),
+    )
+
+    with pytest.raises(_AegisUnresolvableInPoll, match="aegis"):
+        await runner._submit_and_poll(
+            MagicMock(), "prompt", "seedance_v2.0_mini", "1:1", 10,
+            "fp", MagicMock(), "t2v", [], MagicMock(), threading.Event(),
+            tmp_path / "profile", use_real_browser=True,
+        )
+    assert submit.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -936,9 +1295,9 @@ async def test_submit_and_poll_use_real_browser_false_still_works(monkeypatch):
 def test_selector_constants_match_probe_findings():
     """selector 必须跟 probe_*.py 实地命中的一致 —— 防止改错。"""
     assert VIDEO_TAB_SEL == "[role='tab']:has-text('视频')"
-    assert EDITOR_SEL == "div[contenteditable='true']"
-    assert SEND_BTN_SEL == ".send-btn-wrapper button"
-    assert SEND_BTN_FALLBACK_SEL == "button:has(svg path[d^='M4.93934 10.2598'])"
+    assert EDITOR_SEL == "[contenteditable='true'][role='textbox']"
+    assert SEND_BTN_SEL == "#flow-end-msg-send"
+    assert SEND_BTN_FALLBACK_SEL == ".send-btn-wrapper button"
 
 
 # ------------------------- v0.3.2.1 clipboard paste ------------------------- #
@@ -967,6 +1326,7 @@ async def test_submit_via_ui_pastes_long_prompt_in_single_op(monkeypatch):
     await submit_via_ui(
         page,
         LONG_PROMPT,
+        model="seedance_v2.0_mini",
         ratio="16:9",
         duration=10,
         profile_dir=Path("/tmp/p"),
@@ -981,7 +1341,9 @@ async def test_submit_via_ui_pastes_long_prompt_in_single_op(monkeypatch):
     assert len(write_calls) == 1, (
         f"应只调一次 writeText; 实际 {len(write_calls)} 次"
     )
-    assert write_calls[0] == LONG_PROMPT, "writeText 必须接收完整 prompt"
+    assert write_calls[0] == LONG_PROMPT + "时长10秒，比例16:9", (
+        "writeText 必须完整保留原 prompt，并且只追加一次参数后缀"
+    )
     assert len(write_calls[0]) >= 500, "测试 prompt 应 >= 500 字"
 
     # 2) keyboard.type 整段没被调 —— 否则就把整段按 char type 进去了

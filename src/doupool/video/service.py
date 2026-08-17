@@ -25,7 +25,15 @@ from doupool.watermark import (
 
 from .browser import AEGIS_BLOCKED_MESSAGE, AegisBlocked, TokenBundleUnavailable
 from .cost import quota_cost
-from .protocol import DURATIONS, MAX_I2V_IMAGES, MODELS, RATIOS, TASK_MODES, DoubaoContentRejected, DoubaoRateLimited
+from .protocol import (
+    DURATIONS,
+    FIXED_VIDEO_DURATION_SECONDS,
+    MAX_I2V_IMAGES,
+    MODELS,
+    RATIOS,
+    DoubaoContentRejected,
+    DoubaoRateLimited,
+)
 
 
 # v0.2.16:日志 / DB 时间统一按北京时间,跟 OS 时区解耦
@@ -153,6 +161,7 @@ class VideoTaskService:
         # prompt_list 长度自动决定是否打组。
         group_id: str | None = None,
     ):
+        duration = FIXED_VIDEO_DURATION_SECONDS
         prompt = prompt.strip()
         mode = (mode or "t2v").strip().lower()
         # 兼容: 同时支持单 prompt / prompts 列表
@@ -176,26 +185,18 @@ class VideoTaskService:
                     prompt_list = [prompt]
         if not prompt_list:
             raise ValueError("请输入画面描述")
-        if mode not in TASK_MODES:
-            raise ValueError("不支持的任务类型")
+        if mode != "t2v":
+            raise ValueError("当前版本仅支持文生视频")
         if model not in MODELS or ratio not in RATIOS or duration not in DURATIONS:
             raise ValueError("不支持的视频参数")
+        if images:
+            raise ValueError("当前版本仅支持文生视频")
         if account_id:
             account = Account.get_or_none(Account.id == account_id)
             if not account or not account.enabled or account.status != "active":
                 raise NoAvailableAccount("指定的豆包账号不可用")
 
         image_paths: list[str] = []
-        if mode == "i2v":
-            if not images:
-                raise ValueError("图生视频请至少上传 1 张图片")
-            if len(images) > MAX_I2V_IMAGES:
-                raise ValueError(f"图生视频最多支持 {MAX_I2V_IMAGES} 张图片")
-            if self.assets_dir is None:
-                raise ValueError("图生视频资源目录未配置")
-            image_paths = self._persist_images(images)
-        elif images:
-            raise ValueError("文生视频不支持图片附件")
 
         # 多个 prompt → 同一 group_id,自动归组
         # v0.2.32:caller(手动重试)显式传 group_id 时优先用,沿用原组;
@@ -974,18 +975,6 @@ class VideoTaskService:
         self._schedule_callback(task_id)
 
     async def resume_queued(self) -> None:
-        # v0.2.33:重启后恢复 _pre_charged_tasks —— start() 的 CAS 预扣已落 DB,
-        # 但内存失;如果不在 _pre_charged_tasks 重建记录,_run_inner 会走
-        # update() 闭包的 increment 分支,造成二次扣款。in-flight 任务 = 任何
-        # 还可能被 _schedule 拉起的 status(queued/starting/generating) +
-        # account_id 非空的行 —— 这些都是 start() 走通后被 schedule 的,
-        # 对应一次成功的 CAS 预扣。
-        recovered = self._reconcile_pre_charged_after_restart()
-        if recovered:
-            self.logger.info(
-                "v0.2.33:重启恢复预扣登记表 %d 条", recovered,
-                extra={"event": "video_pre_charge_recovered", "count": recovered},
-            )
         # v0.2.30:启动 sanitize —— 先把"卡 queued 太久"的任务标 failed。
         #
         # 历史 bug:被 cancel 的任务会写 status=queued + error="应用已停止,
@@ -1004,6 +993,23 @@ class VideoTaskService:
                 "v0.2.30:resume_queued 把 %d 条 stale queued 任务标 failed",
                 stale_count,
                 extra={"event": "video_stale_queued_sanitized", "count": stale_count},
+            )
+        # v0.3.6:stale 判断必须在 duration 更新之前做，否则 update_video_task
+        # 会刷新 updated_at，让历史孤儿逃过清理。剩余 queued 再统一规整到
+        # 10 秒，并把旧预扣退掉后按新成本重新 CAS；余额不足就解除账号继续排队。
+        normalized = self._normalize_queued_durations_after_restart()
+        if normalized:
+            self.logger.info(
+                "v0.3.6:启动规整 queued 非 10 秒任务 %d 条",
+                normalized,
+                extra={"event": "video_queued_duration_normalized", "count": normalized},
+            )
+        # 所有启动迁移完成后才恢复登记表并放行 worker，避免 worker 读取半状态。
+        recovered = self._reconcile_pre_charged_after_restart()
+        if recovered:
+            self.logger.info(
+                "v0.2.33:重启恢复预扣登记表 %d 条", recovered,
+                extra={"event": "video_pre_charge_recovered", "count": recovered},
             )
         for task in self.repository.list_queued_video_tasks():
             self._schedule(task.id)
@@ -1042,17 +1048,26 @@ class VideoTaskService:
         count = 0
         for task in stale_tasks:
             try:
-                self.repository.assign_video_task(task.id, None)
-                self.repository.update_video_task(
-                    task.id,
-                    status="failed",
-                    error_message=(
-                        "启动时清理:任务在 queued 状态卡住超过 "
-                        f"{stale_threshold_seconds // 60} 分钟,可能上次"
-                        "应用退出时被中断,已自动作废,请重新提交"
-                    ),
-                    completed_at=datetime.now(SHANGHAI).replace(tzinfo=None),
-                )
+                with self.repository.database.atomic():
+                    # assigned queued 来自 start() 的 CAS 预扣。先退再解绑，
+                    # 否则 account_id 丢失后无法可靠推导退款对象。
+                    if task.account_id:
+                        old_cost = quota_cost(task.model, int(task.duration))
+                        self.repository.decrement_account_quota(
+                            task.account_id, model=task.model, by=old_cost
+                        )
+                    self._pre_charged_tasks.pop(task.id, None)
+                    self.repository.assign_video_task(task.id, None)
+                    self.repository.update_video_task(
+                        task.id,
+                        status="failed",
+                        error_message=(
+                            "启动时清理:任务在 queued 状态卡住超过 "
+                            f"{stale_threshold_seconds // 60} 分钟,可能上次"
+                            "应用退出时被中断,已自动作废,请重新提交"
+                        ),
+                        completed_at=datetime.now(SHANGHAI).replace(tzinfo=None),
+                    )
                 count += 1
             except Exception:
                 self.logger.exception(
@@ -1061,6 +1076,73 @@ class VideoTaskService:
                     extra={"task_id": task.id},
                 )
         return count
+
+    def _normalize_queued_durations_after_restart(self) -> int:
+        """启动时把非 10 秒 queued 任务连同预扣登记原子规整。"""
+        try:
+            queued = list(
+                VideoTask.select().where(
+                    (VideoTask.status == "queued")
+                    & (VideoTask.duration != FIXED_VIDEO_DURATION_SECONDS)
+                )
+            )
+        except Exception:
+            self.logger.exception(
+                "queued duration 查询失败,跳过规整",
+                extra={"event": "video_queued_duration_query_failed"},
+            )
+            return 0
+
+        normalized = 0
+        daily_quotas = self.settings_service.get_daily_quotas()
+        new_cost_by_model: dict[str, int] = {}
+        for snapshot in queued:
+            new_entry: tuple[str, int, str] | None = None
+            try:
+                with self.repository.database.atomic():
+                    task = VideoTask.get_or_none(VideoTask.id == snapshot.id)
+                    if task is None or task.status != "queued":
+                        continue
+                    old_account_id = task.account_id
+                    old_duration = int(task.duration)
+                    self._pre_charged_tasks.pop(task.id, None)
+
+                    if old_account_id:
+                        old_cost = quota_cost(task.model, old_duration)
+                        self.repository.decrement_account_quota(
+                            old_account_id, model=task.model, by=old_cost
+                        )
+                        self.repository.assign_video_task(task.id, None)
+
+                    self.repository.update_video_task(
+                        task.id, duration=FIXED_VIDEO_DURATION_SECONDS
+                    )
+
+                    if old_account_id:
+                        new_cost = new_cost_by_model.setdefault(
+                            task.model,
+                            quota_cost(task.model, FIXED_VIDEO_DURATION_SECONDS),
+                        )
+                        reserved = self._reserve_for_account(
+                            old_account_id,
+                            by=new_cost,
+                            daily_quotas=daily_quotas,
+                        )
+                        if reserved is not None:
+                            self.repository.assign_video_task(task.id, old_account_id)
+                            new_entry = (old_account_id, new_cost, task.model)
+                if new_entry is not None:
+                    self._pre_charged_tasks[snapshot.id] = new_entry
+                normalized += 1
+            except Exception:
+                self.logger.exception(
+                    "queued duration 规整失败: %s", snapshot.id,
+                    extra={
+                        "event": "video_queued_duration_normalize_failed",
+                        "task_id": snapshot.id,
+                    },
+                )
+        return normalized
 
     def _reconcile_pre_charged_after_restart(self) -> int:
         """v0.2.33:进程重启后恢复 _pre_charged_tasks。
@@ -1193,11 +1275,26 @@ class VideoTaskService:
                 return
             # v0.2.9:按 task.model 找对应桶还有额度的账号。
             daily_quotas = self.settings_service.get_daily_quotas()
-            account = task.account if task.account_id else self.repository.choose_available_account(
-                daily_quotas,
-                model=task.model,
-                strategy=settings.get("scheduler_strategy", "least_used"),
-            )
+            if task.account_id:
+                account = task.account
+            else:
+                # queued 无绑定任务必须按本任务完整成本做 CAS 预扣。旧的
+                # choose_available_account 只检查 used < limit，45/50 的账号
+                # 会被 10 秒任务直接扣到 55，固定时长后尤其容易越桶。
+                queued_cost = quota_cost(
+                    task.model, FIXED_VIDEO_DURATION_SECONDS
+                )
+                account = self.repository.choose_and_reserve_account(
+                    daily_quotas,
+                    by=queued_cost,
+                    strategy=settings.get("scheduler_strategy", "least_used"),
+                )
+                if account is not None:
+                    self._pre_charged_tasks[task.id] = (
+                        account.id,
+                        queued_cost,
+                        task.model,
+                    )
             if account is None:
                 # v0.2.12:区分两种 None ——「没有账号」vs 「账号全满」,UI 才能给出准确指引。
                 stats = self.repository.summarize_account_availability(

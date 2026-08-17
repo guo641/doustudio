@@ -11,6 +11,12 @@ vi.mock('../api', () => ({
   ]),
   listVideoTasks,
   createVideoTask,
+  // 模拟老设置库仍返回 5 秒；App 必须忽略并固定提交 10 秒。
+  getSettings: vi.fn().mockResolvedValue({
+    default_model: 'seedance_v2.0_mini',
+    default_ratio: '1:1',
+    default_duration: 5,
+  }),
   startLogin: vi.fn(),
   loginEvents: vi.fn(),
   // v0.3.0:激活闸门 mock —— 不写的话 App.onMounted 卡在 loading,sidebar 永不出现。
@@ -36,19 +42,24 @@ it('creates a text-to-video task from the video task page', async () => {
   await fireEvent.click(await screen.findByText(/视频任务/));
   await fireEvent.click(screen.getByRole('button', { name: '＋ 添加任务' }));
   expect(screen.getByRole('dialog', { name: '添加视频任务' })).toBeTruthy();
+  expect(screen.queryByLabelText('图片')).toBeNull();
+  const durationInput = screen.getByLabelText('时长') as HTMLInputElement;
+  expect(durationInput.value).toBe('10');
+  expect(durationInput.disabled).toBe(true);
   await fireEvent.update(screen.getByLabelText('画面描述'), '一只猫在草地上行走');
   await fireEvent.click(screen.getByRole('button', { name: '添加文生任务' }));
 
   await waitFor(() => expect(createVideoTask).toHaveBeenCalledWith(expect.objectContaining({
     prompt: '一只猫在草地上行走',
     model: 'seedance_v2.0_mini',
-    duration: 5,
+    duration: 10,
     account_id: null,
     mode: 't2v',
+    images: [],
   })));
 });
 
-it('retries a failed task with its original parameters', async () => {
+it('retries a historical text task with its model and ratio but fixed 10 second duration', async () => {
   listVideoTasks.mockResolvedValue([{
     id: 'failed-1', account_name: '莲韵', prompt: '小狗跳舞',
     model: 'seedance_v2.0_mini', ratio: '9:16', duration: 5,
@@ -63,6 +74,6 @@ it('retries a failed task with its original parameters', async () => {
 
   await waitFor(() => expect(createVideoTask).toHaveBeenCalledWith({
     prompt: '小狗跳舞', model: 'seedance_v2.0_mini', ratio: '9:16',
-    duration: 5, account_id: null, mode: 't2v', images: [],
+    duration: 10, account_id: null, mode: 't2v', images: [],
   }));
 });

@@ -29,7 +29,7 @@ def test_settings_defaults_update_and_persist(repository, database_manager, tmp_
     assert defaults["daily_quota_shared"] == 50
     assert defaults["max_concurrency"] == 1
     assert defaults["default_model"] == "seedance_v2.0_mini"
-    assert defaults["default_duration"] == 5
+    assert defaults["default_duration"] == 10
 
     updated = service.update({"daily_quota_shared": 8, "log_level": "DEBUG"})
 
@@ -111,23 +111,23 @@ def test_settings_reject_shared_quota_out_of_range(repository, database_manager,
         service.update({"daily_quota_shared": 101})
 
 
-def test_settings_accept_duration_4_to_10(repository, database_manager, tmp_path):
-    """v0.2.29:豆包接受任意整数 4..10 秒时长(原 {5,10} 太严)。"""
+def test_settings_normalizes_all_duration_updates_to_ten(repository, database_manager, tmp_path):
     service = SettingsService(repository, tmp_path, database_manager.path)
 
-    for d in (4, 5, 6, 7, 8, 9, 10):
+    for d in (4, 5, 6, 7, 8, 9, 10, 11, "bad", None):
         updated = service.update({"default_duration": d})
-        assert updated["default_duration"] == d
+        assert updated["default_duration"] == 10
+        assert repository.get_setting("default_duration", None) == 10
 
 
-def test_settings_reject_duration_out_of_range(repository, database_manager, tmp_path):
-    """v0.2.29:durations <4 或 >10 拒绝。"""
+def test_settings_preserves_but_ignores_legacy_duration_row(
+    repository, database_manager, tmp_path,
+):
     service = SettingsService(repository, tmp_path, database_manager.path)
+    repository.set_setting("default_duration", 5)
 
-    with pytest.raises(ValueError, match="默认时长"):
-        service.update({"default_duration": 3})
-    with pytest.raises(ValueError, match="默认时长"):
-        service.update({"default_duration": 11})
+    assert service.get()["default_duration"] == 10
+    assert repository.get_setting("default_duration", None) == 5
 
 
 def test_task_interval_seconds_default_zero(repository, database_manager, tmp_path):

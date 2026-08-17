@@ -14,6 +14,12 @@ const tasks = [
     result_url: 'https://example.test/video.mp4', quota_used: 2, quota_total: 5,
     created_at: '2026-07-13T11:12:26',
   },
+  {
+    id: 'failed-i2v', account_name: '旧账号', prompt: '历史图生任务',
+    model: 'seedance_v2.0_mini', ratio: '1:1', duration: 5, mode: 'i2v',
+    image_count: 1, status: 'failed', error: '历史任务失败',
+    created_at: '2026-07-13T10:00:00',
+  },
 ];
 
 it('renders and filters the video task table', async () => {
@@ -42,4 +48,6 @@ it('renders and filters the video task table', async () => {
   expect(screen.getByText('rate limited')).toBeTruthy();
   await fireEvent.click(screen.getByRole('button', { name: '重试任务 failed-1' }));
   expect(view.emitted('retry')[0]).toEqual([tasks[0]]);
+  expect(screen.queryByRole('button', { name: '重试任务 failed-i2v' })).toBeNull();
+  expect(screen.getByText('历史图生任务')).toBeTruthy();
 });

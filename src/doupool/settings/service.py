@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from doupool.video.protocol import FIXED_VIDEO_DURATION_SECONDS
+
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
@@ -46,7 +48,7 @@ class SettingsService:
         "quota_reset_time": "00:00",
         "scheduler_strategy": "least_used",
         "default_model": "seedance_v2.0_mini",
-        "default_duration": 5,
+        "default_duration": FIXED_VIDEO_DURATION_SECONDS,
         "default_ratio": "1:1",
         "download_dir": "",
         "log_level": "INFO",
@@ -107,6 +109,8 @@ class SettingsService:
             stored = self.repository.get_setting(key, None)
             if stored is not None:
                 values[key] = stored
+        # 老库中的 default_duration 行原样保留，但 v0.3.6 不再读取其业务值。
+        values["default_duration"] = FIXED_VIDEO_DURATION_SECONDS
         values["data_dir"] = str(self.data_dir)
         return values
 
@@ -124,11 +128,15 @@ class SettingsService:
         return {"shared": int(self.DEFAULTS["daily_quota_shared"])}
 
     def update(self, changes: dict) -> dict:
+        changes = dict(changes)
         current = self.get()
         unknown = set(changes) - set(self.DEFAULTS)
         if unknown:
             raise ValueError(f"不支持的设置：{', '.join(sorted(unknown))}")
+        if "default_duration" in changes:
+            changes["default_duration"] = FIXED_VIDEO_DURATION_SECONDS
         candidate = {**current, **changes}
+        candidate["default_duration"] = FIXED_VIDEO_DURATION_SECONDS
         self._validate(candidate)
         for key, value in changes.items():
             self.repository.set_setting(key, value)
@@ -158,8 +166,8 @@ class SettingsService:
         if values["default_model"] not in {"seedance_v2.0_std", "seedance_v2.0", "seedance_v2.0_mini"}:
             raise ValueError("默认模型无效")
         # v0.2.29:豆包接受任意整数 4..10 秒,放宽白名单。
-        if not 4 <= int(values["default_duration"]) <= 10:
-            raise ValueError("默认时长必须在 4 到 10 秒之间")
+        if int(values["default_duration"]) != FIXED_VIDEO_DURATION_SECONDS:
+            raise ValueError("视频时长固定为 10 秒")
         if values["default_ratio"] not in {"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}:
             raise ValueError("默认比例无效")
         if values["log_level"] not in {"DEBUG", "INFO", "WARNING", "ERROR"}:

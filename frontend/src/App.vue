@@ -7,7 +7,6 @@ import {
   createVideoTask,
   deleteAccount,
   deleteVideoTask,
-  fileToBase64,
   getLicenseStatus,
   getSettings,
   listAccounts,
@@ -91,6 +90,7 @@ const state = ref('');
 const message = ref('');
 const prompt = ref('');
 const model = ref('seedance_v2.0_mini');
+const FIXED_VIDEO_DURATION_SECONDS = 10;
 
 // v0.3.0:激活闸门 —— 'loading' 是首屏瞬间;'valid' 渲染主 UI;
 // 'needs-activation' / 'expired' 渲染 ActivationDialog。
@@ -101,11 +101,7 @@ const licenseInfo = ref<{ fingerprint: string; expires_at: number | null }>({
   expires_at: null,
 });
 const ratio = ref('1:1');
-const duration = ref(5);
-const imageFiles = ref<File[]>([]);
-const imagePreviews = ref<string[]>([]);
-const MAX_I2V_IMAGES = 9;
-const MAX_I2V_BYTES = 15 * 1024 * 1024;
+const duration = ref(FIXED_VIDEO_DURATION_SECONDS);
 // v0.2.21:refreshTasks() 拿来判断「本轮新出现的终态任务」,触发实时刷 accounts。
 const TERMINAL_STATUSES = ['succeeded', 'failed', 'cancelled'] as const;
 let taskTimer: ReturnType<typeof setInterval> | undefined;
@@ -148,14 +144,12 @@ const downloadedResultsCount = computed(
 const allResultsCount = computed(
   () => tasks.value.filter((t) => t.status === 'succeeded').length,
 );
-/** 有图=图生，无图=文生 */
-const submitMode = computed(() => (imageFiles.value.length > 0 ? 'i2v' : 't2v'));
 // v0.2.11:实时算当前文本会被切成几段,给底部 char-hint 显示提示
 const segmentCount = computed(() => splitBySegmentMarkers(prompt.value).length);
 
 const pageMeta: Record<Page, [string, string]> = {
   accounts: ['账号池', '登录与会话管理'],
-  videos: ['视频任务', '文生 / 图生队列'],
+  videos: ['视频任务', '文生视频队列'],
   results: ['生成结果', '无水印视频'],
   logs: ['运行日志', '本地运行记录'],
   settings: ['设置', '应用与调度配置'],
@@ -272,62 +266,12 @@ async function removeAccount(id: string) {
   }
 }
 
-function clearImages() {
-  for (const url of imagePreviews.value) URL.revokeObjectURL(url);
-  imageFiles.value = [];
-  imagePreviews.value = [];
-}
-
-function onImageSelected(event: Event) {
-  const input = event.target as HTMLInputElement;
-  const picked = Array.from(input.files || []);
-  input.value = '';
-  if (!picked.length) return;
-  const room = MAX_I2V_IMAGES - imageFiles.value.length;
-  if (room <= 0) {
-    showToast('failed', `最多上传 ${MAX_I2V_IMAGES} 张图片`);
-    return;
-  }
-  // 前端先按 15MB 过滤,避免大文件先 base64 编码塞进 WebView 进程内存
-  // 后端 service.py:171 也会校验,这里是 belt-and-suspenders 防御。
-  const oversized = picked.filter((file) => file.size > MAX_I2V_BYTES);
-  if (oversized.length) {
-    showToast(
-      'failed',
-      `已跳过 ${oversized.length} 张超大图片(>15MB):${oversized.map((f) => f.name).join(', ')}`,
-    );
-  }
-  const accepted = picked.filter((file) => file.size <= MAX_I2V_BYTES);
-  const next = accepted.slice(0, room);
-  if (accepted.length > room) {
-    showToast('failed', `最多 ${MAX_I2V_IMAGES} 张,已截取前 ${room} 张`);
-  }
-  imageFiles.value = [...imageFiles.value, ...next];
-  imagePreviews.value = [
-    ...imagePreviews.value,
-    ...next.map((file) => URL.createObjectURL(file)),
-  ];
-}
-
-function removeImage(index: number) {
-  const url = imagePreviews.value[index];
-  if (url) URL.revokeObjectURL(url);
-  imageFiles.value = imageFiles.value.filter((_, i) => i !== index);
-  imagePreviews.value = imagePreviews.value.filter((_, i) => i !== index);
-}
-
 function openTaskDialog() {
-  clearImages();
   showTaskDialog.value = true;
 }
 
-/**
- * 关闭/取消 dialog 的统一入口。务必走这里,以便清掉 imageFiles +
- * 释放 blob URL,避免内存泄漏。
- */
 function closeTaskDialog() {
   showTaskDialog.value = false;
-  clearImages();
 }
 
 async function submitVideo() {
@@ -335,22 +279,8 @@ async function submitVideo() {
   // 整段没标记就当一个 prompt,避免用户原文写整段自然语言时被误切。
   const promptSegments = splitBySegmentMarkers(prompt.value);
   if (promptSegments.length === 0) return;
-  if (imageFiles.value.length > MAX_I2V_IMAGES) {
-    showToast('failed', `最多支持 ${MAX_I2V_IMAGES} 张图片`);
-    return;
-  }
   creating.value = true;
   try {
-    const mode = submitMode.value;
-    const images =
-      mode === 'i2v'
-        ? await Promise.all(
-            imageFiles.value.map(async (file) => ({
-              name: file.name,
-              data_base64: await fileToBase64(file),
-            })),
-          )
-        : [];
     // 多段 → 自动归组;单段 → 走原 prompt 字段(向后兼容)
     const isGroup = promptSegments.length > 1;
     const response = await createVideoTask({
@@ -358,24 +288,20 @@ async function submitVideo() {
       prompts: isGroup ? promptSegments : undefined,
       model: model.value,
       ratio: ratio.value,
-      duration: duration.value,
+      duration: FIXED_VIDEO_DURATION_SECONDS,
       account_id: null,
-      mode,
-      images,
+      mode: 't2v',
+      images: [],
     });
     prompt.value = '';
-    clearImages();
     showTaskDialog.value = false;
     // v0.2.35:跨账号凑余额 —— 后端 200 OK + {task, partial_rejected};
     // partial_rejected 非空时告知用户哪几条 prompt 暂时无账号可用、稍后会被自动重试
     const rejected = response?.partial_rejected ?? [];
     const queuedCount = promptSegments.length - rejected.length;
-    let baseMsg =
-      mode === 'i2v'
-        ? `图生任务已加入队列（${images.length} 张图）`
-        : isGroup
-          ? `${promptSegments.length} 段 prompt 已自动归组`
-          : '文生任务已加入队列';
+    let baseMsg = isGroup
+      ? `${promptSegments.length} 段 prompt 已自动归组`
+      : '文生任务已加入队列';
     if (isGroup) {
       baseMsg = `${queuedCount}/${promptSegments.length} 段已入队`;
     }
@@ -412,7 +338,7 @@ async function onDeleteVideoTask(task: VideoTask) {
 
 async function retryVideoTask(task: VideoTask) {
   if ((task.mode || 't2v') !== 't2v') {
-    showToast('failed', '图生视频需重新上传图片，请新建任务');
+    showToast('failed', '当前版本仅支持文生视频');
     return;
   }
   creating.value = true;
@@ -421,7 +347,7 @@ async function retryVideoTask(task: VideoTask) {
       prompt: task.prompt,
       model: task.model,
       ratio: task.ratio,
-      duration: task.duration,
+      duration: FIXED_VIDEO_DURATION_SECONDS,
       account_id: null,
       mode: 't2v',
       images: [],
@@ -443,7 +369,7 @@ function applyDefaults(value: any) {
   if (!value || typeof value !== 'object') return;
   if (value.default_model) model.value = value.default_model;
   if (value.default_ratio) ratio.value = value.default_ratio;
-  if (value.default_duration) duration.value = value.default_duration;
+  duration.value = FIXED_VIDEO_DURATION_SECONDS;
 }
 
 // v0.2.22 Q4:DownloadButton 三层 fallback (cors / no-cors / window.open) 全
@@ -763,30 +689,6 @@ onBeforeUnmount(() => {
       @close="closeTaskDialog"
     >
       <form @submit.prevent="submitVideo">
-        <div class="image-field">
-          <DpField label="图片（可选，最多 9 张）" for-id="video-image">
-            <input
-              id="video-image"
-              class="file-input"
-              type="file"
-              accept="image/png,image/jpeg,image/webp,image/gif"
-              multiple
-              aria-label="图片"
-              @change="onImageSelected"
-            />
-          </DpField>
-          <div v-if="imagePreviews.length" class="image-preview-list">
-            <div v-for="(src, index) in imagePreviews" :key="`${src}-${index}`" class="image-preview-item">
-              <img :src="src" :alt="`图片 ${index + 1}`" />
-              <DpButton size="sm" type="button" @click="removeImage(index)">移除</DpButton>
-            </div>
-          </div>
-          <p class="image-hint">
-            {{ imageFiles.length ? `图生 · 已选 ${imageFiles.length}/${MAX_I2V_IMAGES} 张` : '不传图为文生，传图为图生' }}
-            · png / jpeg / webp / gif · 单张最大 {{ MAX_I2V_BYTES / 1024 / 1024 }}MB
-          </p>
-        </div>
-
         <DpField label="画面描述" for-id="video-prompt">
           <DpTextarea
             id="video-prompt"
@@ -794,11 +696,7 @@ onBeforeUnmount(() => {
             :rows="7"
             :maxlength="5000"
             autofocus
-            :placeholder="
-              imageFiles.length
-                ? '描述图片如何运动、镜头和氛围…'
-                : '描述主体、动作、场景、镜头和光线…\n\n多段 prompt 用「第一段」「第二段」…分隔,自动归到同一组'
-            "
+            placeholder="描述主体、动作、场景、镜头和光线…\n\n多段 prompt 用「第一段」「第二段」…分隔,自动归到同一组"
           />
         </DpField>
         <div class="char-hint">
@@ -816,14 +714,14 @@ onBeforeUnmount(() => {
             </DpSelect>
           </DpField>
           <DpField label="时长" for-id="video-duration">
-            <!-- v0.2.29:豆包接受任意整数 4..10 秒时长,改 number input 代替原白名单 select。 -->
             <DpInput
               id="video-duration"
               v-model.number="duration"
               type="number"
-              :min="4"
-              :max="10"
+              :min="FIXED_VIDEO_DURATION_SECONDS"
+              :max="FIXED_VIDEO_DURATION_SECONDS"
               :step="1"
+              disabled
             />
           </DpField>
           <DpField label="比例" for-id="video-ratio">
@@ -838,7 +736,7 @@ onBeforeUnmount(() => {
         <div class="dialog-actions">
           <DpButton type="button" @click="closeTaskDialog">取消</DpButton>
           <DpButton type="submit" variant="primary" :disabled="creating || !prompt.trim()">
-            {{ creating ? '正在添加…' : imageFiles.length ? '添加图生任务' : '添加文生任务' }}
+            {{ creating ? '正在添加…' : '添加文生任务' }}
           </DpButton>
         </div>
       </form>
@@ -849,48 +747,6 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.image-field {
-  margin-bottom: 14px;
-}
-
-.file-input {
-  width: 100%;
-  padding: 10px;
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--r-md);
-  background: var(--bg-input);
-  color: var(--text-secondary);
-}
-
-.image-hint {
-  margin: 8px 0 0;
-  color: var(--text-faint);
-  font-size: 12px;
-}
-
-.image-preview-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 10px;
-}
-
-.image-preview-item {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-}
-
-.image-preview-item img {
-  width: 72px;
-  height: 72px;
-  object-fit: cover;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: #111;
-}
-
 .char-hint {
   display: flex;
   justify-content: flex-end;

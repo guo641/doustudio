@@ -38,6 +38,7 @@ type Settings = {
   task_interval_seconds: number;
 };
 
+const FIXED_VIDEO_DURATION_SECONDS = 10;
 const settings = ref<Settings | null>(null);
 const message = ref('');
 const saving = ref(false);
@@ -46,7 +47,11 @@ const emit = defineEmits<{ saved: [value: Settings] }>();
 
 onMounted(async () => {
   try {
-    settings.value = await getSettings();
+    const loaded = await getSettings();
+    settings.value = {
+      ...loaded,
+      default_duration: FIXED_VIDEO_DURATION_SECONDS,
+    };
   } catch (e) {
     message.value = e instanceof Error ? e.message : '设置加载失败';
   }
@@ -57,7 +62,14 @@ async function save() {
   saving.value = true;
   try {
     const { data_dir, ...editable } = settings.value;
-    settings.value = await saveSettings(editable);
+    const saved = await saveSettings({
+      ...editable,
+      default_duration: FIXED_VIDEO_DURATION_SECONDS,
+    });
+    settings.value = {
+      ...saved,
+      default_duration: FIXED_VIDEO_DURATION_SECONDS,
+    };
     message.value = '设置已保存';
     emit('saved', settings.value!);
   } catch (e) {
@@ -232,15 +244,16 @@ async function onCheckUpdate() {
           </DpSelect>
         </DpField>
         <DpField label="默认时长" for-id="setting-default-duration">
-          <!-- v0.2.29:豆包接受任意整数 4..10 秒,改 number input 代替原白名单 select。 -->
           <DpInput
             id="setting-default-duration"
             v-model.number="settings.default_duration"
             type="number"
-            :min="4"
-            :max="10"
+            :min="FIXED_VIDEO_DURATION_SECONDS"
+            :max="FIXED_VIDEO_DURATION_SECONDS"
             :step="1"
+            disabled
           />
+          <span class="watermark-hint">当前版本固定生成 10 秒视频。</span>
         </DpField>
         <DpField label="默认比例">
           <DpSelect v-model="settings.default_ratio">

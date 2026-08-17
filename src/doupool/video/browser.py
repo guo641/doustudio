@@ -42,10 +42,33 @@ _VIDEO_TAB_SELECTORS = (
 )
 _VIDEO_TAB_MOUNT_WAIT_MS = 800
 _VIDEO_TAB_RATIO_WAIT_MS = 2_000
-EDITOR_SEL = "div[contenteditable='true']"
-SEND_BTN_SEL = ".send-btn-wrapper button"
-SEND_BTN_FALLBACK_SEL = "button:has(svg path[d^='M4.93934 10.2598'])"
+EDITOR_SEL = "[contenteditable='true'][role='textbox']"
+SEND_BTN_SEL = "#flow-end-msg-send"
+SEND_BTN_FALLBACK_SEL = ".send-btn-wrapper button"
+_SEND_BTN_LEGACY_SVG_SEL = "button:has(svg path[d^='M4.93934 10.2598'])"
 CREATE_IMAGE_URL = "https://www.doubao.com/chat/create-image"
+_NEW_CONVERSATION_SEL = "div[class*='group/sidebar_nav_item']"
+_VIDEO_TOOLBAR_MORE_SEL = "button.skill-bar-button"
+_VIDEO_GENERATION_SKILL_SEL = (
+    "button[data-component-type='skill-item']"
+    "[data-skill-id='skill_bar_button_17']"
+)
+_VIDEO_GENERATION_SKILL_FALLBACK_SEL = "button[data-component-type='skill-item']"
+_VIDEO_MODE_PLACEHOLDER_SEL = "[data-placeholder='描述你想要的视频']"
+_VIDEO_MODE_CHIP_SEL = (
+    "[data-input-engine-action-source='actionbar']"
+    "[data-value='17'][contenteditable='false']"
+)
+_VIDEO_MODEL_BUTTON_SEL = (
+    "button[data-input-engine-actionbar-control-key='video-model']"
+)
+_VIDEO_MODEL_MENU_ITEM_SEL = "[role='menuitem'][data-slot='dropdown-menu-item']"
+_VIDEO_MODE_READY_WAIT_MS = 5_000
+VIDEO_MODEL_LABELS = {
+    "seedance_v2.0_mini": "Seedance 2.0 Mini",
+    "seedance_v2.0_std": "Seedance 2.0 Fast",
+    "seedance_v2.0": "Seedance 2.0",
+}
 _VIDEO_RATIO_OPTIONS = ("3:4", "4:3", "9:16", "16:9", "1:1", "21:9")
 _VIDEO_DURATION_MIN_SECONDS = 4
 _VIDEO_DURATION_MAX_SECONDS = 15
@@ -841,6 +864,17 @@ class AegisBlocked(RuntimeError):
     """检测到 aegis；调用方必须停止任务并释放对应 profile。"""
 
 
+class _AckWaitTimeout(RuntimeError):
+    """提交后没有在时限内收到 /chat/completion 响应。"""
+
+    def __init__(self, timeout: float, *, request_seen: bool) -> None:
+        self.request_seen = request_seen
+        super().__init__(
+            f"等待 /chat/completion 响应超时 ({timeout}s; "
+            f"request_seen={request_seen})"
+        )
+
+
 # v0.3.5.13:保留旧内部名称，避免外部集成/旧测试在升级时导入失败。
 _AegisUnresolvableInPoll = AegisBlocked
 
@@ -947,12 +981,21 @@ async def _ack_interceptor(page: Page):
     race 防御读 `local_message_ids` 用 —— 浏览器侧生成的 id 我们 Python
     侧没法预生成,只能从 server echo 的 ack 里抓。
     """
-    state: dict[str, object] = {}
+    state: dict[str, object] = {"request_seen": False}
+
+    def _on_request(request) -> None:
+        if "/chat/completion" not in request.url:
+            return
+        state["request_seen"] = True
+        state["request_ts"] = time.time()
 
     async def _on_response(response):
         url = response.url
         if "/chat/completion" not in url:
             return
+        # response 存在必然意味着 request 已发出。这个兜底也让只提供
+        # response 事件的测试替身维持真实语义。
+        state["request_seen"] = True
         try:
             text = await response.text()
         except Exception as exc:
@@ -970,10 +1013,15 @@ async def _ack_interceptor(page: Page):
         except Exception:
             pass
 
+    page.on("request", _on_request)
     page.on("response", _on_response)
     try:
         yield state
     finally:
+        try:
+            page.remove_listener("request", _on_request)
+        except Exception:
+            pass
         try:
             page.remove_listener("response", _on_response)
         except Exception:
@@ -991,7 +1039,10 @@ async def _wait_for_ack(state: dict, *, timeout: float = _UI_ACK_WAIT_SECONDS) -
         if "text" in state:
             return str(state["text"])
         await asyncio.sleep(0.1)
-    raise RuntimeError(f"等待 /chat/completion 响应超时 ({timeout}s)")
+    raise _AckWaitTimeout(
+        timeout,
+        request_seen=bool(state.get("request_seen", False)),
+    )
 
 
 def _parse_sse_ack_payload_from_text(text: str) -> dict | None:
@@ -1870,6 +1921,47 @@ async def _click_video_tab_candidate(page: Page, candidate) -> None:
         await candidate.click(timeout=3_000)
     except TypeError:
         await candidate.click()
+
+
+async def _activate_legacy_video_tab(page: Page) -> None:
+    """激活旧页面的视频 TAB，不打开或读取已停用的视频参数菜单。"""
+    errors: list[str] = []
+    seen_candidates: set[tuple] = set()
+    for selector in _VIDEO_TAB_SELECTORS:
+        candidate = await _wait_for_visible_video_tab_candidate(page, selector)
+        if candidate is None:
+            errors.append(f"{selector}:not_found")
+            continue
+        signature = await _video_tab_candidate_signature(candidate)
+        if signature in seen_candidates:
+            errors.append(f"{selector}:duplicate_candidate")
+            continue
+        seen_candidates.add(signature)
+
+        selected = False
+        try:
+            for name, value in (("aria-selected", "true"), ("data-state", "active")):
+                if (await candidate.get_attribute(name)) == value:
+                    selected = True
+                    break
+        except Exception:
+            selected = False
+        if not selected:
+            await _click_video_tab_candidate(page, candidate)
+            await page.wait_for_timeout(_VIDEO_TAB_MOUNT_WAIT_MS)
+        _LOGGER.info(
+            "event=video_legacy_tab_active url=%s selector=%s already_selected=%s",
+            page.url,
+            selector,
+            selected,
+        )
+        return
+
+    visible_tabs = await _visible_video_tab_texts(page)
+    raise RuntimeError(
+        "旧视频 TAB 未找到: "
+        f"当前可见 tabs={visible_tabs}, attempts={errors}, url={page.url}"
+    )
 
 
 async def _video_tab_candidate_signature(candidate) -> tuple:
@@ -2897,39 +2989,248 @@ async def _apply_video_options(
     )
 
 
+def _exact_ui_text(value: str) -> re.Pattern[str]:
+    return re.compile(rf"^\s*{re.escape(value)}\s*$")
+
+
+async def _first_visible_exact_text(page: Page, selector: str, text: str):
+    locator = page.locator(selector).filter(has_text=_exact_ui_text(text))
+    return await _first_visible_locator(locator)
+
+
+async def _wait_for_visible_exact_text(
+    page: Page,
+    selectors: tuple[str, ...],
+    text: str,
+    *,
+    timeout_ms: int = _VIDEO_MODE_READY_WAIT_MS,
+    require_enabled: bool = False,
+):
+    """等待 React 挂载 exact-text 控件，并按 selector 优先级返回首个命中。"""
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    while time.monotonic() < deadline:
+        for selector in selectors:
+            candidate = await _first_visible_exact_text(page, selector, text)
+            if candidate is None:
+                continue
+            if require_enabled:
+                try:
+                    if not await candidate.is_enabled():
+                        continue
+                except Exception:
+                    continue
+            return candidate
+        await asyncio.sleep(0.1)
+    return None
+
+
+async def _wait_for_video_generation_mode_ready(page: Page):
+    """等待视频模式的 placeholder、chip、model 三个标志同时挂载。"""
+    deadline = time.monotonic() + (_VIDEO_MODE_READY_WAIT_MS / 1000)
+    while time.monotonic() < deadline:
+        placeholder = await _first_visible_locator(
+            page.locator(_VIDEO_MODE_PLACEHOLDER_SEL)
+        )
+        chip = await _first_visible_locator(page.locator(_VIDEO_MODE_CHIP_SEL))
+        model_button = await _first_visible_locator(
+            page.locator(_VIDEO_MODEL_BUTTON_SEL)
+        )
+        if placeholder is not None and chip is not None and model_button is not None:
+            try:
+                if (await model_button.inner_text()).strip():
+                    return model_button
+            except Exception:
+                pass
+        await asyncio.sleep(0.1)
+
+    visible_buttons = await _visible_button_texts(page)
+    raise RuntimeError(
+        "视频生成模式未完整挂载:需要 placeholder/chip/model 三项同时可见; "
+        f"url={page.url}; visible_buttons={visible_buttons}"
+    )
+
+
+async def _wait_for_legacy_video_generation_ready(page: Page):
+    """旧 create-image 页面没有 actionbar chip，以 TAB、编辑器和模型作校验。"""
+    deadline = time.monotonic() + (_VIDEO_MODE_READY_WAIT_MS / 1000)
+    while time.monotonic() < deadline:
+        editor = await _first_visible_locator(page.locator(EDITOR_SEL))
+        model_button = await _first_visible_locator(
+            page.locator(_VIDEO_MODEL_BUTTON_SEL)
+        )
+        if editor is not None and model_button is not None:
+            try:
+                model_text = (await model_button.inner_text()).strip()
+                if model_text:
+                    _LOGGER.info(
+                        "event=video_generation_legacy_mode_ready url=%s model=%r",
+                        page.url,
+                        model_text,
+                    )
+                    return model_button
+            except Exception:
+                pass
+        await asyncio.sleep(0.1)
+
+    visible_buttons = await _visible_button_texts(page)
+    raise RuntimeError(
+        "旧视频生成模式未完整挂载:需要已校验的视频 TAB、编辑器和模型控件; "
+        f"url={page.url}; visible_buttons={visible_buttons}"
+    )
+
+
+async def _enter_video_generation_mode(page: Page):
+    """优先走新对话技能菜单，灰度账号缺入口时回退旧视频 TAB。"""
+    new_conversation = await _wait_for_visible_exact_text(
+        page, (_NEW_CONVERSATION_SEL,), "新对话"
+    )
+    if new_conversation is None:
+        raise RuntimeError("左侧「新对话」入口未找到")
+    await new_conversation.click()
+
+    more = await _wait_for_visible_exact_text(
+        page,
+        (_VIDEO_TOOLBAR_MORE_SEL,),
+        "更多",
+        require_enabled=True,
+    )
+    if more is None:
+        raise RuntimeError("输入框工具条「更多」按钮未找到或不可用")
+
+    video_generation = None
+    skill_selectors = (
+        _VIDEO_GENERATION_SKILL_SEL,
+        _VIDEO_GENERATION_SKILL_FALLBACK_SEL,
+    )
+    for menu_attempt in range(2):
+        await more.click()
+        video_generation = await _wait_for_visible_exact_text(
+            page,
+            skill_selectors,
+            "视频生成",
+            require_enabled=True,
+        )
+        if video_generation is not None:
+            break
+        if menu_attempt == 0:
+            _LOGGER.warning(
+                "event=video_generation_menu_reopen url=%s attempt=1",
+                page.url,
+            )
+            await page.keyboard.press("Escape")
+
+    if video_generation is None:
+        try:
+            skill_texts = await page.locator(
+                _VIDEO_GENERATION_SKILL_FALLBACK_SEL
+            ).all_text_contents()
+        except Exception:
+            skill_texts = []
+        _LOGGER.warning(
+            "event=video_generation_menu_missing url=%s skill_texts=%r",
+            page.url,
+            skill_texts,
+        )
+        _LOGGER.warning(
+            "event=video_generation_legacy_tab_fallback url=%s",
+            page.url,
+        )
+        await page.keyboard.press("Escape")
+        await page.goto(
+            CREATE_IMAGE_URL,
+            wait_until="domcontentloaded",
+            timeout=30_000,
+        )
+        await page.wait_for_timeout(1_000)
+        await _activate_legacy_video_tab(page)
+        return await _wait_for_legacy_video_generation_ready(page)
+    await video_generation.click()
+    return await _wait_for_video_generation_mode_ready(page)
+
+
+def _first_text_line(value: str) -> str:
+    return next((line.strip() for line in value.splitlines() if line.strip()), "")
+
+
+async def _find_exact_model_item(page: Page, label: str, *, selected: bool | None = None):
+    items = await _visible_locators(page.locator(_VIDEO_MODEL_MENU_ITEM_SEL))
+    for item in items:
+        try:
+            if _first_text_line(await item.inner_text()) != label:
+                continue
+            if selected is not None:
+                is_selected = (await item.get_attribute("data-selected")) == "true"
+                if is_selected != selected:
+                    continue
+            return item
+        except Exception:
+            continue
+    return None
+
+
+async def _select_video_model(page: Page, model_button, model: str) -> None:
+    """显式选择 task 级模型，并做菜单状态和按钮文本双回读。"""
+    label = VIDEO_MODEL_LABELS.get(model)
+    if label is None:
+        raise RuntimeError(f"不支持的视频模型: {model}")
+
+    await model_button.click()
+    await page.wait_for_timeout(150)
+    item = await _find_exact_model_item(page, label)
+    if item is None:
+        raise RuntimeError(f"视频模型选项未找到: {label}")
+    await item.click()
+    await page.wait_for_timeout(200)
+
+    # Radix 菜单通常在选择后关闭；若仍开着就直接回读，否则重新打开。
+    if not await _visible_locators(page.locator(_VIDEO_MODEL_MENU_ITEM_SEL)):
+        await model_button.click()
+        await page.wait_for_timeout(150)
+    selected_item = await _find_exact_model_item(page, label, selected=True)
+    if selected_item is None:
+        raise RuntimeError(f"视频模型选中状态回读失败: {label}")
+    await page.keyboard.press("Escape")
+    await page.wait_for_timeout(100)
+
+    button_text = " ".join((await model_button.inner_text()).split())
+    if not button_text.endswith(label):
+        raise RuntimeError(
+            f"视频模型按钮回读不一致: expected={label!r}, actual={button_text!r}"
+        )
+
+
+def _build_video_prompt(prompt: str, *, ratio: str, duration: int) -> str:
+    base = prompt.rstrip()
+    separator = "" if base.endswith(("。", "！", "？", ".", "!", "?")) else "。"
+    return f"{base}{separator}时长{duration}秒，比例{ratio}"
+
+
 async def submit_via_ui(
     page: Page,
     prompt: str,
     *,
+    model: str,
     ratio: str,
     duration: int,
     profile_dir: Path,
     update: Callable[..., None],
 ) -> None:
-    """真实 UI 提交:进入视频 tab,应用参数,粘贴 prompt,再点发送。
+    """真实 UI 提交:新对话进入视频生成模式，粘贴参数化 prompt 后发送。
 
     整段在浏览器内执行,绕过 shark_admin 服务端对 page.evaluate POST 的识别。
-    前后两次 aegis 兜底(进入 tab 前 + click send 前)；任一命中即中止。
+    外层 run gate 之外仍保留两次 aegis 兜底；任一命中即中止。
     """
-    # 1. 导航到 create-image 页(已在则 skip,避免重复跳转)
-    if not page.url.startswith(CREATE_IMAGE_URL):
-        await page.goto(CREATE_IMAGE_URL, wait_until="domcontentloaded", timeout=30_000)
-        await page.wait_for_timeout(1_000)  # 等 React mount 完成
+    # 每次提交（含“确认请求未发出”的一次 ACK 重试）都从干净的新会话开始。
+    model_button = await _enter_video_generation_mode(page)
+    await _select_video_model(page, model_button, model)
 
-    # 2. 提交前只读探测；命中后抛 AegisBlocked，禁止继续点击发送。
+    # 模式和 task 级模型确认后做第一轮只读探测。
     await _pre_submit_aegis_gate(page, profile_dir, update)
 
-    # 3. 点视频 tab(create-image 默认是图像 tab),并确认视频内容已挂载。
-    # 切换失败必须在粘贴 prompt 前终止,避免把内容写进错误的图像页。
-    await _click_video_tab(page)
-
-    # 4. 应用任务比例 + 时长,不继承豆包页面默认或 profile 上次状态。
-    await _apply_video_options(page, ratio=ratio, duration=duration)
-
-    # 5. 清空输入框 —— retry 路径 revise 后调用,这里幂等
+    # 清空输入框 —— 内容审核改写和 ACK 未发出重试路径均幂等。
     await clear_prose_mirror(page)
 
-    # 6. 输入 prompt —— v0.3.2.1:改 clipboard paste(不是 keyboard.type)
+    # 输入 prompt —— 仍使用 clipboard paste，不退回 keyboard.type。
     # 原因:
     # - 用户把整段提示词一次给我,需要"一次性贴入",不是一字一字打
     # - keyboard.type(prompt, delay=20) 对 500 字 prompt 要 ~10s 跑完,
@@ -2944,25 +3245,34 @@ async def submit_via_ui(
     # 一组提交,豆包 conversation 页只收到 3 条且 30-37 那段缺失,先确认
     # 究竟是 Python 侧 paste 就贴错了,还是 React app 抢 state 把对的
     # prompt 替成错的。复现一次后即可定位,定位完撤掉这行。
+    submitted_prompt = _build_video_prompt(
+        prompt,
+        ratio=ratio,
+        duration=duration,
+    )
     _LOGGER.info(
         "[v0.3.5.2 DEBUG submit_via_ui] page.url=%s prompt[:80]=%r",
         page.url,
-        prompt[:80],
+        submitted_prompt[:80],
     )
     # writeText 走 page.evaluate —— 必须 launch_persistent_context 已 grant
     # clipboard-read-write 权限(见 _build_launch_kwargs)
     await page.evaluate(
         "(text) => navigator.clipboard.writeText(text)",
-        prompt,
+        submitted_prompt,
     )
     # 给 clipboard 写入一点点时间(MS Edge 偶发 readback 竞速)
     await page.wait_for_timeout(50)
     await page.keyboard.press("Control+V")
     await page.wait_for_timeout(150)  # 等 ProseMirror 同步 internal state
 
-    # 7. 粘贴后、点击发送前再探一次，覆盖弹窗延迟挂载窗口。
+    # 粘贴后、点击发送前再探一次，覆盖弹窗延迟挂载窗口。
     await _pre_submit_aegis_gate(page, profile_dir, update)
-    await try_click(page, (SEND_BTN_SEL, SEND_BTN_FALLBACK_SEL), timeout=5.0)
+    await try_click(
+        page,
+        (SEND_BTN_SEL, SEND_BTN_FALLBACK_SEL, _SEND_BTN_LEGACY_SVG_SEL),
+        timeout=5.0,
+    )
     await page.wait_for_timeout(500)  # 等 POST 真的飞出去
 
 
@@ -3419,19 +3729,43 @@ class PlaywrightVideoRunner:
             # v0.3.5.5:同 profile 仅串行 submit→ACK,避免并发页面拿到同一组
             # conversation/section/question。锁在 poll 前释放,生成仍可并发。
             async with self._submit_ack_lock_for(profile_dir):
-                # 拦截器在 context 内部拿 state,exit 时自动 remove_listener。
-                async with _ack_interceptor(page) as ack_state:
-                    await submit_via_ui(
-                        page,
-                        prompt,
-                        ratio=ratio,
-                        duration=duration,
-                        profile_dir=profile_dir,
-                        update=update,
-                    )
-                    text = await _wait_for_ack(
-                        ack_state, timeout=_UI_ACK_WAIT_SECONDS,
-                    )
+                # 只有明确观察到 completion request **没有发出**时才允许完整
+                # 重走一次新会话提交流程。request 已发出但 ACK 丢失属于歧义
+                # 状态，绝不重发，避免重复生成和重复计费。
+                ack_state: dict[str, object] = {}
+                text = ""
+                for submit_attempt in range(2):
+                    async with _ack_interceptor(page) as ack_state:
+                        await submit_via_ui(
+                            page,
+                            prompt,
+                            model=model,
+                            ratio=ratio,
+                            duration=duration,
+                            profile_dir=profile_dir,
+                            update=update,
+                        )
+                        try:
+                            text = await _wait_for_ack(
+                                ack_state, timeout=_UI_ACK_WAIT_SECONDS,
+                            )
+                        except _AckWaitTimeout:
+                            # 发送动作本身可能触发延迟挂载的 aegis。重试前先
+                            # 做一次只读探测，命中就沿用 fail-fast 释放 profile。
+                            await _handle_aegis_in_poll(
+                                page, profile_dir, update
+                            )
+                            if bool(ack_state.get("request_seen", False)):
+                                raise
+                            if submit_attempt == 0:
+                                _LOGGER.warning(
+                                    "event=video_submit_retry_no_request "
+                                    "profile=%s attempt=1",
+                                    profile_dir,
+                                )
+                                continue
+                            raise
+                    break
             ack = parse_sse_ack(text)
             # v0.3.3 race 防御:浏览器侧 crypto.randomUUID 生成的 id 我们
             # Python 侧拿不到,只能从 server echo 的 SSE_ACK payload 里抽。

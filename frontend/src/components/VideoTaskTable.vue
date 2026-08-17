@@ -195,7 +195,7 @@ function paramsText(task: VideoTaskRow) {
                 去水印失败
               </span>
               <DpButton
-                v-if="task.status === 'failed'"
+                v-if="task.status === 'failed' && (task.mode || 't2v') === 't2v'"
                 size="sm"
                 :aria-label="`重试任务 ${task.id}`"
                 @click="$emit('retry', task)"

@@ -5,6 +5,7 @@ import pytest
 from doupool.video import protocol as protocol_module
 from doupool.video.protocol import (
     EXTRA_CLIENT_META_KEYS,
+    FIXED_VIDEO_DURATION_SECONDS,
     DoubaoContentRejected,
     DoubaoRateLimited,
     _FALLBACK_COOLDOWN_S,
@@ -332,6 +333,11 @@ def _wrap(content_blocks: list[dict]) -> dict:
 _CHAIN_COPYRIGHT_REJECTION = (
     "抱歉，由于版权相关限制，暂时无法创作对应的内容，换其他主题试试吧。"
 )
+
+
+def test_fixed_video_duration_constant_keeps_legacy_protocol_durations():
+    assert FIXED_VIDEO_DURATION_SECONDS == 10
+    assert protocol_module.DURATIONS == set(range(4, 11))
 
 
 def _wrap_chain_envelope(message_fields: dict) -> dict:

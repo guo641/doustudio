@@ -19,7 +19,7 @@ from playwright.sync_api import sync_playwright
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from doupool.db.models import Account, LoginAttempt, utcnow
 from doupool.login.browser_sessions import (
@@ -32,6 +32,7 @@ from doupool.logging.setup import set_log_level
 from doupool.settings.service import DownloadDirPickerUnavailable, open_directory
 from doupool.updater import check_for_update
 from doupool.video.browser import TokenBundleUnavailable, extract_webmssdk_tokens
+from doupool.video.protocol import FIXED_VIDEO_DURATION_SECONDS
 from doupool.video.service import NoAvailableAccount, quota_window
 
 
@@ -47,7 +48,7 @@ class CreateVideoTaskBody(BaseModel):
     prompts: list[str] = Field(default_factory=list, max_length=20)
     model: str = "seedance_v2.0_mini"
     ratio: str = "1:1"
-    duration: int = 5
+    duration: int = FIXED_VIDEO_DURATION_SECONDS
     account_id: str | None = None
     mode: str = "t2v"
     images: list[ImageAttachmentBody] = Field(default_factory=list, max_length=9)
@@ -59,6 +60,17 @@ class CreateVideoTaskBody(BaseModel):
     # 不会漏掉这条新任务。只在手动重试路径传,普通新建留 None 让
     # service 端按 prompt 数量决定是否打组。
     group_id: str | None = None
+
+    @field_validator("duration", mode="before")
+    @classmethod
+    def _normalize_duration(cls, _value) -> int:
+        return FIXED_VIDEO_DURATION_SECONDS
+
+    @model_validator(mode="after")
+    def _t2v_only(self):
+        if self.mode != "t2v" or self.images:
+            raise ValueError("当前版本仅支持文生视频")
+        return self
 
     # v0.2.37.3:`prompts` 列表中每个元素也按 5000 字封顶(单段 prompt),跟
     # 上面的 `prompt` 单值一致。`max_length=20` 是段数上限,这里再加单段字符
@@ -697,6 +709,8 @@ def create_app(
             raise HTTPException(status_code=503, detail="视频服务未启动")
         try:
             payload = body.model_dump()
+            # schema 已规整；路由再守一次，避免后续模型改动绕过固定时长。
+            payload["duration"] = FIXED_VIDEO_DURATION_SECONDS
             payload["images"] = [
                 {"name": item["name"], "data_base64": item["data_base64"]}
                 for item in payload.get("images") or []

@@ -8,6 +8,7 @@ const api = vi.hoisted(() => {
     quota_reset_time: '00:00',
     scheduler_strategy: 'least_used',
     default_model: 'seedance_v2.0_mini',
+    // 模拟旧数据库值；设置页必须规整成固定 10 秒。
     default_duration: 5,
     default_ratio: '1:1',
     download_dir: '/tmp/downloads',
@@ -26,7 +27,7 @@ const api = vi.hoisted(() => {
   listLogs: vi.fn().mockResolvedValue([{ id:1, level:'ERROR', module:'doupool.video', event:'failed', message:'rate limited', created_at:'2026-07-13T12:00:00' }]),
   clearLogs: vi.fn().mockResolvedValue(undefined),
   // v0.2.29:每日额度字段从 daily_quota 改为 daily_quota_shared(共享池)。
-  // max_concurrency 默认 1 保留,default_duration 默认 5 保留。
+  // max_concurrency 默认 1 保留；旧 default_duration=5 用于验证前端规整。
   getSettings: vi.fn().mockImplementation(async () => ({ ...defaultSettings })),
   saveSettings: vi.fn().mockImplementation(async value=>value),
   pickDownloadDir: vi.fn().mockResolvedValue({ path: '/chosen/downloads' }),
@@ -208,7 +209,10 @@ it('saves settings and creates a backup', async () => {
   // 共享池默认值 50(mock 给的)
   await fireEvent.update(quotaInput, '8');
   await fireEvent.click(screen.getByRole('button', { name:'保存设置' }));
-  await waitFor(()=>expect(api.saveSettings).toHaveBeenCalledWith(expect.objectContaining({ daily_quota_shared: 8 })));
+  await waitFor(()=>expect(api.saveSettings).toHaveBeenCalledWith(expect.objectContaining({
+    daily_quota_shared: 8,
+    default_duration: 10,
+  })));
   await fireEvent.click(screen.getByRole('button', { name:'备份数据库' }));
   expect(api.backupDatabase).toHaveBeenCalled();
 });
@@ -232,14 +236,16 @@ it('opens the configured download directory', async () => {
   await waitFor(() => expect(api.openDownloadDir).toHaveBeenCalledWith('/tmp/downloads'));
 });
 
-// v0.2.29:max_concurrency 输入上限 50(default_duration 是 number input 4..10)。
-it('uses 4..10 second number input and exposes 50 concurrency cap', async () => {
+it('locks video duration to 10 seconds and exposes 50 concurrency cap', async () => {
   render(SettingsPage);
   const durationInput = (await screen.findByLabelText('默认时长')) as HTMLInputElement;
   expect(durationInput.type).toBe('number');
-  expect(durationInput.min).toBe('4');
+  expect(durationInput.value).toBe('10');
+  expect(durationInput.disabled).toBe(true);
+  expect(durationInput.min).toBe('10');
   expect(durationInput.max).toBe('10');
   expect(durationInput.step).toBe('1');
+  expect(screen.getByText('当前版本固定生成 10 秒视频。')).toBeTruthy();
 
   const concurrencyInput = (await screen.findByLabelText('全局并发数')) as HTMLInputElement;
   expect(concurrencyInput.max).toBe('50');

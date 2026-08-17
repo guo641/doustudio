@@ -1,6 +1,8 @@
 from fastapi.testclient import TestClient
 from pathlib import Path
 
+import pytest
+
 from doupool.api.app import create_app
 from doupool.login.service import LoginService
 from doupool.settings.service import SettingsService
@@ -116,10 +118,77 @@ def test_create_and_list_video_tasks(repository, tmp_path, temp_profile):
     assert response.status_code == 200
     body = response.json()
     assert body["task"]["status"] == "queued"
+    assert body["task"]["duration"] == 10
     assert body["partial_rejected"] == []
     listed = client.get("/api/video-tasks", headers={"X-DouPool-Token": "secret"})
     assert listed.status_code == 200
     assert listed.json()[0]["account_name"] == "账号一"
+
+
+def test_create_video_task_normalizes_malformed_duration_before_service(
+    repository, tmp_path, temp_profile,
+):
+    from doupool.db.models import Account
+
+    Account.create(
+        id="account-duration",
+        display_name="账号",
+        doubao_user_id="user-duration",
+        profile_dir=temp_profile,
+    )
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login, FakeVideoService(repository)
+    ))
+
+    response = client.post(
+        "/api/video-tasks",
+        headers={"X-DouPool-Token": "secret"},
+        json={
+            "prompt": "固定十秒",
+            "model": "seedance_v2.0_mini",
+            "ratio": "1:1",
+            "duration": {"malformed": True},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task"]["duration"] == 10
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"mode": "i2v", "images": []},
+        {
+            "mode": "t2v",
+            "images": [{"name": "legacy.png", "data_base64": "eA=="}],
+        },
+    ],
+)
+def test_create_video_task_rejects_i2v_and_image_inputs(
+    repository, tmp_path, payload,
+):
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login, FakeVideoService(repository)
+    ))
+    body = {
+        "prompt": "不允许图生",
+        "model": "seedance_v2.0_mini",
+        "ratio": "1:1",
+        **payload,
+    }
+
+    response = client.post(
+        "/api/video-tasks",
+        headers={"X-DouPool-Token": "secret"},
+        json=body,
+    )
+
+    assert response.status_code == 422
+    assert "当前版本仅支持文生视频" in response.text
+    assert repository.list_video_tasks() == []
 
 
 class FakeVideoServicePartialRejected(FakeVideoService):
@@ -230,8 +299,7 @@ def test_settings_round_trip_backup_and_validation(repository, database_manager,
     assert initial["daily_quota_shared"] == 50
     # max_concurrency 默认 1
     assert initial["max_concurrency"] == 1
-    # 默认时长 5 秒(4..10 范围里中位)
-    assert initial["default_duration"] == 5
+    assert initial["default_duration"] == 10
     # 单独更新共享池
     updated = client.put("/api/settings", headers=headers, json={"daily_quota_shared": 7})
     assert updated.status_code == 200
@@ -239,9 +307,13 @@ def test_settings_round_trip_backup_and_validation(repository, database_manager,
     # 并发上限 51 拒
     assert client.put("/api/settings", headers=headers, json={"max_concurrency": 0}).status_code == 422
     assert client.put("/api/settings", headers=headers, json={"max_concurrency": 51}).status_code == 422
-    # 时长 3 / 11 拒(原 {5,10} 太严,现任意整数 4..10)
-    assert client.put("/api/settings", headers=headers, json={"default_duration": 3}).status_code == 422
-    assert client.put("/api/settings", headers=headers, json={"default_duration": 11}).status_code == 422
+    # v0.3.6:任意输入值都规整为固定 10 秒。
+    for value in (3, 11, "bad", None):
+        normalized = client.put(
+            "/api/settings", headers=headers, json={"default_duration": value}
+        )
+        assert normalized.status_code == 200
+        assert normalized.json()["default_duration"] == 10
     # daily_quota_shared 200 拒(范围 1..100)
     assert client.put("/api/settings", headers=headers, json={"daily_quota_shared": 200}).status_code == 422
     backup = client.post("/api/settings/backup", headers=headers)
