@@ -10,85 +10,11 @@ from zoneinfo import ZoneInfo
 
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
-from ..captcha.config import load_credentials as _load_captcha_credentials
-from ..captcha.solver import (
-    AegisCaptchaDisabled as _AegisCaptchaDisabled,
-    AegisCaptchaFailed as _AegisCaptchaFailed,
-    detect_aegis_captcha as _detect_aegis_captcha,
-    is_in_cooldown as _is_captcha_cooldown,
-    make_client as _make_captcha_client,
-    mark_cooldown as _mark_captcha_cooldown,
-    solve_aegis_captcha as _solve_aegis_captcha,
-)
 from .detector import DoubaoIdentity
 from .service import VerifiedLogin
 
 _LOG = logging.getLogger("doupool.login")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-
-
-# v0.3.0:captcha 探测间隔(秒)—— keepalive 期间不能太密,会拖慢 aegis
-# 校验逻辑(它在等用户操作);也不能太疏,会错过弹窗。2s 一探够。
-_CAPTCHA_DETECT_INTERVAL_SECONDS = 2.0
-
-
-def _try_solve_captcha_if_needed(page, account_key: str, on_state) -> bool:
-    """v0.3.0:在 owner thread 同步探测 aegis 弹窗 + 解算。
-
-    返回 True = 本次检测触发了解算(无论成败),False = 没检测到/已 cooldown/
-    凭证不可用。解算后打 cooldown,30 分钟内不再尝试。on_state 只接受三个
-    合法 LoginState 字符串:"captcha_solving" / "keepalive" / "failed"。
-    solver 内部中间状态("uploading"/"dragging"/"verifying")写 _LOG 而不
-    穿透 — 否则会触发 _emit 的 LoginState 校验失败。
-    """
-    if _is_captcha_cooldown(account_key):
-        return False
-    try:
-        kind = _detect_aegis_captcha(page)
-    except Exception as exc:
-        _LOG.debug("aegis detect failed: %s", exc)
-        return False
-    if kind.value == "unknown":
-        return False
-    creds = _load_captcha_credentials()
-    try:
-        client = _make_captcha_client(creds)
-    except _AegisCaptchaDisabled as exc:
-        _LOG.info("aegis detected but captcha disabled: %s", exc)
-        _mark_captcha_cooldown(account_key)
-        return False
-    on_state("captcha_solving", "检测到拖拽验证,正在通过图鉴打码平台处理...")
-    import asyncio
-
-    def _solver_state_log(s: str) -> None:
-        _LOG.info("aegis solver state: %s", s)
-
-    try:
-        try:
-            asyncio.run(
-                _solve_aegis_captcha(
-                    page, client,
-                    on_state=_solver_state_log,
-                )
-            )
-        finally:
-            client.close()
-    except _AegisCaptchaFailed as exc:
-        _LOG.warning("aegis solver failed: %s", exc)
-        _mark_captcha_cooldown(account_key)
-        on_state("failed", f"拖拽验证未通过:{exc}")
-        return True
-    except _AegisCaptchaDisabled as exc:
-        _LOG.warning("aegis solver disabled mid-run: %s", exc)
-        _mark_captcha_cooldown(account_key)
-        on_state("failed", f"打码平台凭证不可用:{exc}")
-        return True
-    else:
-        _LOG.info("aegis solved for account=%s, marking cooldown", account_key)
-        _mark_captcha_cooldown(account_key)
-        on_state("keepalive", "拖拽验证已通过,请继续访问 doubao.com/chat/")
-        return True
-
 
 # v0.2.7:沿 yaonieyo/doubao-account-pool 双轨判定,完全抛弃
 # /passport/web/account/info/ 调用 —— 字节系 aegis 风控会把浏览器外任何
@@ -642,16 +568,12 @@ class PlaywrightLoginRunner:
                 # 真实 Chromium 进程,JS / 渲染照样跑。需要 pump 时我们
                 # 间隔调 active[0].wait_for_timeout(250)。
                 #
-                # v0.3.0:keepalive 期间每 2s 探测 aegis 弹窗 —— 用户在那个
-                # 浏览器里访问 doubao.com/chat/ 时,豆包可能弹出拖拽验证。
-                # 探测到 → 触发图鉴解算,解算完后继续 keepalive。
                 if self.keepalive_seconds > 0 and not cancel_event.is_set():
                     _LOG.info(
                         "login keepalive: 浏览器保持打开 %s 秒,请访问 doubao.com/chat/",
                         self.keepalive_seconds,
                     )
                     end_at = _monotonic() + self.keepalive_seconds
-                    captcha_last_detect_at = 0.0
                     while not cancel_event.is_set():
                         remaining = end_at - _monotonic()
                         if remaining <= 0:
@@ -668,18 +590,6 @@ class PlaywrightLoginRunner:
                         else:
                             # 没有活动 page,context 自动 close 在即 —— 退出
                             break
-                        # v0.3.0:captcha 探测(节流 2s)
-                        now = _monotonic()
-                        if active and (now - captcha_last_detect_at) >= _CAPTCHA_DETECT_INTERVAL_SECONDS:
-                            captcha_last_detect_at = now
-                            try:
-                                _try_solve_captcha_if_needed(
-                                    active[0],
-                                    account_key=str(profile_dir),
-                                    on_state=lambda s, msg: emit(s, msg),
-                                )
-                            except Exception as exc:
-                                _LOG.warning("captcha hook raised: %s", exc)
                     _LOG.info("login keepalive: 窗口已结束")
                 return VerifiedLogin(identity.as_mapping(), str(profile_dir))
             finally:

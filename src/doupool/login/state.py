@@ -17,8 +17,7 @@ class LoginState(StrEnum):
     # doubao.com/chat/ 生成 WebMSSDK token 的窗口。keepalive 结束后
     # 才进入 SUCCEEDED 终态。
     KEEPALIVE = "keepalive"
-    # v0.3.0:豆包 aegis 拖拽验证触发的中间态 —— solver 正在通过图鉴
-    # 打码平台拖滑块让弹窗消失。前端 status 显"正在通过人机验证"。
+    # 历史中间态值保留，兼容旧数据库/事件回放；当前登录流程不再触发。
     CAPTCHA_SOLVING = "captcha_solving"
 
 
@@ -51,8 +50,7 @@ ALLOWED = {
         LoginState.FAILED,
         LoginState.CANCELLED,
         LoginState.TIMED_OUT,
-        # v0.3.0:aegis 弹窗可能出现在 VERIFYING → SUCCEEDED 之间
-        # (e.g. doubao.com/chat/ 加载时弹);失败 → FAILED,成功 → SUCCEEDED
+        # 历史状态转移保留以兼容旧事件；当前登录流程不再进入该状态。
         LoginState.CAPTCHA_SOLVING,
     },
     # v0.2.20:SUCCEEDED 可以暂时转 KEEPALIVE(扫码成功但浏览器还在),
@@ -67,16 +65,15 @@ ALLOWED = {
         LoginState.SUCCEEDED,
         LoginState.FAILED,
         LoginState.CANCELLED,
-        # v0.3.0:keepalive 期间用户访问 doubao.com/chat/ 时 aegis 弹窗
-        # 也可能触发;解决完回到 KEEPALIVE 让浏览器继续开着。
+        # 历史状态转移保留以兼容旧事件；当前 keepalive 不再触发该状态。
         LoginState.CAPTCHA_SOLVING,
     },
-    # 失败/取消/超时已是终态;CAPTCHA_SOLVING 只进不出,失败 → FAILED
+    # 历史状态的终态转移保留以兼容旧事件。
     LoginState.CAPTCHA_SOLVING: {
         LoginState.SUCCEEDED,
         LoginState.FAILED,
         LoginState.CANCELLED,
-        # v0.3.0:solver 成功后回 KEEPALIVE 让浏览器继续开着
+        # 历史成功回转移保留以兼容旧事件。
         LoginState.KEEPALIVE,
     },
 }
@@ -94,4 +91,3 @@ class LoginStateMachine:
         if next_state not in ALLOWED.get(self.state, set()):
             raise InvalidLoginTransition(f"cannot transition {self.state} -> {next_state}")
         self.state = next_state
-

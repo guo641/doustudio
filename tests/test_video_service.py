@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from doupool.db.models import Account
-from doupool.video.browser import TokenBundleUnavailable
+from doupool.video.browser import (
+    AEGIS_BLOCKED_MESSAGE,
+    AegisBlocked,
+    TokenBundleUnavailable,
+)
 from doupool.video.protocol import DoubaoContentRejected, DoubaoRateLimited
 from doupool.video.service import NoAvailableAccount, VideoTaskService
 
@@ -33,6 +37,36 @@ class StaticSettings:
     def get_daily_quotas(self):
         # v0.2.29:repository 期望单一 shared 桶。
         return {"shared": 50}
+
+
+class AegisBlockedRunner:
+    async def run(self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs):
+        raise AegisBlocked(AEGIS_BLOCKED_MESSAGE)
+
+
+@pytest.mark.asyncio
+async def test_service_aegis_blocked_fails_and_refunds_precharge(repository, temp_profile):
+    Account.create(
+        id="account-aegis",
+        display_name="aegis",
+        doubao_user_id="user-aegis",
+        profile_dir=temp_profile,
+    )
+    service = VideoTaskService(
+        repository,
+        AegisBlockedRunner(),
+        StaticSettings(),
+        account_poll_interval=0.01,
+    )
+
+    task, _ = service.start("prompt", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    assert saved.status == "failed"
+    assert saved.error_message == AEGIS_BLOCKED_MESSAGE
+    assert Account.get_by_id("account-aegis").video_quota_used_shared == 0
+    assert task.id not in service._pre_charged_tasks
 
 
 @pytest.mark.asyncio

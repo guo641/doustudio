@@ -23,7 +23,7 @@ from doupool.watermark import (
     resolve_clean_url as zhuceka_resolve,
 )
 
-from .browser import TokenBundleUnavailable
+from .browser import AEGIS_BLOCKED_MESSAGE, AegisBlocked, TokenBundleUnavailable
 from .cost import quota_cost
 from .protocol import DURATIONS, MAX_I2V_IMAGES, MODELS, RATIOS, TASK_MODES, DoubaoContentRejected, DoubaoRateLimited
 
@@ -665,6 +665,18 @@ class VideoTaskService:
             )
         except asyncio.CancelledError:
             raise
+        except AegisBlocked:
+            self.repository.update_video_task(
+                task_id,
+                status="failed",
+                error_message=AEGIS_BLOCKED_MESSAGE,
+            )
+            self.logger.warning(
+                "retry-result 检测到 aegis，已释放账号浏览器",
+                extra={"event": "video_aegis_blocked", "task_id": task_id},
+            )
+            self._schedule_callback(task_id)
+            return
         except Exception as exc:
             self.repository.update_video_task(
                 task_id,
@@ -905,6 +917,18 @@ class VideoTaskService:
                 update,
                 cancellation,
             )
+        except AegisBlocked:
+            self.repository.update_video_task(
+                task_id,
+                status="failed",
+                error_message=AEGIS_BLOCKED_MESSAGE,
+            )
+            self.logger.warning(
+                "retry-result 检测到 aegis，已释放账号浏览器",
+                extra={"event": "video_aegis_blocked", "task_id": task_id},
+            )
+            self._schedule_callback(task_id)
+            return
         except Exception as exc:
             # recheck_result 抛错 = 远端确实没 result / 网络挂了 / 风控拒了
             # 回退到 previous_status(原本可能是 succeeded),不强行标 failed。
@@ -1403,6 +1427,24 @@ class VideoTaskService:
                         )
                     # v0.2.9:succeeded 后异步发 callback —— 拿到最新 task 行
                     # (含 result_url / clean_video_url)再发,前端收到时就能直接用。
+                    self._schedule_callback(task_id)
+                    return
+                except AegisBlocked:
+                    refund_quota_if_recorded()
+                    self.repository.update_video_task(
+                        task_id,
+                        status="failed",
+                        error_message=AEGIS_BLOCKED_MESSAGE,
+                        completed_at=datetime.now(SHANGHAI).replace(tzinfo=None),
+                    )
+                    self.logger.warning(
+                        "检测到 aegis，任务停止并已释放账号浏览器",
+                        extra={
+                            "event": "video_aegis_blocked",
+                            "account_id": account.id,
+                            "task_id": task_id,
+                        },
+                    )
                     self._schedule_callback(task_id)
                     return
                 except TokenBundleUnavailable as exc:

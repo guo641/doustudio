@@ -26,11 +26,6 @@ const api = vi.hoisted(() => ({
     default_timeout_minutes: 7,
     // v0.2.34:并发任务间隔(秒)—— SettingsPage 新增字段。
     task_interval_seconds: 0,
-    // v0.3.1.1:图鉴打码平台凭证字段 —— 之前 SettingsPage 没暴露,solver
-    // 拿不到,aegis 弹窗挂着没人解。补上后前端能输入,后端 solver 才能用。
-    ttshitu_username: '',
-    ttshitu_password: '',
-    ttshitu_enabled: false,
   }),
   saveSettings: vi.fn().mockImplementation(async value=>value),
   backupDatabase: vi.fn().mockResolvedValue({ path:'/tmp/backup.sqlite3' }),
@@ -225,24 +220,10 @@ it('uses 4..10 second number input and exposes 50 concurrency cap', async () => 
   expect(concurrencyInput.max).toBe('50');
 });
 
-// v0.3.1.1:图鉴打码平台凭证 —— 后端 solver 已就绪,但前端从未暴露入口,
-// 补 UI 后 solver 才能拿凭证解开 aegis 弹窗。
-it('enables ttshitu solver from SettingsPage', async () => {
+it('does not expose removed ttshitu settings', async () => {
   render(SettingsPage);
-  const enabledBox = (await screen.findByLabelText('启用图鉴打码')) as HTMLInputElement;
-  const usernameBox = (await screen.findByLabelText('图鉴用户名')) as HTMLInputElement;
-  const passwordBox = (await screen.findByLabelText('图鉴密码')) as HTMLInputElement;
-  expect(enabledBox.type).toBe('checkbox');
-  expect(enabledBox.checked).toBe(false);
-  expect(passwordBox.type).toBe('password');
-
-  await fireEvent.click(enabledBox);
-  await fireEvent.update(usernameBox, 'demo-user');
-  await fireEvent.update(passwordBox, 'demo-pass');
-  await fireEvent.click(screen.getByRole('button', { name:'保存设置' }));
-  await waitFor(()=>expect(api.saveSettings).toHaveBeenCalledWith(expect.objectContaining({
-    ttshitu_enabled: true,
-    ttshitu_username: 'demo-user',
-    ttshitu_password: 'demo-pass',
-  })));
+  await screen.findByText('文件与日志');
+  expect(screen.queryByLabelText('启用图鉴打码')).toBeNull();
+  expect(screen.queryByLabelText('图鉴用户名')).toBeNull();
+  expect(screen.queryByLabelText('图鉴密码')).toBeNull();
 });

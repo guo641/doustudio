@@ -21,6 +21,23 @@ def test_settings_defaults_update_and_persist(repository, database_manager, tmp_
     assert SettingsService(repository, tmp_path, database_manager.path).get()["log_level"] == "DEBUG"
 
 
+def test_legacy_ttshitu_rows_are_preserved_but_ignored(
+    repository, database_manager, tmp_path,
+):
+    repository.set_setting("ttshitu_username", "legacy-user")
+    repository.set_setting("ttshitu_password", "legacy-password")
+    repository.set_setting("ttshitu_enabled", True)
+
+    service = SettingsService(repository, tmp_path, database_manager.path)
+    values = service.get()
+
+    assert "ttshitu_username" not in values
+    assert "ttshitu_password" not in values
+    assert "ttshitu_enabled" not in values
+    with pytest.raises(ValueError, match="ttshitu_enabled"):
+        service.update({"ttshitu_enabled": False})
+
+
 def test_settings_reject_invalid_values(repository, database_manager, tmp_path):
     service = SettingsService(repository, tmp_path, database_manager.path)
 

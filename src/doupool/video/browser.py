@@ -18,21 +18,10 @@ from pathlib import Path
 from playwright.async_api import BrowserContext, Page, async_playwright
 
 from ..prompt_reviser import classify_failure, revise_prompt
-from ..captcha.solver import (
-    AegisCaptchaDisabled as _AegisCaptchaDisabled,
-    AegisCaptchaFailed as _AegisCaptchaFailed,
-    detect_aegis_captcha as _detect_aegis_captcha,
-    is_in_cooldown as _captcha_is_in_cooldown,
-    make_client as _make_captcha_client,
-    mark_cooldown as _captcha_mark_cooldown,
-    probe_aegis_quickly as _probe_aegis_quickly,
-    solve_aegis_captcha as _solve_aegis_captcha,
-)
-from ..captcha.config import load_credentials as _load_captcha_credentials
+from .aegis_probe import aegis_popup_present
 from .protocol import (
     EXTRA_CLIENT_META_KEYS,
     DoubaoContentRejected,
-    DoubaoRateLimited,
     build_completion_payload,
     find_creation_directory,
     find_video_node,
@@ -40,14 +29,6 @@ from .protocol import (
     parse_sse_ack,
     parse_download_info,
 )
-
-# v0.3.1.2:video runner 在 page.goto 之后、提交之前等弹窗出现的最长时间。
-# aegis 弹窗通常在 navigation 后 1-3s 渲染;4s 缓冲。
-_CAPTCHA_DETECT_WAIT_BEFORE_SUBMIT_SECONDS = 4.0
-# v0.3.1.3(去掉):用户实测 aegis 实际在「开始生成视频时」弹,不在 page.goto 后。
-# pre-submit hook 等 4s 经常空等,真正起作用的是 poll 期间的 hook;把后者挪到
-# chain 请求之前 + 去掉每 3 轮节流,改成每次 poll 都探。captcha 探本身是纯 DOM
-# 查询(几十 ms),不会拖慢 timeout。_CAPTCHA_DETECT_INTERVAL_POLLS 常量删除。
 
 # v0.3.2:UI click 路径 selector 常量。类名稳定优先,SVG path 兜底。
 # 视频 tab 用 a11y role + 文本(豆包前端 aria 标签就是「视频」)。
@@ -130,20 +111,12 @@ _VIDEO_OPTIONS_CLOSE_WAIT_MS = 1_500
 _VIDEO_OPTIONS_CLOSED_STABLE_MS = 200
 _VIDEO_OPTIONS_TRIGGER_WAIT_MS = 3_000
 _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS = 4
-# v0.3.2.3:UI click 路径下的弹窗缓冲。**经验值**(用户在 v0.3.2.2 反馈):
-# 实测 aegis 弹窗在 navigate 后 3-5s 才会出现,v0.3.2.2 用的 2s 经常空等,
-# 然后 POST 立即飞出 + 弹窗刚好弹 → shark_admin 拒绝。所以 submit 前必须
-# 给弹窗足够的"出现窗口",而且必须确认弹窗消失后才能点 send。
-_UI_CAPTCHA_WAIT_SECONDS = 6.0  # 弹窗出现最长的等待(用户实测 3-5s)
-_UI_CAPTCHA_VERIFY_GONE_SECONDS = 4.0  # 解完后等弹窗彻底消失的轮询窗口
-_UI_CAPTCHA_DETECT_POLL_INTERVAL = 0.5  # 弹窗轮询间隔
+# UI click 路径下的弹窗缓冲。实测 aegis 弹窗在导航后 3-5s 才出现，
+# 因此提交前保留完整探测窗口；命中后立即中止，不再自动求解。
+_UI_AEGIS_WAIT_SECONDS = 6.0  # 弹窗出现最长的等待(用户实测 3-5s)
+_UI_AEGIS_DETECT_POLL_INTERVAL = 0.5  # 弹窗轮询间隔
 # 拦截 /chat/completion 响应的最长时间,跟 click → POST → SSE 飞出去对齐
 _UI_ACK_WAIT_SECONDS = 30.0
-
-# v0.3.2.5:shark_admin 拒绝 → 不关浏览器 → 等滑块 → 图鉴拖 → 重提 的循环上限。
-# 用户实测触发后通常 1 次 solve + retry 就能过,但同一账号连续 2 次都过不了时
-# 应直接失败,免得无限循环浪费 token / 额度。2 次足够覆盖偶发网络抖动。
-_MAX_RISK_RETRY = 2
 
 # v0.2.22:模块级 logger,retry loop 用 warn 级记「revise 重试」事件
 _LOGGER = logging.getLogger(__name__)
@@ -848,329 +821,50 @@ async def _handle_aegis_in_poll(
     profile_dir: Path,
     update: Callable[..., None],
 ) -> bool:
-    """v0.3.4:poll 循环里碰到 aegis 弹窗时的统一处理入口。
-
-    设计目标:
-      - 不被 cooldown 短路(廉价探测必须每次跑)
-      - 凭证可用 + 未在 cooldown → 调完整 solver 求解
-      - 凭证不可用 / 已 cooldown → **fail-fast**,不浪费 30 分钟盲飞
-        (用户原话:"我在后台看到视频已经生成成功了,你特么还卡在生成中")
-
-    返回:
-      True  = 探测到弹窗并**已解决**(solver 跑通),调用方继续 poll
-      False = 未探测到弹窗,调用方继续 poll
-      raise  AegisCaptchaUnresolvable = 探测到但**无法自动解**
-              (凭证关 / 已 cooldown),调用方应终止任务
-
-    与 `_try_solve_captcha_in_video` 的关系:
-      本函数是 poll 专用入口,内部仍可能调 `_try_solve_captcha_in_video`
-      做求解(它会走 cooldown),但探测 + fail-fast 决策由本函数负责。
-    """
-    if not await _probe_aegis_quickly(page):
+    """轮询期只读探测 aegis；命中后立即中止当前 profile 的任务。"""
+    del profile_dir
+    if not await aegis_popup_present(page):
         return False
-
-    # 探测到了 → 先看凭证能不能用
-    creds = _load_captcha_credentials()
-    client = None
     try:
-        client = _make_captcha_client(creds)
-    except _AegisCaptchaDisabled as exc:
-        # 凭证不可用 —— 整个 ~35 分钟视频生成都要被这个 popup 挡住,
-        # 早 fail 早让用户知道,别让任务挂"生成中"直到超时。
-        _LOGGER.warning(
-            "aegis popup detected during poll but credentials unusable: %s; "
-            "failing task fast instead of polling blind",
-            exc,
-        )
-        _captcha_mark_cooldown(str(profile_dir))
-        try:
-            update(error_message=(
-                f"aegis 拖拽验证已弹出,但图鉴打码凭证未配置或已停用({exc})。"
-                "请在 Settings → 图鉴打码平台填写凭证并启用,或手动在浏览器中拖动验证后重新提交任务。"
-            ))
-        except Exception:
-            pass
-        raise _AegisUnresolvableInPoll(
-            "aegis drag captcha blocking poll loop; captcha credentials not configured"
-        ) from exc
-
-    # 凭证可用 → 立即关掉 client(只需要 make_client 用来检查可不可用,
-    # 真正的 solver 会自己构造 client)。然后调老 solver。
-    if client is not None:
-        try:
-            client.close()
-        except Exception:
-            pass
-    return await _try_solve_captcha_in_video(
-        page, profile_dir, update, wait_for_popup_seconds=0.0,
-    )
+        update(error_message=AEGIS_BLOCKED_MESSAGE)
+    except Exception:
+        pass
+    raise AegisBlocked(AEGIS_BLOCKED_MESSAGE)
 
 
-class _AegisUnresolvableInPoll(RuntimeError):
-    """v0.3.4:poll 循环里 aegis 弹窗持续挂着但客户端无法自动解。
-    抛这个让上层 service 把任务标 failed + 退额度。"""
+AEGIS_BLOCKED_MESSAGE = "当前任务已停止，请在账号管理中打开该账号浏览器完成验证后重提"
 
 
-async def _try_solve_captcha_in_video(
-    page: Page,
-    profile_dir: Path,
-    update: Callable[..., None],
-    *,
-    wait_for_popup_seconds: float = 0.0,
-) -> bool:
-    """v0.3.1.2:video runner 路径的 captcha hook —— 与 login 的
-    `_try_solve_captcha_if_needed` 不同,这里是 async,跑在 video runner
-    的事件循环里。**不能**套 `asyncio.run`(login 那样),否则会
-    "asyncio.run() cannot be called from a running event loop"。
+class AegisBlocked(RuntimeError):
+    """检测到 aegis；调用方必须停止任务并释放对应 profile。"""
 
-    `wait_for_popup_seconds`:
-      - 0 = poll 路径,弹窗已在(刚 detect 到)就解
-      - > 0 = 提交前,先等 N 秒让弹窗出现再 detect
 
-    返回 True = 本次调用尝试解过(无论成败),False = cooldown/无弹窗。
-    **失败/异常一律吞掉不 raise** —— 让 task 继续走原有失败路径。
-    aegis 弹窗还在 / 图鉴坏了 / 凭证关掉 / 网络挂了,都不会挂掉 task,
-    只是把 cooldown 标上,防止短时间内反复调图鉴 API 浪费钱。
-
-    account_key = `str(profile_dir)`,与 login 路径用同一份,共享 30 分钟
-    cooldown —— login keepalive 刚解完 / video 刚解完,两边都自动跳过。
-    """
-    account_key = str(profile_dir)
-    if _captcha_is_in_cooldown(account_key):
-        return False
-
-    if wait_for_popup_seconds > 0:
-        try:
-            await asyncio.sleep(wait_for_popup_seconds)
-        except Exception:
-            return False
-
-    try:
-        kind = await _detect_aegis_captcha(page)
-    except Exception as exc:
-        _LOGGER.debug("aegis detect failed: %s", exc)
-        return False
-    if kind.value == "unknown":
-        return False
-
-    creds = _load_captcha_credentials()
-    try:
-        client = _make_captcha_client(creds)
-    except _AegisCaptchaDisabled as exc:
-        _LOGGER.info("aegis detected but captcha disabled: %s", exc)
-        _captcha_mark_cooldown(account_key)
-        try:
-            update(error_message=f"检测到拖拽验证,但图鉴打码未启用或凭证缺失,任务将按豆包原流程处理({exc})")
-        except Exception:
-            pass
-        return True
-
-    def _on_state(s: str) -> None:
-        msg = {
-            "uploading": "正在通过图鉴打码平台识别拖拽验证",
-            "dragging": "正在拟人拖拽通过验证",
-            "verifying": "等待 aegis 校验结果",
-            "ok": "拖拽验证已通过,继续提交任务",
-            "failed": "拖拽验证未通过,任务将按豆包原流程处理",
-        }.get(s, f"图鉴解算:{s}")
-        _LOGGER.info("video captcha state: %s", s)
-        try:
-            update(error_message=msg)
-        except Exception:
-            pass
-
-    try:
-        try:
-            await _solve_aegis_captcha(page, client, on_state=_on_state)
-        finally:
-            client.close()
-    except _AegisCaptchaFailed as exc:
-        _LOGGER.warning("aegis solver failed in video path: %s", exc)
-        _captcha_mark_cooldown(account_key)
-        try:
-            update(error_message=f"图鉴自动解算失败({exc}),任务将按豆包原流程处理")
-        except Exception:
-            pass
-        return True
-    except _AegisCaptchaDisabled as exc:
-        _LOGGER.warning("aegis solver disabled mid-run: %s", exc)
-        _captcha_mark_cooldown(account_key)
-        try:
-            update(error_message=f"图鉴打码平台凭证失效({exc})")
-        except Exception:
-            pass
-        return True
-    except Exception:  # noqa: BLE001
-        _LOGGER.exception("aegis solver unexpected error in video path")
-        _captcha_mark_cooldown(account_key)
-        return True
-    else:
-        _LOGGER.info("aegis solved for video account=%s, marking cooldown", account_key)
-        _captcha_mark_cooldown(account_key)
-        try:
-            update(error_message="拖拽验证已通过,继续提交任务")
-        except Exception:
-            pass
-        return True
+# v0.3.5.13:保留旧内部名称，避免外部集成/旧测试在升级时导入失败。
+_AegisUnresolvableInPoll = AegisBlocked
 
 
 async def _pre_submit_aegis_gate(
     page: Page,
     profile_dir: Path,
     update: Callable[..., None],
-) -> bool:
-    """v0.3.2.4:提交前的**阻塞式** aegis 网关。
-
-    用户反馈(v0.3.2.3,v0.3.2.4):
-      「提示词粘贴进去,刚提交,滑块弹窗刚出现,窗口就被自动关闭了。
-       应该是软件把滑块认定为问题,直接关闭了窗口。」
-
-    根因:`submit_via_ui` step 2 用 `_UI_CAPTCHA_WAIT_SECONDS = 2.0s` 等弹窗。
-    实测 aegis 弹窗在 navigation 后 3-5s 才会出现,所以:
-      - 2s 等待期内没有弹窗 → step 6 直接点 send
-      - POST 飞出去 → 弹窗刚好在 POST 中出现
-      - 服务端 shark_admin 看到「非真人触发」(因为 aegis 弹窗挂在前面挡 submit)→ 拒绝
-      - 弹窗还在挂着 → 用户看到「弹窗刚出现就关」(其实是 aegis 超时自动收起)
-      - 用户感觉「软件主动关了窗口」
-
-    本 helper 改阻塞式轮询:
-      1. cooldown 检查:在冷却期直接放行(已解过别浪费)
-      2. 轮询 detect aegis 弹窗(每 0.5s 一次,最多 6s —— 用户实测窗口 3-5s)
-      3. 探测到 → 调 `solve_aegis_captcha` 拖
-      4. 解完后,**轮询确认弹窗彻底消失**(每 0.5s,最多 4s)
-      5. 弹窗仍在 / 解失败 / 异常 → 返 False,**阻止** click send
-         (防 POST + 弹窗撞车 → shark_admin 拒 → 浪费视频额度)
-
-    返回 True = 放行(可以点 send)/ False = 网关拒绝(上层 raise 阻止 submit)。
-
-    **v0.3.2.4 重要修正**:solver 失败 / 凭证关 / 异常统一返 False,**不**
-    再「降级放行让 submit 撞弹窗」。原因:
-      - 降级放行 = POST 撞弹窗 = shark_admin 拒 = 视频额度被扣 + 任务失败
-      - 阻止 submit = 30 分钟 cooldown 保护 + 任务标失败但**不退额度**
-        (用户没提交成功就不会进 chain poll,链上不会有扣费记录)
-      - 阻断告诉用户「拖拽未通过,稍后重试」比 shark_admin 莫大扣费更友好
-
-    **v0.3.2.4 第 2 处修正**:本 helper 现在**也用于 paste 之后** (submit_via_ui
-    step 6 替换为再次调本 helper,等 6s + 解 + 验证消失,而不是 fire-and-forget)。
-    实测中 aegis 弹窗有时在 submit 前没起,在 paste / click send 之间才挂上,
-    这种 case v0.3.2.3 的「step 2 单点拦截」覆盖不到,必须 step 6 再拦一次。
-
-    cooldown 复用:`str(profile_dir)` 与 login 路径共享同一份 30min dict,
-    login keepalive 刚解完 → video 路径立即放行。
-    """
-    account_key = str(profile_dir)
-    if _captcha_is_in_cooldown(account_key):
-        # login / 上次 video 路径 30min 内已解过 — 直接放行
-        _LOGGER.debug("aegis gate: account=%s in cooldown, allow submit", account_key)
-        return True
-
-    # Step 1:轮询 detect aegis 弹窗(最多 6s,实测窗口 3-5s)
-    popup_present = False
-    deadline = time.monotonic() + _UI_CAPTCHA_WAIT_SECONDS
-    last_kind = None
+) -> None:
+    """提交前轮询 aegis；无弹窗放行，命中则立即中止。"""
+    del profile_dir
+    deadline = time.monotonic() + _UI_AEGIS_WAIT_SECONDS
     while time.monotonic() < deadline:
         try:
-            kind = await _detect_aegis_captcha(page)
+            popup_present = await aegis_popup_present(page)
         except Exception as exc:
             _LOGGER.debug("aegis gate detect failed: %s", exc)
-            kind = None
-        if kind is not None and kind.value != "unknown":
-            popup_present = True
-            last_kind = kind
-            break
-        await asyncio.sleep(_UI_CAPTCHA_DETECT_POLL_INTERVAL)
-
-    if not popup_present:
-        # 探测期内无弹窗 — 好事,放行
-        _LOGGER.debug("aegis gate: no popup within %.1fs, allow submit", _UI_CAPTCHA_WAIT_SECONDS)
-        return True
-
-    # Step 2:弹窗已挂上,调 solver 拖
-    _LOGGER.info("aegis gate: popup=%s detected, solving", last_kind)
-    try:
-        update(error_message="提交前检测到拖拽验证,正在通过图鉴打码平台识别")
-    except Exception:
-        pass
-
-    creds = _load_captcha_credentials()
-    try:
-        client = _make_captcha_client(creds)
-    except _AegisCaptchaDisabled as exc:
-        _LOGGER.warning("aegis gate: solver disabled: %s", exc)
-        # v0.3.2.4:凭证关也返 False — 别让 POST 撞弹窗浪费额度
-        _captcha_mark_cooldown(account_key)
-        try:
-            update(error_message=f"图鉴凭证未配置或已停用({exc}),暂不提交以免扣额度")
-        except Exception:
-            pass
-        return False
-
-    def _on_state(s: str) -> None:
-        msg = {
-            "uploading": "图鉴正在识别拖拽图...",
-            "dragging": "图鉴正在拖动滑块...",
-            "verifying": "等待 aegis 校验拖拽结果...",
-            "ok": "拖拽已通过,等待弹窗消失",
-            "failed": "图鉴解算失败",
-        }.get(s, f"图鉴:{s}")
-        try:
-            update(error_message=msg)
-        except Exception:
-            pass
-
-    try:
-        try:
-            await _solve_aegis_captcha(page, client, on_state=_on_state)
-        finally:
-            client.close()
-    except (_AegisCaptchaFailed, _AegisCaptchaDisabled) as exc:
-        _LOGGER.warning("aegis gate solver failed: %s", exc)
-        _captcha_mark_cooldown(account_key)
-        # v0.3.2.4:解失败也返 False — 不再放行让 POST 撞弹窗
-        try:
-            update(error_message=f"图鉴解算失败({exc}),暂不提交以免扣额度")
-        except Exception:
-            pass
-        return False
-    except Exception:  # noqa: BLE001
-        _LOGGER.exception("aegis gate solver unexpected error")
-        _captcha_mark_cooldown(account_key)
-        try:
-            update(error_message="图鉴解算异常,暂不提交以免扣额度")
-        except Exception:
-            pass
-        return False
-
-    # Step 3:解完后轮询确认弹窗彻底消失(最多 4s)
-    gone_deadline = time.monotonic() + _UI_CAPTCHA_VERIFY_GONE_SECONDS
-    while time.monotonic() < gone_deadline:
-        try:
-            kind = await _detect_aegis_captcha(page)
-        except Exception:
-            kind = None
-        if kind is None or kind.value == "unknown":
-            # 弹窗消失 — 放行
-            _LOGGER.info(
-                "aegis gate: popup gone after %.2fs, allow submit",
-                _UI_CAPTCHA_VERIFY_GONE_SECONDS - (gone_deadline - time.monotonic()),
-            )
+            popup_present = False
+        if popup_present:
             try:
-                update(error_message="拖拽验证已通过,正在提交任务")
+                update(error_message=AEGIS_BLOCKED_MESSAGE)
             except Exception:
                 pass
-            return True
-        await asyncio.sleep(_UI_CAPTCHA_DETECT_POLL_INTERVAL)
-
-    # Step 4:解完后 4s 弹窗仍在 — **不放行**(防止 POST + 弹窗撞车触发 shark_admin)
-    _LOGGER.error(
-        "aegis gate: popup still present after solve within %.1fs, blocking submit",
-        _UI_CAPTCHA_VERIFY_GONE_SECONDS,
-    )
-    try:
-        update(error_message="拖拽验证后弹窗未消失,暂不提交,稍后重试")
-    except Exception:
-        pass
-    return False
+            raise AegisBlocked(AEGIS_BLOCKED_MESSAGE)
+        await asyncio.sleep(_UI_AEGIS_DETECT_POLL_INTERVAL)
+    _LOGGER.debug("aegis gate: no popup within %.1fs, allow submit", _UI_AEGIS_WAIT_SECONDS)
 
 
 # v0.3.2:真实 UI click 路径的核心 helper —— 替换掉 `page.evaluate(fetch /chat/completion)`。
@@ -1185,8 +879,8 @@ async def try_click(
 ) -> None:
     """v0.3.2:按 selector 顺序试,首个可见 + 可点击的就点。
 
-    行为参考 captcha/solver.py 的 `_find_element_box` 模式:
-    locator().first.wait_for(state='visible') → bounding_box → mouse.move/down/up。
+    使用 locator().first.wait_for(state='visible') → bounding_box →
+    mouse.move/down/up 的真人点击路径。
     click 间隔用 random.randint(0, 80) 抖动 50-130ms,防止 aegis 时序风控
     识别出「匀速间隔 = 自动化」。click 后再 wait_for_timeout(150) 让 React
     处理完 click event,否则立刻读 ProseMirror 可能拿到旧节点。
@@ -2779,24 +2473,15 @@ async def submit_via_ui(
     """真实 UI 提交:进入视频 tab,应用参数,粘贴 prompt,再点发送。
 
     整段在浏览器内执行,绕过 shark_admin 服务端对 page.evaluate POST 的识别。
-    前后两次 aegis 兜底(进入 tab 前 + click send 前),wait 2s / 0s;
-    cooldown 自动跳过(30min 复用 login 路径的同一份 _captcha_cooldown dict)。
+    前后两次 aegis 兜底(进入 tab 前 + click send 前)；任一命中即中止。
     """
     # 1. 导航到 create-image 页(已在则 skip,避免重复跳转)
     if not page.url.startswith(CREATE_IMAGE_URL):
         await page.goto(CREATE_IMAGE_URL, wait_until="domcontentloaded", timeout=30_000)
         await page.wait_for_timeout(1_000)  # 等 React mount 完成
 
-    # 2. v0.3.2.3:**阻塞式** aegis 网关 —— 取代 v0.3.2.2 的 fire-and-forget 探测
-    # 旧逻辑:`_UI_CAPTCHA_WAIT_SECONDS = 2.0s` 等弹窗,实测 aegis 3-5s 才出现,
-    # 经常空等 → step 6 点 send → POST 撞弹窗 → shark_admin 拒绝。
-    # 新逻辑:轮询 6s 探弹窗 → 解 → 验证消失(4s)→ 还在就**不点 send**。
-    if not await _pre_submit_aegis_gate(page, profile_dir, update):
-        # 弹窗 4s 内没消失 — 阻止 POST,告诉上层重试或换号
-        raise RuntimeError(
-            "aegis 拖拽验证未通过或弹窗未消失,暂不提交任务以免触发服务端风控。"
-            "请稍候 30s 重试,或确认图鉴打码平台账号配额。"
-        )
+    # 2. 提交前只读探测；命中后抛 AegisBlocked，禁止继续点击发送。
+    await _pre_submit_aegis_gate(page, profile_dir, update)
 
     # 3. 点视频 tab(create-image 默认是图像 tab),并确认视频内容已挂载。
     # 切换失败必须在粘贴 prompt 前终止,避免把内容写进错误的图像页。
@@ -2839,17 +2524,8 @@ async def submit_via_ui(
     await page.keyboard.press("Control+V")
     await page.wait_for_timeout(150)  # 等 ProseMirror 同步 internal state
 
-    # 7. v0.3.2.4:**再跑一次阻塞式 aegis 网关**(paste 后、click send 前)
-    # v0.3.2.3 这步用 _try_solve_captcha_in_video(wait=0) 仅 fire-and-forget,
-    # 用户实测中 aegis 弹窗常在 paste / click send 之间才挂上,前一次(step 2)
-    # 网关捕捉不到;step 6 用 wait=0 探测也来不及。修法:step 6 直接复用
-    # _pre_submit_aegis_gate(cooldown 自动跳过 30min 内已解过场景,
-    # 第 2 次跑跟第 1 次跑共享 cooldown)。
-    if not await _pre_submit_aegis_gate(page, profile_dir, update):
-        raise RuntimeError(
-            "粘贴后再次检测到拖拽验证且未通过,暂不提交任务以免触发服务端风控。"
-            "请稍候 30s 重试,或确认图鉴打码平台账号配额。"
-        )
+    # 7. 粘贴后、点击发送前再探一次，覆盖弹窗延迟挂载窗口。
+    await _pre_submit_aegis_gate(page, profile_dir, update)
     await try_click(page, (SEND_BTN_SEL, SEND_BTN_FALLBACK_SEL), timeout=5.0)
     await page.wait_for_timeout(500)  # 等 POST 真的飞出去
 
@@ -2958,6 +2634,30 @@ class PlaywrightVideoRunner:
             self._tokens[key] = bundle
             return context, bundle
 
+    async def _release_profile_context(self, profile_dir: Path) -> None:
+        """关闭并清除共享 profile context，使人工登录窗口可以重新打开。"""
+        key = str(profile_dir)
+        async with self._lock_for(profile_dir):
+            context = self._contexts.pop(key, None)
+            self._tokens.pop(key, None)
+            if context is None:
+                return
+            try:
+                # Persistent contexts can retain the profile SingletonLock while
+                # an anchor/task page is still alive. Close every page first so
+                # the user's account-management browser can reopen this profile.
+                for page in list(context.pages):
+                    try:
+                        if not page.is_closed():
+                            await page.close()
+                    except Exception:
+                        pass
+                await context.close()
+            except Exception:
+                # 释放是 fail-fast 的清理动作；底层 context 已经失效时不应
+                # 覆盖 AegisBlocked，也不能阻止缓存清理。
+                pass
+
     async def close(self) -> None:
         """v0.2.19:关闭所有共享 BrowserContext + Playwright 实例。
         service.shutdown() 调用一次即可。
@@ -3055,12 +2755,8 @@ class PlaywrightVideoRunner:
             while time.monotonic() < deadline:
                 if cancel_event.is_set():
                     raise RuntimeError("任务已取消")
-                # v0.3.4:recheck 路径同样会撞 aegis(用户查视频时正好赶上弹窗),
-                # 走相同的 fail-fast / solve 逻辑,不让 aegis 把 recheck 阻塞到超时。
-                try:
-                    await _handle_aegis_in_poll(page, profile_dir, update)
-                except _AegisUnresolvableInPoll:
-                    raise
+                # recheck 同样执行只读探测，命中即停止并释放 profile。
+                await _handle_aegis_in_poll(page, profile_dir, update)
                 chain = await page.evaluate(
                     CHAIN_SCRIPT, {"conversationId": conversation_id}
                 )
@@ -3086,14 +2782,18 @@ class PlaywrightVideoRunner:
                     if time.monotonic() >= deadline:
                         break
                     try:
-                        if await _probe_aegis_quickly(page):
+                        if await aegis_popup_present(page):
                             break
                     except Exception:
                         break
                     await asyncio.sleep(1)
             return None
+        except AegisBlocked:
+            await self._release_profile_context(profile_dir)
+            raise
         finally:
-            await page.close()
+            with contextlib.suppress(Exception):
+                await page.close()
 
     async def run(
         self,
@@ -3161,16 +2861,8 @@ class PlaywrightVideoRunner:
                 )
                 await page.wait_for_timeout(1_500)
 
-            # v0.3.1.2:提交前探 aegis 弹窗 —— 弹窗通常在 navigation 后 1-3s
-            # 渲染,等 4s 后再 detect + solve。失败/凭证关一律吞 + mark cooldown,
-            # 不挂 task。helper 内部 update(error_message=...) 上报进度,前端
-            # 看到「正在通过图鉴打码平台识别拖拽验证」之类提示。
-            await _try_solve_captcha_in_video(
-                page,
-                profile_dir,
-                update,
-                wait_for_popup_seconds=_CAPTCHA_DETECT_WAIT_BEFORE_SUBMIT_SECONDS,
-            )
+            # 上传或提交前先完成一次完整探测窗口；命中即停止该 profile。
+            await _pre_submit_aegis_gate(page, profile_dir, update)
 
             fingerprint = token_bundle.device_id or token_bundle.web_id
 
@@ -3204,7 +2896,6 @@ class PlaywrightVideoRunner:
             # 且有 quota_recorded 闸门只扣 1 次 —— 重试不重复扣。
             prompt_to_send = prompt
             attempt = 0
-            risk_attempt = 0  # v0.3.2.5:shark_admin 重试次数,独立于 reject 重试
             while True:
                 try:
                     return await self._submit_and_poll(
@@ -3223,86 +2914,6 @@ class PlaywrightVideoRunner:
                         use_real_browser=True,  # v0.3.2:UI click 路径
                         owner_task_id=owner_task_id,
                     )
-                except DoubaoRateLimited as exc:
-                    # v0.3.2.5:shark_admin 风控拦截 —— **不能**关浏览器。
-                    # 用户反馈(2026-08-13):「还是滑块刚出现就被关掉了,我现在要求
-                    # 你修改一个审核逻辑,只要是识别到账号被风控拦截这个报错,就
-                    # 不能关闭浏览器,必须等滑块出来让图鉴识别再模拟拖动提交。」
-                    #
-                    # 之前 v0.3.2.3/4 的实现:任何 submit 异常 → bubbles up 到
-                    # service.py → run() finally 块 page.close() → 滑块随页面
-                    # 一起被关。本分支**不让**它冒泡,保持 page 活着,在原页
-                    # 等 aegis 弹窗出现,然后调图鉴 solver 解,再用同一 prompt
-                    # 调一次 _submit_and_poll(即 submit_via_ui 再走一遍
-                    # navigate/click/type/submit 的完整流程)。
-                    #
-                    # 关键不变量:
-                    # - page 在整个 retry 期间不关(finally 块不会跑到,因为
-                    #   本分支既不 raise 也不 return)
-                    # - quota 已经在 service._run_inner.update("generating")
-                    #   时扣过,失败路径 service.py 会 refund,所以 retry 不
-                    #   重复扣
-                    # - prompt 不变(同账号同风控场景,改写 prompt 也救不了,
-                    #   shark_admin 是按账号 + IP + 请求指纹特征拦的)
-                    # - 最多 _MAX_RISK_RETRY 次,避免无限循环浪费 token
-                    if not exc.is_risk_control:
-                        # 非风控的 quota 限流:沿用原行为(交给 service.py 走
-                        # mark_account_limited + assign None + 任务回 queued)
-                        raise
-                    risk_attempt += 1
-                    if risk_attempt > _MAX_RISK_RETRY:
-                        _LOGGER.error(
-                            "event=video_risk_control_retry_exhausted attempts=%d",
-                            risk_attempt - 1,
-                        )
-                        # 用 reject 风格的 RuntimeError 抛出,让 service.py
-                        # 走「task failed + 退额度 + 不阻塞账号」路径
-                        raise RuntimeError(
-                            f"账号被风控拦截(shark_admin),连续 {risk_attempt - 1} 次"
-                            f"自动解滑块均失败,请稍后重试或换号"
-                        )
-                    _LOGGER.warning(
-                        "event=video_risk_control_keepalive attempt=%d/%d | %s",
-                        risk_attempt, _MAX_RISK_RETRY, exc,
-                    )
-                    try:
-                        update(
-                            error_message=(
-                                f"检测到风控拦截,正在保留浏览器等待滑块并自动"
-                                f"解算(第 {risk_attempt}/{_MAX_RISK_RETRY} 次)"
-                            )
-                        )
-                    except Exception:
-                        pass
-                    # 在原 page 上等 aegis 弹窗出现 → 图鉴解 → 验证消失。
-                    # _pre_submit_aegis_gate 返回 True = 放行(可继续 submit),
-                    # False = 解失败/超时(阻止 submit,本分支 raise 出去走失败路径)。
-                    solved = await _pre_submit_aegis_gate(
-                        page, profile_dir, update,
-                    )
-                    if not solved:
-                        _LOGGER.error(
-                            "event=video_risk_control_captcha_solve_failed attempt=%d",
-                            risk_attempt,
-                        )
-                        raise RuntimeError(
-                            f"账号被风控拦截(shark_admin),第 {risk_attempt} 次"
-                            f"自动解滑块失败,请稍后重试或确认图鉴凭证"
-                        )
-                    try:
-                        update(
-                            error_message=(
-                                f"滑块已通过,正在以原 prompt 重新提交"
-                                f"(第 {risk_attempt}/{_MAX_RISK_RETRY} 次)"
-                            )
-                        )
-                    except Exception:
-                        pass
-                    # continue → 重新跑 _submit_and_poll,submit_via_ui 会再
-                    # 走一次 create-image → 视频 tab → 清空 → type → send。
-                    # page 状态由 _pre_submit_aegis_gate 接管后是「弹窗消失」,
-                    # 再走 submit 不会立即撞弹窗。
-                    continue
                 except DoubaoContentRejected as exc:
                     attempt += 1
                     if max_reject_retries <= 0 or attempt > max_reject_retries:
@@ -3320,8 +2931,12 @@ class PlaywrightVideoRunner:
                     update(error_message=f"豆包拒绝(第 {attempt}/{max_reject_retries} 次改写重试中)")
                     prompt_to_send = new_prompt
                     continue
+        except AegisBlocked:
+            await self._release_profile_context(profile_dir)
+            raise
         finally:
-            await page.close()
+            with contextlib.suppress(Exception):
+                await page.close()
 
     async def _submit_and_poll(
         self,
@@ -3457,17 +3072,8 @@ class PlaywrightVideoRunner:
         while time.monotonic() < deadline:
             if cancel_event.is_set():
                 raise RuntimeError("任务已取消")
-            # v0.3.1.3 + v0.3.4:每次 poll 都探 aegis,挪到 chain 请求之前。
-            # v0.3.1.3 的实现有 bug:`_try_solve_captcha_in_video` 内部被
-            # 30 分钟 cooldown 短路,导致探测只在第 1 次生效,后续 30 分钟
-            # 完全失明 → 用户看到「卡生成中」,实际 aegis 一直挂着挡 chain。
-            # v0.3.4 改用 `_handle_aegis_in_poll` —— 探测不走 cooldown,
-            # 凭证不可用时直接抛 `_AegisUnresolvableInPoll` 让任务 fail-fast,
-            # 不浪费 35 分钟盲飞。
-            try:
-                await _handle_aegis_in_poll(page, profile_dir, update)
-            except _AegisUnresolvableInPoll:
-                raise
+            # 每次 poll 都先做只读探测，避免弹窗把 chain 轮询拖到超时。
+            await _handle_aegis_in_poll(page, profile_dir, update)
             chain = await page.evaluate(CHAIN_SCRIPT, {"conversationId": ack["conversation_id"]})
             if chain["status"] != 200:
                 raise RuntimeError(f"豆包结果接口返回 HTTP {chain['status']}")
@@ -3505,9 +3111,7 @@ class PlaywrightVideoRunner:
                 if time.monotonic() >= deadline:
                     break
                 try:
-                    if await _probe_aegis_quickly(page):
-                        # 探测到 popup → 跳出 wait 段,下一轮开头由
-                        # `_handle_aegis_in_poll` 做凭证检查 / fail-fast / 求解
+                    if await aegis_popup_present(page):
                         break
                 except Exception:
                     # page 在 wait 期间被外部关掉 → 跳出,上层 catch 后处理

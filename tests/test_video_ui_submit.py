@@ -11,7 +11,7 @@
 
 mock 策略:
 - _FakePage 模拟 locator.first + bounding_box + mouse + keyboard 最小接口
-- monkeypatch _try_solve_captcha_in_video 让 submit_via_ui 不用真跑 captcha
+- monkeypatch 提交前 aegis gate，避免单测等待真实探测窗口
 - _submit_and_poll 测试用 monkeypatch 整个拦截器返回 SSE ACK 文本
 """
 from __future__ import annotations
@@ -25,7 +25,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from doupool.captcha.solver import CaptchaKind
 from doupool.video import protocol as protocol_module
 from doupool.video.browser import (
     EDITOR_SEL,
@@ -37,15 +36,11 @@ from doupool.video.browser import (
     _ack_interceptor,
     _build_launch_kwargs,
     _extract_local_message_ids_from_ack_payload,
-    _handle_aegis_in_poll,
-    _pre_submit_aegis_gate,
-    _probe_aegis_quickly,
     _wait_for_ack,
     clear_prose_mirror,
     submit_via_ui,
     try_click,
 )
-from doupool.video.protocol import DoubaoRateLimited
 
 
 # ------------------------- fakes ------------------------- #
@@ -228,10 +223,7 @@ async def test_submit_via_ui_clicks_video_tab_and_send_btn(monkeypatch):
         "doupool.video.browser._apply_video_options",
         options_mock,
     )
-    monkeypatch.setattr(
-        "doupool.video.browser._try_solve_captcha_in_video",
-        AsyncMock(return_value=False),
-    )
+    monkeypatch.setattr("doupool.video.browser._pre_submit_aegis_gate", AsyncMock())
     await submit_via_ui(
         page,
         "测试一只小狗",
@@ -274,10 +266,7 @@ async def test_submit_via_ui_skips_goto_when_already_on_create_image(monkeypatch
         "doupool.video.browser._apply_video_options",
         AsyncMock(),
     )
-    monkeypatch.setattr(
-        "doupool.video.browser._try_solve_captcha_in_video",
-        AsyncMock(return_value=False),
-    )
+    monkeypatch.setattr("doupool.video.browser._pre_submit_aegis_gate", AsyncMock())
     await submit_via_ui(
         page,
         "x",
@@ -296,10 +285,7 @@ async def test_submit_via_ui_goto_when_on_other_page(monkeypatch):
         "doupool.video.browser._apply_video_options",
         AsyncMock(),
     )
-    monkeypatch.setattr(
-        "doupool.video.browser._try_solve_captcha_in_video",
-        AsyncMock(return_value=False),
-    )
+    monkeypatch.setattr("doupool.video.browser._pre_submit_aegis_gate", AsyncMock())
     await submit_via_ui(
         page,
         "x",
@@ -318,7 +304,7 @@ async def test_submit_via_ui_applies_options_before_paste_and_send(monkeypatch):
     events: list[str] = []
 
     async def fake_gate(*_args, **_kwargs):
-        return True
+        events.append("aegis-gate")
 
     async def fake_try_click(_page, selectors, **_kwargs):
         events.append("video-tab" if selectors == (VIDEO_TAB_SEL,) else "send")
@@ -345,7 +331,14 @@ async def test_submit_via_ui_applies_options_before_paste_and_send(monkeypatch):
         update=MagicMock(),
     )
 
-    assert events == ["video-tab", "options", "paste", "send"]
+    assert events == [
+        "aegis-gate",
+        "video-tab",
+        "options",
+        "paste",
+        "aegis-gate",
+        "send",
+    ]
 
 
 @pytest.mark.asyncio
@@ -510,10 +503,7 @@ async def test_submit_and_poll_use_real_browser_returns_three_field_ack(monkeypa
         yield {"text": sse_text}
 
     monkeypatch.setattr("doupool.video.browser._ack_interceptor", fake_interceptor)
-    monkeypatch.setattr(
-        "doupool.video.browser._try_solve_captcha_in_video",
-        AsyncMock(return_value=False),
-    )
+    monkeypatch.setattr("doupool.video.browser._pre_submit_aegis_gate", AsyncMock())
 
     # 把整个 poll 路径短路:_resolve_original_download 直接返 ack dict。
     # 关键:这避开了 chain / parse_creation_result 真实响应形状(很复杂),
@@ -973,10 +963,7 @@ async def test_submit_via_ui_pastes_long_prompt_in_single_op(monkeypatch):
         "doupool.video.browser._apply_video_options",
         AsyncMock(),
     )
-    monkeypatch.setattr(
-        "doupool.video.browser._try_solve_captcha_in_video",
-        AsyncMock(return_value=False),
-    )
+    monkeypatch.setattr("doupool.video.browser._pre_submit_aegis_gate", AsyncMock())
     await submit_via_ui(
         page,
         LONG_PROMPT,
@@ -1050,685 +1037,6 @@ def test_build_launch_kwargs_grants_clipboard_permission():
     assert "clipboard-read" in visible_perms
     assert "clipboard-write" in visible_perms
     assert "clipboard-read-write" not in visible_perms
-
-
-# ------------------------- v0.3.2.3 _pre_submit_aegis_gate ------------------------- #
-
-
-@pytest.fixture
-def fast_gate_constants(monkeypatch):
-    """把 _UI_CAPTCHA_* 三个常量临时压短,避免测试真的等 6+4 秒。
-
-    v0.3.2.3 经验值 6s wait + 4s verify gone 是真机场景下「足够」的窗口;
-    单测没必要等真的时间,改成 0.2 + 0.2 就能覆盖四条分支。
-    """
-    import doupool.video.browser as browser_mod
-
-    monkeypatch.setattr(browser_mod, "_UI_CAPTCHA_WAIT_SECONDS", 0.2)
-    monkeypatch.setattr(browser_mod, "_UI_CAPTCHA_VERIFY_GONE_SECONDS", 0.2)
-    monkeypatch.setattr(browser_mod, "_UI_CAPTCHA_DETECT_POLL_INTERVAL", 0.05)
-
-
-@pytest.mark.asyncio
-async def test_pre_submit_aegis_gate_no_popup_allows_submit(
-    monkeypatch, fast_gate_constants,
-):
-    """case 1:探测期内始终没弹窗 → 放行 True。
-
-    这是大多数正常提交路径(no aegis popup)—— 直接进 step 6 点 send,
-    不浪费时间等弹窗。
-    """
-    page = _FakePage()
-    update = MagicMock()
-
-    # detect 一律返 UNKNOWN → 6s 内不会 break
-    monkeypatch.setattr(
-        "doupool.video.browser._detect_aegis_captcha",
-        AsyncMock(return_value=CaptchaKind.UNKNOWN),
-    )
-
-    allowed = await _pre_submit_aegis_gate(
-        page, Path("/tmp/p"), update,
-    )
-    assert allowed is True
-    # solve 路径不应被触达(load_credentials 没调就对了)
-    update.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_pre_submit_aegis_gate_in_cooldown_allows_submit(
-    monkeypatch, fast_gate_constants,
-):
-    """case 2:账号已在 cooldown → 立即放行,根本不走 detect。
-
-    account_key = str(profile_dir),与 login 路径共享同一份 30min dict;
-    login 刚解完 → video 路径秒过,不会浪费图鉴配额。
-    """
-    page = _FakePage()
-    update = MagicMock()
-
-    monkeypatch.setattr(
-        "doupool.video.browser._captcha_is_in_cooldown",
-        lambda key: True,
-    )
-
-    # detect 不该被调(已 cooldown 立即 return)
-    detect_mock = AsyncMock(return_value=CaptchaKind.SLIDE_PUZZLE)
-    monkeypatch.setattr(
-        "doupool.video.browser._detect_aegis_captcha", detect_mock,
-    )
-
-    allowed = await _pre_submit_aegis_gate(
-        page, Path("/tmp/in_cooldown"), update,
-    )
-    assert allowed is True
-    detect_mock.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_pre_submit_aegis_gate_popup_solved_and_gone_allows_submit(
-    monkeypatch, fast_gate_constants,
-):
-    """case 3:探测到弹窗 → 解 → 弹窗消失 → 放行 True。
-
-    主 happy path,弹窗被图鉴拖走了,solver 之后 detect 返 UNKNOWN。
-    """
-    page = _FakePage()
-    update = MagicMock()
-    profile_dir = Path("/tmp/gate_solved")
-
-    # detect 序列:第 1-2 次 UNKNOWN,第 3 次 SLIDE(被发现),之后全 UNKNOWN(已解)
-    detect_results = [
-        CaptchaKind.UNKNOWN,
-        CaptchaKind.UNKNOWN,
-        CaptchaKind.SLIDE_PUZZLE,  # 弹窗出现 → 进 solve 路径
-        CaptchaKind.UNKNOWN,       # 解完后消失
-        CaptchaKind.UNKNOWN,
-    ]
-    monkeypatch.setattr(
-        "doupool.video.browser._detect_aegis_captcha",
-        AsyncMock(side_effect=detect_results),
-    )
-
-    # 凭证可用 → make_client 返 dummy
-    monkeypatch.setattr(
-        "doupool.video.browser._load_captcha_credentials",
-        lambda: MagicMock(usable=True),
-    )
-    dummy_client = MagicMock()
-    monkeypatch.setattr(
-        "doupool.video.browser._make_captcha_client",
-        lambda creds: dummy_client,
-    )
-    # solve 直接完成
-    monkeypatch.setattr(
-        "doupool.video.browser._solve_aegis_captcha",
-        AsyncMock(return_value=None),
-    )
-    # mark_cooldown 不做断言但 stub 掉避免污染
-    monkeypatch.setattr(
-        "doupool.video.browser._captcha_mark_cooldown",
-        lambda key: None,
-    )
-
-    allowed = await _pre_submit_aegis_gate(
-        page, profile_dir, update,
-    )
-    assert allowed is True, "弹窗解完消失后,网关必须放行"
-    # update 至少报过一次 "拖拽验证已通过"
-    update_msgs = [c.kwargs.get("error_message", "") for c in update.call_args_list]
-    assert any("拖拽" in m or "已通过" in m for m in update_msgs), (
-        f"解完后应该报进度文案; 实际 update={update_msgs}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_pre_submit_aegis_gate_popup_persists_blocks_submit(
-    monkeypatch, fast_gate_constants,
-):
-    """case 4:探测到弹窗 → 解 → 弹窗仍在 → 返 False(**不**点 send)。
-
-    这是 v0.3.2.3 关键防御:防止 POST 撞 aegis 弹窗触发 shark_admin 拒绝。
-    submit_via_ui 拿到 False 就 raise RuntimeError 阻止 click send。
-    """
-    page = _FakePage()
-    update = MagicMock()
-    profile_dir = Path("/tmp/gate_stuck")
-
-    # detect:第一次就 SLIDE,之后永远 SLIDE(弹窗卡死)
-    monkeypatch.setattr(
-        "doupool.video.browser._detect_aegis_captcha",
-        AsyncMock(return_value=CaptchaKind.SLIDE_PUZZLE),
-    )
-
-    monkeypatch.setattr(
-        "doupool.video.browser._load_captcha_credentials",
-        lambda: MagicMock(usable=True),
-    )
-    dummy_client = MagicMock()
-    monkeypatch.setattr(
-        "doupool.video.browser._make_captcha_client",
-        lambda creds: dummy_client,
-    )
-    # solver 调完,弹窗依然在(就等不到 UNKNOWN)
-    monkeypatch.setattr(
-        "doupool.video.browser._solve_aegis_captcha",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._captcha_mark_cooldown",
-        lambda key: None,
-    )
-
-    allowed = await _pre_submit_aegis_gate(
-        page, profile_dir, update,
-    )
-    assert allowed is False, "弹窗持续存在必须阻止 submit,防 POST + 弹窗撞车"
-    # update 应有「暂不提交」语义
-    update_msgs = [c.kwargs.get("error_message", "") for c in update.call_args_list]
-    assert any("未消失" in m or "暂不" in m or "稍后" in m for m in update_msgs), (
-        f"弹窗卡死时 update 必须告诉用户; 实际={update_msgs}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_pre_submit_aegis_gate_credentials_disabled_blocks_submit(
-    monkeypatch, fast_gate_constants,
-):
-    """case 5(v0.3.2.4):图鉴凭证关(没配 / enabled=false)→ make_client 抛
-    AegisCaptchaDisabled → 网关返 **False**,**阻止** submit。
-
-    旧 v0.3.2.3 行为是「降级放行」—— 让 submit 撞 aegis 弹窗 → 走原失败路径。
-    但实测:撞弹窗会被 shark_admin 风控挡,直接扣视频额度 + 任务失败,
-    「降级放行」反而是 bug,比直接 fail 更糟。
-
-    新语义:任何解不出来的情况(凭证关 / solver 失败 / 异常)→ 返 False,
-    submit_via_ui 拿到 False 直接 raise RuntimeError 阻止 click send。
-    cooldown 30 分钟保护下次不要重蹈覆辙。
-    """
-    page = _FakePage()
-    update = MagicMock()
-    profile_dir = Path("/tmp/no_creds")
-
-    # 探测到弹窗
-    monkeypatch.setattr(
-        "doupool.video.browser._detect_aegis_captcha",
-        AsyncMock(return_value=CaptchaKind.SLIDE_PUZZLE),
-    )
-
-    # make_client 抛 AegisCaptchaDisabled(凭证关)
-    from doupool.captcha.solver import AegisCaptchaDisabled
-    monkeypatch.setattr(
-        "doupool.video.browser._load_captcha_credentials",
-        lambda: MagicMock(usable=False),
-    )
-
-    def _raise_disabled(creds):
-        raise AegisCaptchaDisabled("凭证未配置")
-
-    monkeypatch.setattr(
-        "doupool.video.browser._make_captcha_client",
-        _raise_disabled,
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._captcha_mark_cooldown",
-        lambda key: None,
-    )
-
-    allowed = await _pre_submit_aegis_gate(
-        page, profile_dir, update,
-    )
-    # v0.3.2.4:凭证关 → 阻止 submit,不能撞 shark_admin 风控
-    assert allowed is False, "凭证关必须阻止 submit,以免撞 aegis 触发服务端风控"
-    update_msgs = [c.kwargs.get("error_message", "") for c in update.call_args_list]
-    # 必须告诉用户原因(凭证关 / 配额 / 30min cooldown)
-    assert any(
-        "凭证" in m or "图鉴" in m or "配额" in m or "暂不" in m for m in update_msgs
-    ), f"凭证关必须有提示; 实际={update_msgs}"
-
-
-@pytest.mark.asyncio
-async def test_pre_submit_aegis_gate_solver_failed_blocks_submit(
-    monkeypatch, fast_gate_constants,
-):
-    """case 5b(v0.3.2.4):solver 抛 AegisCaptchaFailed → 网关返 **False**。
-
-    旧行为返 True(降级放行)撞 shark_admin 失败 → 扣额度。改成 False 阻止。
-    """
-    page = _FakePage()
-    update = MagicMock()
-    profile_dir = Path("/tmp/solver_failed")
-
-    monkeypatch.setattr(
-        "doupool.video.browser._detect_aegis_captcha",
-        AsyncMock(return_value=CaptchaKind.SLIDE_PUZZLE),
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._load_captcha_credentials",
-        lambda: MagicMock(usable=True),
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._make_captcha_client",
-        lambda creds: MagicMock(),
-    )
-
-    from doupool.captcha.solver import AegisCaptchaFailed
-
-    async def _raise_failed(*a, **kw):
-        raise AegisCaptchaFailed("图鉴识别失败,余额不足")
-
-    monkeypatch.setattr(
-        "doupool.video.browser._solve_aegis_captcha",
-        _raise_failed,
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._captcha_mark_cooldown",
-        lambda key: None,
-    )
-
-    allowed = await _pre_submit_aegis_gate(
-        page, profile_dir, update,
-    )
-    assert allowed is False, "solver 抛 AegisCaptchaFailed 必须阻止 submit"
-    update_msgs = [c.kwargs.get("error_message", "") for c in update.call_args_list]
-    assert any("失败" in m or "余额" in m or "配额" in m or "暂不" in m for m in update_msgs), (
-        f"solver 失败必须告诉用户原因; 实际={update_msgs}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_pre_submit_aegis_gate_solver_exception_blocks_submit(
-    monkeypatch, fast_gate_constants,
-):
-    """case 5c(v0.3.2.4):solver 抛通用 Exception → 网关返 **False**(防御性)。
-
-    旧行为:except Exception → 返 True(吞错降级),然后撞 shark_admin。
-    新行为:任何意外也返 False —— 阻止 submit 比误放行更安全。
-    """
-    page = _FakePage()
-    update = MagicMock()
-    profile_dir = Path("/tmp/solver_crash")
-
-    monkeypatch.setattr(
-        "doupool.video.browser._detect_aegis_captcha",
-        AsyncMock(return_value=CaptchaKind.SLIDE_PUZZLE),
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._load_captcha_credentials",
-        lambda: MagicMock(usable=True),
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._make_captcha_client",
-        lambda creds: MagicMock(),
-    )
-
-    async def _raise_boom(*a, **kw):
-        raise RuntimeError("solver 内层炸了")
-
-    monkeypatch.setattr(
-        "doupool.video.browser._solve_aegis_captcha",
-        _raise_boom,
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._captcha_mark_cooldown",
-        lambda key: None,
-    )
-
-    allowed = await _pre_submit_aegis_gate(
-        page, profile_dir, update,
-    )
-    assert allowed is False, "solver 抛通用 Exception 也必须阻止 submit"
-    update_msgs = [c.kwargs.get("error_message", "") for c in update.call_args_list]
-    assert any("异常" in m or "暂不" in m or "稍后" in m for m in update_msgs), (
-        f"异常必须告诉用户; 实际={update_msgs}"
-    )
-
-
-# ------------------------- v0.3.2.3 / v0.3.2.4 submit_via_ui 行为契约 ------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_submit_via_ui_raises_when_gate_blocks(monkeypatch, fast_gate_constants):
-    """v0.3.2.3 + v0.3.2.4 submit_via_ui 契约:_pre_submit_aegis_gate 返 False →
-    整体 raise RuntimeError,不能进入 step 3 后续 click 流程。
-
-    防止代码被改回 fire-and-forget:即使 gate 拒绝,后续 try_click 也不该被调。
-
-    v0.3.2.4 进一步:step 6 也走完整的 _pre_submit_aegis_gate(不再是
-    _try_solve_captcha_in_video 弱兜底),所以两次调用都应被验证;
-    第一次返 False → 直接 raise,不会再调第二次。
-    """
-    page = _FakePage(url="https://www.doubao.com/chat/create-image")
-    update = MagicMock()
-
-    gate_mock = AsyncMock(return_value=False)
-    monkeypatch.setattr(
-        "doupool.video.browser._pre_submit_aegis_gate",
-        gate_mock,
-    )
-
-    with pytest.raises(RuntimeError, match="aegis 拖拽验证未通过"):
-        await submit_via_ui(
-            page,
-            "x",
-            ratio="1:1",
-            duration=5,
-            profile_dir=Path("/tmp/p"),
-            update=update,
-        )
-
-    # 关键:raise 之后,send button 不该被 click(mouse.downs 应为 0)。
-    # VIDEO_TAB_SEL 也不该被 click(还没到 step 3)。
-    assert page.mouse.downs == 0, (
-        f"gate 拒绝后 mouse.downs 必须为 0(不该进 step 3/6); "
-        f"实际={page.mouse.downs}, moves={page.mouse.moves}"
-    )
-
-    # v0.3.2.4:gate 第一次返 False 直接 raise —— 只调了一次(不进 step 6)。
-    # 这是 step 2 「导航 → 网关」的拦截路径。
-    assert gate_mock.await_count == 1, (
-        f"gate 第一次返 False 应直接 raise,不应再调第二次; "
-        f"实际 await_count={gate_mock.await_count}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_submit_via_ui_step6_rechecks_aegis_after_paste(
-    monkeypatch, fast_gate_constants,
-):
-    """v0.3.2.4 契约:submit_via_ui 在 step 2(导航后) **和** step 6(粘贴后、
-    click send 前)都调 _pre_submit_aegis_gate。
-
-    用户实际场景:step 2 网关通过 → paste prompt → aegis 弹窗刚出现 → click
-    send → POST 撞弹窗 → shark_admin 拒绝。step 6 二次拦截防止这种情况。
-
-    此测试:step 2 返 True(允许 paste),step 6 返 False(拦截 send)→ 整体 raise。
-    """
-    page = _FakePage(url="https://www.doubao.com/chat/create-image")
-    update = MagicMock()
-
-    # step 2 返 True,paste 正常进行;step 6 返 False 拦截 send
-    gate_mock = AsyncMock(side_effect=[True, False])
-    monkeypatch.setattr(
-        "doupool.video.browser._pre_submit_aegis_gate",
-        gate_mock,
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._apply_video_options",
-        AsyncMock(),
-    )
-
-    # step 6 触发的错误文案跟 step 2 不一样(「粘贴后再次检测到...」)
-    with pytest.raises(RuntimeError, match="粘贴后再次检测到拖拽验证"):
-        await submit_via_ui(
-            page,
-            "x",
-            ratio="1:1",
-            duration=5,
-            profile_dir=Path("/tmp/p"),
-            update=update,
-        )
-
-    # step 2 通过 → step 3(点 video tab)跑了 1 次 mouse.down,
-    # 但 step 6 raise → step 6 的 click(SEND_BTN_SEL)没跑 → 总 mouse.downs 应为 1
-    assert page.mouse.downs == 1, (
-        f"step 6 raise 后 SEND_BTN_SEL click 必须被阻止; "
-        f"应有 1 次 mouse.down(video tab click); 实际={page.mouse.downs}"
-    )
-    # gate 必须被调 **两次**(step 2 + step 6)
-    assert gate_mock.await_count == 2, (
-        f"step 2 通过 → step 6 必须再调一次 gate; "
-        f"实际 await_count={gate_mock.await_count}"
-    )
-
-
-# ------------------------- v0.3.2.5 shark_admin 拒绝 → 不关浏览器重提 ------------------------- #
-#
-# 用户反馈(2026-08-13):「还是滑块刚出现就被关掉了,我现在要求你修改一个
-# 审核逻辑,只要是识别到账号被风控拦截这个报错,就不能关闭浏览器,必须等
-# 滑块出来让图鉴识别再模拟拖动提交。」
-#
-# v0.3.2.3 / v0.3.2.4 的实现是「submit 撞弹窗 → raise → service.py
-# finally page.close() → 弹窗随页面被关」。v0.3.2.5 在 run() retry loop
-# 里新增 except DoubaoRateLimited(is_risk_control=True) 分支:不让它冒泡,
-# 保持 page 活着,在原 page 上调 _pre_submit_aegis_gate 等弹窗出现 + 解,
-# 然后 continue 重新跑 _submit_and_poll。
-#
-# 关键不变量:
-# - page 在整个 retry 期间不关(finally 块不会跑到)
-# - quota 已经在 service._run_inner.update("generating") 时扣过,失败路径
-#   service.py 会 refund,所以 retry 不重复扣
-# - 最多 _MAX_RISK_RETRY 次,避免无限循环浪费 token
-#
-
-
-def _stub_run_setup(monkeypatch):
-    """把 run() 的「打开 context + new_page + 提交前 captcha 探针 + i2v 上传」
-    全部 stub 掉,只让 retry loop 跑。返回 (runner, submit_and_poll_mock,
-    gate_mock) —— 测试只关心这三个的状态变化。
-    """
-    runner = PlaywrightVideoRunner(timeout=10, poll_interval=1)
-
-    # context + token_bundle(返回 (_FakePage 形状的 MagicMock context))
-    fake_page = MagicMock()
-    fake_page.url = "https://www.doubao.com/chat/"
-    fake_page.close = AsyncMock(return_value=None)  # run() finally 会 await 它
-    fake_page.goto = AsyncMock(return_value=None)
-    fake_page.wait_for_timeout = AsyncMock(return_value=None)
-    fake_context = MagicMock()
-    fake_context.new_page = AsyncMock(return_value=fake_page)
-    fake_context.is_closed = MagicMock(return_value=False)
-    fake_token_bundle = MagicMock()
-    fake_token_bundle.device_id = "device-fp"
-
-    async def fake_get_shared_context(self, profile_dir, pc_version=None, **kw):
-        return fake_context, fake_token_bundle
-
-    monkeypatch.setattr(
-        "doupool.video.browser.PlaywrightVideoRunner._get_shared_context",
-        fake_get_shared_context,
-    )
-    monkeypatch.setattr(
-        "doupool.video.browser._is_context_alive",
-        lambda ctx: True,
-    )
-
-    # 提交前 captcha 探针 no-op
-    monkeypatch.setattr(
-        "doupool.video.browser._try_solve_captcha_in_video",
-        AsyncMock(return_value=False),
-    )
-
-    # _submit_and_poll 替成 mock
-    submit_and_poll_mock = AsyncMock()
-    monkeypatch.setattr(
-        "doupool.video.browser.PlaywrightVideoRunner._submit_and_poll",
-        submit_and_poll_mock,
-    )
-
-    # _pre_submit_aegis_gate 替成 mock(默认放行 True)
-    gate_mock = AsyncMock(return_value=True)
-    monkeypatch.setattr(
-        "doupool.video.browser._pre_submit_aegis_gate",
-        gate_mock,
-    )
-
-    return runner, submit_and_poll_mock, gate_mock
-
-
-@pytest.mark.asyncio
-async def test_run_shark_admin_keepalive_solve_succeeds_then_retry_succeeds(
-    monkeypatch, fast_gate_constants,
-):
-    """case 1(v0.3.2.5 主路径):第一次 _submit_and_poll 抛
-    DoubaoRateLimited(is_risk_control=True) → 不 raise、不关 page →
-    调 _pre_submit_aegis_gate 等滑块 + 解 → 返 True → 用原 prompt 第二次
-    _submit_and_poll 成功 → 任务完成。
-
-    这是用户 2026-08-13 反馈的核心场景的 happy path:滑块在第一次 submit 后
-    才出现,程序不关窗口,等图鉴拖完后自动重提。
-    """
-    runner, submit_and_poll_mock, gate_mock = _stub_run_setup(monkeypatch)
-    update = MagicMock()
-    cancel = threading.Event()
-    profile_dir = Path("/tmp/risk_keepalive")
-
-    # 第一次抛风控拒绝,第二次返 ack
-    final_ack = {"conversation_id": "C-final", "section_id": "S-final", "question_id": "Q-final"}
-    submit_and_poll_mock.side_effect = [
-        DoubaoRateLimited("shark_admin 拒绝", is_risk_control=True),
-        final_ack,
-    ]
-
-    result = await runner.run(
-        profile_dir=profile_dir,
-        prompt="小狗在草地上奔跑",
-        model="seedance_v2.0_mini",
-        ratio="16:9",
-        duration=10,
-        update=update,
-        cancel_event=cancel,
-        owner_task_id="owner-task",
-    )
-
-    # 重试成功 → 返 ack
-    assert result == final_ack
-    # 两次 submit_and_poll 调用
-    assert submit_and_poll_mock.await_count == 2
-    assert all(
-        call.kwargs["owner_task_id"] == "owner-task"
-        for call in submit_and_poll_mock.await_args_list
-    )
-    # gate 必须被调一次(第一次冒泡风控时),**不能在第二次跑前再调**
-    assert gate_mock.await_count == 1, (
-        f"gate 应只在第一次风控后调一次,等弹窗 + 解完后放行重提; "
-        f"实际={gate_mock.await_count}"
-    )
-    # update 至少报过一次「检测到风控拦截,正在保留浏览器等待滑块并自动解算」
-    update_msgs = [c.kwargs.get("error_message", "") for c in update.call_args_list]
-    assert any("风控" in m and "保留浏览器" in m for m in update_msgs), (
-        f"风控 keepalive 必须报进度文案; 实际={update_msgs}"
-    )
-    # 第二次重提成功后 update 应写「滑块已通过,正在以原 prompt 重新提交」
-    assert any("滑块已通过" in m for m in update_msgs), (
-        f"解完滑块应报正在重提; 实际={update_msgs}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_run_shark_admin_keepalive_solve_failed_raises(
-    monkeypatch, fast_gate_constants,
-):
-    """case 2(v0.3.2.5):图鉴解滑块失败(_pre_submit_aegis_gate 返 False)
-    → raise RuntimeError,不再 retry。
-
-    防御性:不让任务在「等不到滑块」的境况下无限循环。第一次 solve 失败
-    → 直接 fail-fast 走 service.py 失败路径(task failed + 退额度)。
-    """
-    runner, submit_and_poll_mock, gate_mock = _stub_run_setup(monkeypatch)
-    update = MagicMock()
-    cancel = threading.Event()
-    profile_dir = Path("/tmp/risk_solve_fail")
-
-    submit_and_poll_mock.side_effect = DoubaoRateLimited(
-        "shark_admin 拒绝", is_risk_control=True,
-    )
-    # 第一次 solve → 失败
-    gate_mock.side_effect = [False]
-
-    with pytest.raises(RuntimeError, match="自动解滑块失败"):
-        await runner.run(
-            profile_dir=profile_dir,
-            prompt="x",
-            model="seedance_v2.0_mini",
-            ratio="16:9",
-            duration=10,
-            update=update,
-            cancel_event=cancel,
-        )
-
-    # 只调了一次 submit_and_poll(第一次冒泡风控);solve 失败 → 不再重试
-    assert submit_and_poll_mock.await_count == 1
-    assert gate_mock.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_run_shark_admin_retry_exhausted_raises(monkeypatch, fast_gate_constants):
-    """case 3(v0.3.2.5):连续 _MAX_RISK_RETRY 次风控拒绝 + 每次解滑块成功 →
-    用完 _MAX_RISK_RETRY 后 raise RuntimeError 退出,防止无限循环。
-
-    防浪费 token / 额度:同一账号同 IP 同请求指纹特征,改 prompt 也救不了
-    shark_admin —— _MAX_RISK_RETRY=2 是上限,够覆盖偶发网络抖动,再多次就
-    是无谓消耗。
-    """
-    import doupool.video.browser as browser_mod
-
-    monkeypatch.setattr(browser_mod, "_MAX_RISK_RETRY", 2)
-    runner, submit_and_poll_mock, gate_mock = _stub_run_setup(monkeypatch)
-    update = MagicMock()
-    cancel = threading.Event()
-    profile_dir = Path("/tmp/risk_exhaust")
-
-    # 每次 submit_and_poll 都抛风控;gate 一直成功(模拟「滑块解得通但 shark_admin 仍挡」)
-    submit_and_poll_mock.side_effect = DoubaoRateLimited(
-        "shark_admin 拒绝", is_risk_control=True,
-    )
-    gate_mock.side_effect = [True, True, True]  # 第 3 次不会再被调
-
-    with pytest.raises(RuntimeError, match="连续 2 次自动解滑块均失败"):
-        await runner.run(
-            profile_dir=profile_dir,
-            prompt="x",
-            model="seedance_v2.0_mini",
-            ratio="16:9",
-            duration=10,
-            update=update,
-            cancel_event=cancel,
-        )
-
-    # 初始 1 次 + retry 2 次(_MAX_RISK_RETRY=2)= 总共 3 次 submit_and_poll
-    # (每次 raise DoubaoRateLimited 后 risk_attempt 递增,直到 > _MAX_RISK_RETRY 才 raise RuntimeError)
-    assert submit_and_poll_mock.await_count == 3
-    # gate 也调了 2 次(每次失败后等滑块 + 解)
-    assert gate_mock.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_run_non_risk_rate_limit_still_bubbles(monkeypatch, fast_gate_constants):
-    """case 4(v0.3.2.5 防御):is_risk_control=False 的 quota 限流 → 不走
-    keepalive 分支,沿原行为冒泡(交给 service.py 处理 mark_account_limited
-    + assign None + 任务回 queued)。
-
-    验证点:非风控的 DoubaoRateLimited 不被 swallow,必须 raise 出去。
-    """
-    runner, submit_and_poll_mock, gate_mock = _stub_run_setup(monkeypatch)
-    update = MagicMock()
-    cancel = threading.Event()
-    profile_dir = Path("/tmp/quota_limit")
-
-    submit_and_poll_mock.side_effect = DoubaoRateLimited(
-        "豆包今日 quota 已用完", is_risk_control=False,
-    )
-
-    with pytest.raises(DoubaoRateLimited, match="quota"):
-        await runner.run(
-            profile_dir=profile_dir,
-            prompt="x",
-            model="seedance_v2.0_mini",
-            ratio="16:9",
-            duration=10,
-            update=update,
-            cancel_event=cancel,
-        )
-
-    # 非风控 → 不应触发 gate,也不应第二次 submit_and_poll
-    assert submit_and_poll_mock.await_count == 1
-    assert gate_mock.await_count == 0, (
-        f"非风控的 quota 限流绝不能触发滑块等待 gate; "
-        f"实际 await_count={gate_mock.await_count}"
-    )
-
-
 # ------------------------- v0.3.4:poll 循环 aegis fail-fast ------------------------- #
 #
 # 背景:用户原话「我在后台看到视频已经生成成功了,你特么还卡在生成中」。
@@ -1737,7 +1045,7 @@ async def test_run_non_risk_rate_limit_still_bubbles(monkeypatch, fast_gate_cons
 #
 # v0.3.4 修复:
 #   1. 加 `_handle_aegis_in_poll`(廉价探测 + fail-fast)
-#   2. poll 循环 wait_for_timeout 拆 1s 段,每段先 `_probe_aegis_quickly`
+#   2. poll 循环 wait_for_timeout 拆 1s 段,每段先 `aegis_popup_present`
 #   3. 探测到 aegis 但凭证不可用 → 抛 `_AegisUnresolvableInPoll`,任务立刻 fail
 #
 # 本节测试:验证(2)(3)的契约,(1)已在 test_video_captcha_hook.py 覆盖。
@@ -1871,9 +1179,7 @@ async def test_poll_loop_fails_fast_on_aegis_unresolvable(
 
     async def fake_handle_aegis(*a, **kw):
         call_log["handle_calls"] += 1
-        raise _AegisUnresolvableInPoll(
-            "aegis drag captcha blocking poll loop; captcha credentials not configured"
-        )
+        raise _AegisUnresolvableInPoll("当前任务已停止，请在账号管理中打开该账号浏览器完成验证后重提")
 
     monkeypatch.setattr(
         "doupool.video.browser._handle_aegis_in_poll", fake_handle_aegis,
@@ -1911,7 +1217,7 @@ async def test_poll_loop_fails_fast_on_aegis_unresolvable(
 async def test_poll_loop_segments_wait_into_1s_intervals(monkeypatch):
     """v0.3.4:wait_for_timeout 拆 1s 段 + 每段先 probe —— 而不是一次 wait 35*60s。
 
-    验证:poll_interval=3 时,1s 段循环应跑 3 次 `_probe_aegis_quickly`,
+    验证:poll_interval=3 时,1s 段循环应跑 3 次 `aegis_popup_present`,
     每次 sleep 1s。run_in_executor/真 asyncio.sleep 会被 monkeypatch。
     """
     runner = PlaywrightVideoRunner(timeout=2, poll_interval=3)
@@ -1944,7 +1250,7 @@ async def test_poll_loop_segments_wait_into_1s_intervals(monkeypatch):
     )
     probe_mock = AsyncMock(return_value=False)
     monkeypatch.setattr(
-        "doupool.video.browser._probe_aegis_quickly", probe_mock,
+        "doupool.video.browser.aegis_popup_present", probe_mock,
     )
     # 真 sleep 加速(避免 35 分钟测试)
     sleep_mock = AsyncMock()
@@ -1980,10 +1286,10 @@ async def test_poll_loop_segments_wait_into_1s_intervals(monkeypatch):
             use_real_browser=False,
         )
 
-    # v0.3.4 关键契约:`_probe_aegis_quickly` 必被 poll 循环多次调
+    # v0.3.4 关键契约:`aegis_popup_present` 必被 poll 循环多次调
     # (timeout=2, poll_interval=3,但 timeout 先到 → 至少 1 轮 → probe 至少 3 次)
     assert probe_mock.await_count >= 1, (
-        f"_probe_aegis_quickly 必须至少调一次(每 1s 段都探); "
+        f"aegis_popup_present 必须至少调一次(每 1s 段都探); "
         f"实际 {probe_mock.await_count} 次"
     )
     # 单次 1s sleep 调用次数 = 至少一轮 wait 内的 1s 段数
@@ -2036,7 +1342,7 @@ async def test_poll_loop_probe_exception_breaks_wait_not_loop(monkeypatch):
     # probe 每次都抛(模拟 page 在 wait 期间被外部关)
     probe_mock = AsyncMock(side_effect=Exception("Target closed"))
     monkeypatch.setattr(
-        "doupool.video.browser._probe_aegis_quickly", probe_mock,
+        "doupool.video.browser.aegis_popup_present", probe_mock,
     )
 
     async def fake_resolve(self, page, result, cancel_event):

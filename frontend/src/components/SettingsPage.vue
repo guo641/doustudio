@@ -29,12 +29,6 @@ type Settings = {
   // v0.2.34:并发任务间隔(秒)—— 每个 task 在抢并发位前 sleep N 秒,避免
   // 多账号同时 dispatch 触发豆包风控。0 关闭(默认)。
   task_interval_seconds: number;
-  // v0.3.1.1:图鉴打码平台凭证(见 src/doupool/captcha/config.py)。
-  // 不填 → solver 抛 AegisCaptchaDisabled,aegis 弹窗挂着没人解(用户反馈的
-  // 「任务浏览打开就关闭了,然后报错」就是这条链路)。
-  ttshitu_username: string;
-  ttshitu_password: string;
-  ttshitu_enabled: boolean;
 };
 
 const settings = ref<Settings | null>(null);
@@ -256,46 +250,6 @@ async function onCheckUpdate() {
             开启后,每个视频任务生成完成时,会自动用上述 KEY 调
             <code>https://api.zhuceka.cn/home/api?type=dsp&uid=...&key=...&url=...</code>
             把无水印链接写到任务的「clean_video_url」字段。
-          </span>
-        </DpField>
-      </div>
-    </DpCard>
-
-    <DpCard wide title="验证码(图鉴 ttshitu)" description="豆包弹 aegis 拖拽验证时,自动通过图鉴打码平台截图 + 拟人拖拽通过">
-      <div class="fields">
-        <DpField label="启用图鉴打码" for-id="setting-ttshitu-enabled">
-          <input
-            id="setting-ttshitu-enabled"
-            v-model="settings.ttshitu_enabled"
-            type="checkbox"
-            class="checkbox"
-          />
-        </DpField>
-        <DpField label="图鉴用户名" for-id="setting-ttshitu-username">
-          <DpInput
-            id="setting-ttshitu-username"
-            v-model="settings.ttshitu_username"
-            placeholder="ttshitu.com 用户名"
-          />
-        </DpField>
-        <DpField label="图鉴密码" for-id="setting-ttshitu-password" span2>
-          <DpInput
-            id="setting-ttshitu-password"
-            v-model="settings.ttshitu_password"
-            type="password"
-            placeholder="ttshitu.com 密码"
-          />
-        </DpField>
-        <DpField span2>
-          <span class="watermark-hint">
-            开启后,登录 keepalive 期间(扫码成功后 30 秒)如果豆包弹出拖拽
-            验证,aegis solver 会自动通过图鉴打码平台(typeid 27 坐标点选 +
-            兜底 typeid 33 单缺口滑块)截图 + 拟人拖拽通过验证。弹窗不会
-            自动关闭 —— solver 会一直挂着等它完成。
-            <strong>不填凭证时弹窗会一直挂着直到你手动关闭 UI</strong>,
-            这就是「任务浏览打开就关闭了」的根因。同账号触发后 30 分钟
-            内不再尝试第二次,期间「换 IP / 改密码」是主缓解手段。
-            账号在 <code>https://www.ttshitu.com/</code> 注册。
           </span>
         </DpField>
       </div>
