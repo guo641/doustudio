@@ -21,7 +21,8 @@ _UNSET = object()
 
 
 class _FakeMouse:
-    def __init__(self):
+    def __init__(self, page):
+        self.page = page
         self.moves: list[tuple] = []
         self.downs = 0
         self.ups = 0
@@ -34,6 +35,16 @@ class _FakeMouse:
 
     async def up(self):
         self.ups += 1
+        if self.page.aria_mouse_updates and self.moves:
+            target_x = float(self.moves[-1][0])
+            track_x = 100.0
+            track_width = 220.0
+            position = min(1.0, max(0.0, (target_x - track_x) / track_width))
+            raw_value = round(
+                self.page.aria_raw_min
+                + position * (self.page.aria_raw_max - self.page.aria_raw_min)
+            )
+            self.page.set_aria_raw(raw_value)
 
 
 class _FakeKeyboard:
@@ -209,10 +220,22 @@ class _FakeElement:
 
     async def evaluate(self, expression, value=_UNSET):
         if value is not _UNSET:
-            self.page.duration = int(value)
-            self.page.duration_has_been_set = True
-            self.page.schedule_trigger_update()
+            requested = int(value)
+            self.page.last_slider_requested = requested
+            self.page.slider_native_values.append(requested)
+            if (
+                self.kind == "aria"
+                and self.page.aria_native_updates
+                and "setAttribute('aria-valuenow'" in expression
+            ):
+                self.page.set_aria_raw(requested)
+            elif self.kind != "aria":
+                self.page.duration = requested
+                self.page.duration_has_been_set = True
+                self.page.schedule_trigger_update()
             return None
+        if expression == "el => el.tagName":
+            return "DIV" if self.kind == "aria" else self.tag.upper()
         if "closest" in expression:
             return (
                 self.inside_send_wrapper
@@ -227,11 +250,13 @@ class _FakeElement:
     async def get_attribute(self, name: str) -> str | None:
         if self.kind == "aria":
             if name == "aria-valuemin":
-                return "4"
+                return str(self.page.aria_raw_min)
             if name == "aria-valuemax":
-                return "15"
+                return str(self.page.aria_raw_max)
             if name == "aria-valuenow":
-                return str(self.page.duration)
+                return str(self.page.aria_raw_value)
+            if name == "aria-valuetext":
+                return f"{self.page.duration}s"
         if name == "role":
             return self.role
         if name == "aria-label":
@@ -251,11 +276,13 @@ class _FakeElement:
         if self.kind != "aria":
             raise RuntimeError("not an aria slider")
         self.page.slider_presses.append(key)
-        if key == "Home":
-            self.page.duration = 4
-        elif key == "ArrowRight":
-            self.page.duration = min(15, self.page.duration + 1)
-        self.page.schedule_trigger_update()
+        if self.page.aria_keyboard_updates:
+            if key == "Home":
+                self.page.set_aria_raw(self.page.aria_raw_min)
+            elif key == "ArrowRight":
+                self.page.set_aria_raw(
+                    min(self.page.aria_raw_max, self.page.aria_raw_value + 1)
+                )
 
     async def inner_text(self) -> str:
         if self.kind == "trigger":
@@ -263,8 +290,12 @@ class _FakeElement:
             if self.page.trigger_inner_text_calls <= self.page.readback_stale_calls:
                 stale = self.page.readback_stale_duration
                 if stale is not None:
+                    stale_ratio = (
+                        self.page.readback_stale_ratio
+                        or self.page.display_ratio
+                    )
                     return (
-                        f"{self.page.trigger_prefix}{self.page.display_ratio} · "
+                        f"{self.page.trigger_prefix}{stale_ratio} · "
                         f"{stale}s{self.page.trigger_suffix}"
                     )
         return self._text()
@@ -276,9 +307,14 @@ class _FakeElement:
             return self.box
         return {"x": 200, "y": 100, "width": 16, "height": 16}
 
+    async def count(self) -> int:
+        return 1
+
     def locator(self, selector: str):
+        if "data-slot='slider-track'" in selector:
+            return _FakeElement(self.page, "track")
         assert selector == "xpath=.."
-        return _FakeElement(self.page, "track")
+        return _FakeElement(self.page, "thumb_parent")
 
 
 class _FakeLocator:
@@ -460,6 +496,12 @@ class _FakePage:
         trigger_suffix: str = "",
         readback_stale_calls: int = 0,
         readback_stale_duration: int | None = None,
+        readback_stale_ratio: str | None = None,
+        aria_keyboard_updates: bool = True,
+        aria_native_updates: bool = True,
+        aria_mouse_updates: bool = True,
+        aria_raw_min: int = 4,
+        aria_raw_max: int = 15,
         extra_buttons: list[str] | None = None,
         more_buttons: list[dict] | None = None,
         model_anchor: bool = False,
@@ -496,6 +538,7 @@ class _FakePage:
         self.trigger_suffix = trigger_suffix
         self.readback_stale_calls = readback_stale_calls
         self.readback_stale_duration = readback_stale_duration
+        self.readback_stale_ratio = readback_stale_ratio
         self.trigger_inner_text_calls = 0
         self.trigger_updates = trigger_updates
         self.trigger_update_delay_ms = trigger_update_delay_ms
@@ -509,7 +552,15 @@ class _FakePage:
         self.ratio_clicks: list[str | None] = []
         self.range_fills: list[str] = []
         self.slider_presses: list[str] = []
+        self.slider_native_values: list[int] = []
+        self.last_slider_requested: int | None = None
         self.slider_focused = False
+        self.aria_keyboard_updates = aria_keyboard_updates
+        self.aria_native_updates = aria_native_updates
+        self.aria_mouse_updates = aria_mouse_updates
+        self.aria_raw_min = aria_raw_min
+        self.aria_raw_max = aria_raw_max
+        self.aria_raw_value = aria_raw_min + (duration - 4)
         self.trigger = _FakeElement(
             self,
             "trigger",
@@ -557,9 +608,15 @@ class _FakePage:
             )
         ]
         self.range_element = _FakeElement(self, "range")
-        self.aria_element = _FakeElement(self, "aria")
+        self.aria_element = _FakeElement(
+            self,
+            "aria",
+            role="slider",
+            aria_label="视频时长",
+            data_testid="duration-slider",
+        )
         self.keyboard = _FakeKeyboard(self)
-        self.mouse = _FakeMouse()
+        self.mouse = _FakeMouse(self)
 
     @property
     def dom_elements(self) -> list[_FakeElement]:
@@ -654,6 +711,12 @@ class _FakePage:
             self.display_ratio = self.ratio
             self.display_duration = self.duration
             self.pending_trigger_update_ms = None
+
+    def set_aria_raw(self, raw_value: int) -> None:
+        self.aria_raw_value = raw_value
+        self.duration = 4 + (raw_value - self.aria_raw_min)
+        self.duration_has_been_set = True
+        self.schedule_trigger_update()
 
     async def wait_for_timeout(self, milliseconds: int):
         if self.pending_escape_close_ms is not None:
@@ -878,15 +941,17 @@ async def test_apply_video_options_finds_role_button_trigger_with_nested_text():
 @pytest.mark.asyncio
 async def test_apply_video_options_retries_readback_for_prefixed_trigger(caplog):
     """A stale first readback must enter the second independent readback phase."""
-    # The first phase polls 30 times at 50 ms. Keep the old duration for that
-    # entire phase, then expose the updated value on the retry phase.
+    # The first phase polls 60 times at 50 ms. Keep the old ratio for that
+    # entire phase, then expose the updated summary on the retry phase. A
+    # matching ratio with a wrong duration is rejected immediately instead.
     page = _FakePage(
         ratio="自动",
         duration=9,
         trigger_prefix="视频生成 · ",
         trigger_suffix=" · 默认",
-        readback_stale_calls=30,
+        readback_stale_calls=60,
         readback_stale_duration=9,
+        readback_stale_ratio="自动",
     )
 
     with caplog.at_level(logging.WARNING, logger="doupool.video.browser"):
@@ -894,10 +959,10 @@ async def test_apply_video_options_retries_readback_for_prefixed_trigger(caplog)
 
     assert page.ratio == "1:1"
     assert page.duration == 5
-    assert page.trigger_inner_text_calls >= 31
+    assert page.trigger_inner_text_calls >= 61
     assert page.trigger._text() == "视频生成 · 1:1 · 5s · 默认"
     assert "event=video_options_readback_retry" in caplog.text
-    assert "actual='视频生成 · 1:1 · 9s · 默认'" in caplog.text
+    assert "actual='视频生成 · 自动 · 9s · 默认'" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -944,7 +1009,120 @@ async def test_apply_video_options_uses_aria_slider_fallback():
     assert page.duration == 5
     assert page.slider_focused is True
     assert page.slider_presses == ["Home", "ArrowRight"]
-    assert page.mouse.downs == 0
+    assert page.slider_native_values == [5]
+    assert page.mouse.downs == 1
+    assert page.mouse.ups == 1
+
+
+@pytest.mark.asyncio
+async def test_aria_slider_native_path_runs_when_keyboard_does_not_commit(caplog):
+    page = _FakePage(
+        slider_kind="aria",
+        duration=9,
+        aria_keyboard_updates=False,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="doupool.video.browser"):
+        await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert page.slider_presses == ["Home", "ArrowRight"]
+    assert page.slider_native_values == [5]
+    assert page.mouse.downs == 1
+    assert page.duration == 5
+    assert "event=aria_slider_set_path path=keyboard" in caplog.text
+    assert "event=aria_slider_set_path path=native" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_aria_slider_mouse_path_commits_when_other_paths_do_not():
+    page = _FakePage(
+        slider_kind="aria",
+        duration=9,
+        aria_keyboard_updates=False,
+        aria_native_updates=False,
+    )
+
+    await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert page.slider_native_values == [5]
+    assert page.mouse.downs == 1
+    assert page.mouse.ups == 1
+    assert page.duration == 5
+
+
+@pytest.mark.asyncio
+async def test_aria_slider_fails_when_all_set_paths_leave_wrong_value():
+    page = _FakePage(
+        slider_kind="aria",
+        duration=9,
+        aria_keyboard_updates=False,
+        aria_native_updates=False,
+        aria_mouse_updates=False,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"expected=5s expected_raw=5 actual_raw='9'",
+    ):
+        await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert page.mouse.downs == 1
+
+
+@pytest.mark.asyncio
+async def test_aria_slider_probe_logs_dom_identity(caplog):
+    page = _FakePage(slider_kind="aria", duration=9)
+
+    with caplog.at_level(logging.DEBUG, logger="doupool.video.browser"):
+        await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert "event=aria_slider_probe phase=before" in caplog.text
+    assert "tag='DIV'" in caplog.text
+    assert "aria_label='视频时长'" in caplog.text
+    assert "role='slider'" in caplog.text
+    assert "data_testid='duration-slider'" in caplog.text
+    assert "aria_valuenow='9'" in caplog.text
+    assert "bbox=" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_aria_slider_maps_radix_index_domain_to_duration(caplog):
+    page = _FakePage(
+        slider_kind="aria",
+        duration=10,
+        aria_raw_min=0,
+        aria_raw_max=11,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="doupool.video.browser"):
+        await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert page.aria_raw_value == 1
+    assert page.duration == 5
+    assert page.slider_presses == ["Home", "ArrowRight"]
+    assert page.slider_native_values == [1]
+    assert page.mouse.moves[-1][0] == pytest.approx(120.0)
+    assert "aria_valuemin='0'" in caplog.text
+    assert "aria_valuemax='11'" in caplog.text
+    assert "aria_valuenow='6'" in caplog.text
+    assert "requested_seconds=5 target_raw=1" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_min,raw_max", [(0, 100), (2, 13)])
+async def test_aria_slider_rejects_unexpected_raw_domain(raw_min, raw_max):
+    page = _FakePage(
+        slider_kind="aria",
+        duration=10,
+        aria_raw_min=raw_min,
+        aria_raw_max=raw_max,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"raw_min={raw_min} raw_max={raw_max}",
+    ):
+        await _apply_video_options(page, ratio="1:1", duration=5)
 
 
 @pytest.mark.asyncio
@@ -1026,6 +1204,26 @@ async def test_apply_video_options_fails_when_trigger_readback_stays_stale():
 
     with pytest.raises(RuntimeError, match="视频参数设置后校验失败"):
         await _apply_video_options(page, ratio="16:9", duration=10)
+
+
+@pytest.mark.asyncio
+async def test_a_readback_rejects_matching_ratio_with_wrong_duration(caplog):
+    page = _FakePage(
+        trigger_updates=False,
+        ratio="1:1",
+        duration=9,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="doupool.video.browser"):
+        with pytest.raises(
+            RuntimeError,
+            match=r"expected=1:1 · 5s.*actual='1:1 · 9s'",
+        ):
+            await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert "event=video_options_readback_failed" in caplog.text
+    assert "actual_duration=9" in caplog.text
+    assert "event=video_options_readback_retry" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1625,6 +1823,33 @@ async def test_apply_video_options_type_b_accepts_verified_controls_without_summ
     assert page.range_fills == ["5"]
     assert len(page.more_clicks) == 4
     assert all(clicked is page.more_elements[0] for clicked in page.more_clicks)
+    assert page.menu_open is False
+
+
+@pytest.mark.asyncio
+async def test_type_b_controls_readback_maps_radix_index_to_seconds():
+    page = _FakePage(
+        has_trigger=False,
+        model_anchor=True,
+        slider_kind="aria",
+        duration=10,
+        aria_raw_min=0,
+        aria_raw_max=11,
+        more_buttons=[
+            {
+                "value": "⋯",
+                "tag": "button",
+                "adjacent_to_model": True,
+                "action": "toggle_menu",
+                "box": {"x": 260, "y": 100, "width": 32, "height": 32},
+            },
+        ],
+    )
+
+    await _apply_video_options(page, ratio="1:1", duration=5)
+
+    assert page.aria_raw_value == 1
+    assert page.duration == 5
     assert page.menu_open is False
 
 

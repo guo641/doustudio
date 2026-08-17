@@ -47,6 +47,8 @@ SEND_BTN_SEL = ".send-btn-wrapper button"
 SEND_BTN_FALLBACK_SEL = "button:has(svg path[d^='M4.93934 10.2598'])"
 CREATE_IMAGE_URL = "https://www.doubao.com/chat/create-image"
 _VIDEO_RATIO_OPTIONS = ("3:4", "4:3", "9:16", "16:9", "1:1", "21:9")
+_VIDEO_DURATION_MIN_SECONDS = 4
+_VIDEO_DURATION_MAX_SECONDS = 15
 _VIDEO_OPTIONS_TRIGGER_RE = re.compile(
     r"(?:自动|3:4|4:3|9:16|16:9|1:1|21:9)\s*·\s*(?:[4-9]|1[0-5])s"
 )
@@ -106,7 +108,7 @@ _VIDEO_MORE_OPTIONS_MAX_HORIZONTAL_GAP_PX = 160
 _VIDEO_MORE_OPTIONS_MAX_VERTICAL_DELTA_PX = 32
 _VIDEO_MORE_OPTIONS_MAX_ICON_SIZE_PX = 64
 _VIDEO_OPTIONS_MENU_WAIT_MS = 1_000
-_VIDEO_OPTIONS_READBACK_WAIT_MS = 1_500
+_VIDEO_OPTIONS_READBACK_WAIT_MS = 3_000
 _VIDEO_OPTIONS_CLOSE_WAIT_MS = 1_500
 _VIDEO_OPTIONS_CLOSED_STABLE_MS = 200
 _VIDEO_OPTIONS_TRIGGER_WAIT_MS = 3_000
@@ -1176,6 +1178,23 @@ async def _visible_video_ratio_options(page: Page) -> list[str]:
     return visible
 
 
+async def _video_options_visibility_snapshot(
+    page: Page,
+) -> tuple[int | None, int | None]:
+    """Read-only visibility counts used by the video-options diagnostics."""
+    try:
+        range_inputs = await _visible_locators(page.locator("input[type='range']"))
+        aria_sliders = await _visible_locators(page.locator("[role='slider']"))
+        duration_visible: int | None = len(range_inputs) + len(aria_sliders)
+    except Exception:
+        duration_visible = None
+    try:
+        ratio_visible: int | None = len(await _visible_video_ratio_options(page))
+    except Exception:
+        ratio_visible = None
+    return duration_visible, ratio_visible
+
+
 async def _wait_for_video_ratio_options(
     page: Page,
     *,
@@ -1237,6 +1256,29 @@ async def _video_options_locator_signature(locator) -> tuple:
         else ()
     )
     return text, *attributes, position
+
+
+async def _video_options_locator_signature_without_text(locator) -> tuple:
+    """Read-only signature that avoids an extra inner_text() observation."""
+    attributes: list[str] = []
+    for name in ("aria-label", "title", "class"):
+        try:
+            attributes.append((await locator.get_attribute(name)) or "")
+        except Exception:
+            attributes.append("")
+    try:
+        box = await locator.bounding_box()
+    except Exception:
+        box = None
+    position = (
+        tuple(
+            round(float(box.get(key, 0)), 1)
+            for key in ("x", "y", "width", "height")
+        )
+        if box
+        else ()
+    )
+    return "", *attributes, position
 
 
 async def _find_video_more_options_trigger(
@@ -1914,6 +1956,11 @@ async def _open_video_options(page: Page):
     summary_attempts = 0
     prefer_more = False
     for attempt in range(10):
+        _LOGGER.debug(
+            "event=video_options_open_phase start_url=%s attempt=%s",
+            page.url,
+            attempt,
+        )
         trigger_result = await _wait_for_video_options_trigger(
             page,
             excluded_more_signatures=excluded_more_signatures,
@@ -1938,6 +1985,23 @@ async def _open_video_options(page: Page):
         try:
             await trigger.click()
             candidate_clicked = True
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                diagnostic_trigger_signature = (
+                    trigger_signature
+                    if trigger_signature is not None
+                    else await _video_options_locator_signature_without_text(trigger)
+                )
+                duration_visible, ratio_visible = (
+                    await _video_options_visibility_snapshot(page)
+                )
+                _LOGGER.debug(
+                    "event=video_options_after_click kind=%s "
+                    "trigger_signature=%r duration_visible=%s ratio_visible=%s",
+                    trigger_kind,
+                    diagnostic_trigger_signature,
+                    duration_visible,
+                    ratio_visible,
+                )
             visible_options = await _wait_for_video_ratio_options(page)
 
             # 少数灰度 UI 是两级菜单：三点先展开外层，再点外层中的
@@ -2030,11 +2094,62 @@ async def _find_video_duration_control(page: Page):
     return None, None
 
 
+async def _video_options_duration_search_snapshot(
+    page: Page,
+) -> tuple[str, int]:
+    """Read-only range/ARIA slider count for duration-search diagnostics."""
+    try:
+        range_count = len(
+            await _visible_locators(page.locator("input[type='range']"))
+        )
+    except Exception:
+        range_count = 0
+    try:
+        aria_count = len(
+            await _visible_locators(page.locator("[role='slider']"))
+        )
+    except Exception:
+        aria_count = 0
+    if range_count:
+        return "range", range_count + aria_count
+    if aria_count:
+        return "aria", aria_count
+    return "none", 0
+
+
 async def _wait_for_video_duration_control(page: Page, *, timeout_ms: int = 500):
     step_ms = 50
     attempts = max(1, (timeout_ms + step_ms - 1) // step_ms)
+    started = time.monotonic()
     for attempt in range(attempts):
-        kind, control = await _find_video_duration_control(page)
+        try:
+            kind, control = await _find_video_duration_control(page)
+        except Exception:
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                visible_kind, visible_count = (
+                    await _video_options_duration_search_snapshot(page)
+                )
+                _LOGGER.debug(
+                    "event=video_options_duration_search step_ms=%s total_ms=%s "
+                    "visible_kind=%s visible_count=%s",
+                    step_ms,
+                    round((time.monotonic() - started) * 1000),
+                    visible_kind,
+                    visible_count,
+                )
+            raise
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            visible_kind, visible_count = (
+                await _video_options_duration_search_snapshot(page)
+            )
+            _LOGGER.debug(
+                "event=video_options_duration_search step_ms=%s total_ms=%s "
+                "visible_kind=%s visible_count=%s",
+                step_ms,
+                round((time.monotonic() - started) * 1000),
+                visible_kind,
+                visible_count,
+            )
         if control is not None:
             return kind, control
         if attempt + 1 < attempts:
@@ -2069,34 +2184,208 @@ async def _set_native_range_value(control, duration: int) -> None:
 
 
 async def _set_aria_slider_value(page: Page, control, duration: int) -> None:
-    min_value = int(await control.get_attribute("aria-valuemin") or 4)
-    max_value = int(await control.get_attribute("aria-valuemax") or 15)
-    if not min_value <= duration <= max_value:
+    if not _VIDEO_DURATION_MIN_SECONDS <= duration <= _VIDEO_DURATION_MAX_SECONDS:
         raise ValueError(
-            f"视频时长必须在 {min_value} 到 {max_value} 秒之间: {duration}"
+            "视频时长必须在 "
+            f"{_VIDEO_DURATION_MIN_SECONDS} 到 "
+            f"{_VIDEO_DURATION_MAX_SECONDS} 秒之间: {duration}"
         )
 
     try:
+        raw_min = int(float(
+            await control.get_attribute("aria-valuemin")
+            or _VIDEO_DURATION_MIN_SECONDS
+        ))
+        raw_max = int(float(
+            await control.get_attribute("aria-valuemax")
+            or _VIDEO_DURATION_MAX_SECONDS
+        ))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("视频时长滑块值域不可解析") from exc
+
+    supported_domains = {
+        (_VIDEO_DURATION_MIN_SECONDS, _VIDEO_DURATION_MAX_SECONDS),
+        (0, _VIDEO_DURATION_MAX_SECONDS - _VIDEO_DURATION_MIN_SECONDS),
+    }
+    if (raw_min, raw_max) not in supported_domains:
+        raise RuntimeError(
+            "视频时长滑块值域不匹配: "
+            f"raw_min={raw_min} raw_max={raw_max} "
+            f"supported_domains={sorted(supported_domains)}"
+        )
+    # 豆包当前有两种 ARIA 值域：旧 UI 直接用 4..15 秒，新 Radix UI
+    # 用 0..11 作为 4..15 秒的索引。两者跨度都为 11，因此统一把秒数
+    # 映射到 raw_min 起算的离散索引。
+    target_raw = raw_min + (duration - _VIDEO_DURATION_MIN_SECONDS)
+
+    async def _slider_probe(phase: str) -> None:
+        """Emit a read-only snapshot of the selected slider in DEBUG logs."""
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        try:
+            tag_name = await control.evaluate("el => el.tagName")
+        except Exception:
+            tag_name = None
+        attrs: dict[str, str | None] = {}
+        for name in (
+            "aria-label",
+            "role",
+            "data-testid",
+            "aria-valuemin",
+            "aria-valuemax",
+            "aria-valuenow",
+            "aria-valuetext",
+        ):
+            try:
+                attrs[name] = await control.get_attribute(name)
+            except Exception:
+                attrs[name] = None
+        try:
+            box = await control.bounding_box()
+        except Exception:
+            box = None
+        try:
+            data_attrs = await control.evaluate(
+                """el => {
+                    for (let node = el; node; node = node.parentElement) {
+                        const attrs = Object.fromEntries(
+                            [...node.attributes]
+                                .filter(attr => attr.name.startsWith('data-'))
+                                .map(attr => [attr.name, attr.value])
+                        );
+                        if (Object.keys(attrs).length) return attrs;
+                    }
+                    return {};
+                }"""
+            )
+        except Exception:
+            data_attrs = None
+        try:
+            ancestor = control.locator(
+                "xpath=ancestor::*[contains(@class,'option') or "
+                "contains(@class,'panel') or @role='dialog' or "
+                "@data-slot='slider'][1]"
+            )
+            ancestor_html = (
+                await ancestor.evaluate("el => el.outerHTML.slice(0, 400)")
+                if await ancestor.count()
+                else None
+            )
+        except Exception:
+            ancestor_html = None
+        _LOGGER.debug(
+            "event=aria_slider_probe phase=%s tag=%r aria_label=%r role=%r "
+            "data_testid=%r data_attrs=%r aria_valuemin=%r aria_valuemax=%r "
+            "aria_valuenow=%r aria_valuetext=%r bbox=%r ancestor_html=%r",
+            phase,
+            tag_name,
+            attrs["aria-label"],
+            attrs["role"],
+            attrs["data-testid"],
+            data_attrs,
+            attrs["aria-valuemin"],
+            attrs["aria-valuemax"],
+            attrs["aria-valuenow"],
+            attrs["aria-valuetext"],
+            box,
+            ancestor_html,
+        )
+
+    await _slider_probe("before")
+    keyboard_now: str | None = None
+    try:
         await control.focus()
         await control.press("Home")
-        for _ in range(duration - min_value):
+        for _ in range(target_raw - raw_min):
             await control.press("ArrowRight")
         await page.wait_for_timeout(100)
-        now = await control.get_attribute("aria-valuenow")
-        if now is not None and int(float(now)) == duration:
-            return
+        keyboard_now = await control.get_attribute("aria-valuenow")
+    except Exception:
+        keyboard_now = None
+
+    _LOGGER.debug(
+        "event=aria_slider_set_path path=keyboard requested_seconds=%s "
+        "target_raw=%s observed_raw=%r",
+        duration,
+        target_raw,
+        keyboard_now,
+    )
+
+    # Dispatch the native value/change events as a second path.  This is
+    # useful for React wrappers that ignore Playwright's synthetic key events;
+    # the mouse path below remains the authoritative fallback for custom
+    # div[role=slider] implementations.
+    try:
+        await control.evaluate(
+            """(el, value) => {
+                const desc = el.tagName === 'INPUT'
+                    ? Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, 'value'
+                    )
+                    : null;
+                if (desc && desc.set) {
+                    desc.set.call(el, String(value));
+                }
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }""",
+            target_raw,
+        )
+    except Exception as exc:
+        _LOGGER.debug("event=aria_slider_set_path path=native error=%r", exc)
+    native_now: str | None = None
+    try:
+        native_now = await control.get_attribute("aria-valuenow")
     except Exception:
         pass
+    _LOGGER.debug(
+        "event=aria_slider_set_path path=native requested_seconds=%s "
+        "target_raw=%s observed_raw=%r",
+        duration,
+        target_raw,
+        native_now,
+    )
 
-    # 某些自定义 slider 不响应键盘,退回到真实鼠标拖动。
+    # 不把 ``aria-valuenow`` 变成目标值当作成功：对 React 受控的
+    # ``div[role=slider]``，上面的 DOM 属性/事件路径可能只改了 DOM，
+    # React state 仍保持旧值。始终走真实鼠标路径，让控件自己的事件链
+    # 提交状态；最后再用 aria-valuenow 做严格校验。
     thumb_box = await control.bounding_box()
-    track_box = await control.locator("xpath=..").bounding_box()
-    if not thumb_box or not track_box or track_box["width"] <= 0:
+    track_box = None
+    try:
+        radix_track = control.locator(
+            "xpath=ancestor::*[@data-slot='slider'][1]"
+            "//*[@data-slot='slider-track']"
+        )
+        if await radix_track.count():
+            track_box = await radix_track.bounding_box()
+    except Exception:
+        track_box = None
+    if (
+        not track_box
+        or not thumb_box
+        or track_box["width"] <= thumb_box["width"]
+    ):
+        try:
+            parent_box = await control.locator("xpath=..").bounding_box()
+        except Exception:
+            parent_box = None
+        if (
+            parent_box
+            and thumb_box
+            and parent_box["width"] > thumb_box["width"]
+        ):
+            track_box = parent_box
+    if (
+        not thumb_box
+        or not track_box
+        or track_box["width"] <= thumb_box["width"]
+    ):
         raise RuntimeError("视频时长滑块无法定位拖动轨道")
     start_x = thumb_box["x"] + thumb_box["width"] / 2
     start_y = thumb_box["y"] + thumb_box["height"] / 2
     target_x = track_box["x"] + track_box["width"] * (
-        (duration - min_value) / (max_value - min_value)
+        (target_raw - raw_min) / (raw_max - raw_min)
     )
     await page.mouse.move(start_x, start_y)
     await page.mouse.down()
@@ -2105,9 +2394,24 @@ async def _set_aria_slider_value(page: Page, control, duration: int) -> None:
     await page.wait_for_timeout(100)
 
     now = await control.get_attribute("aria-valuenow")
-    if now is not None and int(float(now)) != duration:
+    _LOGGER.debug(
+        "event=aria_slider_set_path path=mouse requested_seconds=%s "
+        "target_raw=%s observed_raw=%r thumb_box=%r track_box=%r",
+        duration,
+        target_raw,
+        now,
+        thumb_box,
+        track_box,
+    )
+    await _slider_probe("after_mouse")
+    try:
+        actual = int(float(now)) if now is not None else None
+    except (TypeError, ValueError):
+        actual = None
+    if actual != target_raw:
         raise RuntimeError(
-            f"视频时长滑块设置失败: expected={duration}s actual={now}s"
+            "视频时长滑块设置失败: "
+            f"expected={duration}s expected_raw={target_raw} actual_raw={now!r}"
         )
 
 
@@ -2147,6 +2451,8 @@ async def _wait_for_video_options_readback(
     expected = re.compile(
         rf"{re.escape(ratio)}\s*·\s*{duration}s"
     )
+    ratio_expected = re.compile(rf"{re.escape(ratio)}\s*·")
+    duration_pattern = re.compile(r"\b([4-9]|1[0-5])s\b")
 
     if trigger_kind == "B":
         # 三点入口本身永远不会变成「1:1 · 5s」。重新打开菜单，若灰度
@@ -2219,9 +2525,47 @@ async def _wait_for_video_options_readback(
                                             "aria-valuenow"
                                         )
                                 try:
-                                    actual_duration = int(float(raw_duration))
+                                    actual_raw = int(float(raw_duration))
                                 except (TypeError, ValueError):
-                                    actual_duration = None
+                                    actual_raw = None
+                                if control_kind == "aria" and control is not None:
+                                    try:
+                                        raw_min = int(float(
+                                            await control.get_attribute("aria-valuemin")
+                                            or _VIDEO_DURATION_MIN_SECONDS
+                                        ))
+                                        raw_max = int(float(
+                                            await control.get_attribute("aria-valuemax")
+                                            or _VIDEO_DURATION_MAX_SECONDS
+                                        ))
+                                    except (TypeError, ValueError):
+                                        raw_min = raw_max = None
+                                    if (
+                                        actual_raw is not None
+                                        and raw_min is not None
+                                        and raw_max is not None
+                                        and (raw_min, raw_max)
+                                        in {
+                                            (
+                                                _VIDEO_DURATION_MIN_SECONDS,
+                                                _VIDEO_DURATION_MAX_SECONDS,
+                                            ),
+                                            (
+                                                0,
+                                                _VIDEO_DURATION_MAX_SECONDS
+                                                - _VIDEO_DURATION_MIN_SECONDS,
+                                            ),
+                                        }
+                                    ):
+                                        actual_duration = (
+                                            _VIDEO_DURATION_MIN_SECONDS
+                                            + actual_raw
+                                            - raw_min
+                                        )
+                                    else:
+                                        actual_duration = None
+                                else:
+                                    actual_duration = actual_raw
                                 if actual_duration == duration:
                                     break
                                 if duration_attempt + 1 < duration_attempts:
@@ -2275,7 +2619,7 @@ async def _wait_for_video_options_readback(
             )
 
     actual = ""
-    for readback_attempt in range(2):
+    for readback_attempt in range(3):
         step_ms = 50
         attempts = max(
             1,
@@ -2285,19 +2629,37 @@ async def _wait_for_video_options_readback(
             trigger = await _find_video_options_trigger(page)
             if trigger is not None:
                 actual = await trigger.inner_text()
-                if expected.search(actual):
-                    return actual
+                if ratio_expected.search(actual):
+                    duration_match = duration_pattern.search(actual)
+                    if duration_match is not None:
+                        actual_duration = int(duration_match.group(1))
+                        if actual_duration != duration:
+                            _LOGGER.warning(
+                                "event=video_options_readback_failed "
+                                "url=%s expected=%r actual=%r "
+                                "actual_duration=%s",
+                                page.url,
+                                f"{ratio} · {duration}s",
+                                actual,
+                                actual_duration,
+                            )
+                            raise RuntimeError(
+                                "视频参数设置后校验失败: "
+                                f"expected={ratio} · {duration}s "
+                                f"actual={actual!r}"
+                            )
+                        return actual
             if attempt + 1 < attempts:
                 await page.wait_for_timeout(step_ms)
-        if readback_attempt == 0:
+        if readback_attempt < 2:
             _LOGGER.warning(
                 "event=video_options_readback_retry url=%s expected=%r actual=%r "
-                "retry_after_ms=500",
+                "retry_after_ms=1000",
                 page.url,
                 f"{ratio} · {duration}s",
                 actual,
             )
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(1000)
     _LOGGER.warning(
         "event=video_options_readback_failed url=%s expected=%r actual=%r "
         "trigger_pattern=%r",
@@ -2318,18 +2680,47 @@ async def _close_video_options(
     trigger_kind: str | None = None,
 ) -> None:
     trigger_kind = trigger_kind or await _video_options_trigger_kind(trigger)
+    # Keep the normal A path observation-free here: inner_text() is also used
+    # by readback and some page implementations expose it through a live
+    # React render.  B's icon trigger has no useful text, but reading it is
+    # useful for the requested diagnostic signature.
+    trigger_text = ""
     if trigger_kind == "B":
-        # 两级菜单下 Escape 可能只关闭比例内层而保留三点外层。B 型入口
-        # 的根三点是确定的 toggle，优先点原 locator 一次关闭整个外层。
         try:
             trigger_text = await trigger.inner_text()
         except Exception:
             trigger_text = ""
+    else:
+        try:
+            trigger_text = (
+                await trigger.get_attribute("aria-label")
+                or await trigger.get_attribute("title")
+                or ""
+            )
+        except Exception:
+            trigger_text = ""
+    if trigger_kind == "B":
+        # 两级菜单下 Escape 可能只关闭比例内层而保留三点外层。B 型入口
+        # 的根三点是确定的 toggle，优先点原 locator 一次关闭整个外层。
+        _LOGGER.debug(
+            "event=video_options_close_attempt kind=%s trigger_text=%r "
+            "reason=%s",
+            trigger_kind,
+            trigger_text,
+            "normal",
+        )
         toggle_error: Exception | None = None
         try:
             await trigger.click()
         except Exception as first_error:
             try:
+                _LOGGER.debug(
+                    "event=video_options_close_attempt kind=%s "
+                    "trigger_text=%r reason=%s",
+                    trigger_kind,
+                    trigger_text,
+                    "fallback_reclick",
+                )
                 trigger = (
                     await _find_video_options_trigger(page, prefer_more=True)
                     or trigger
@@ -2350,6 +2741,13 @@ async def _close_video_options(
         else:
             visible_after_toggle = await _visible_video_ratio_options(page)
 
+        _LOGGER.debug(
+            "event=video_options_close_attempt kind=%s trigger_text=%r "
+            "reason=%s",
+            trigger_kind,
+            trigger_text,
+            "fallback_escape",
+        )
         await page.keyboard.press("Escape")
         visible_after_escape = await _wait_for_video_options_closed(page)
         if len(visible_after_escape) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
@@ -2370,6 +2768,12 @@ async def _close_video_options(
             f"trigger_text={trigger_text!r} visible={visible_after_escape}"
         )
 
+    _LOGGER.debug(
+        "event=video_options_close_attempt kind=%s trigger_text=%r reason=%s",
+        trigger_kind,
+        trigger_text,
+        "normal",
+    )
     await page.keyboard.press("Escape")
     visible_after_escape = await _wait_for_video_options_closed(page)
     if len(visible_after_escape) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
@@ -2377,7 +2781,17 @@ async def _close_video_options(
 
     # 部分页面版本不处理 Escape,退回再次点击组合按钮关闭 toggle。
     trigger = await _find_video_options_trigger(page) or trigger
-    trigger_text = await trigger.inner_text()
+    try:
+        trigger_text = await trigger.inner_text()
+    except Exception:
+        trigger_text = ""
+    _LOGGER.debug(
+        "event=video_options_close_attempt kind=%s trigger_text=%r "
+        "reason=%s",
+        trigger_kind,
+        trigger_text,
+        "fallback_reclick",
+    )
     await trigger.click()
     visible_after_toggle = await _wait_for_video_options_closed(page)
     if len(visible_after_toggle) < _VIDEO_OPTIONS_MIN_VISIBLE_RATIOS:
@@ -2409,8 +2823,12 @@ async def _apply_video_options(
         raise RuntimeError(
             f"视频比例选项不存在: {ratio}; 可选项={list(_VIDEO_RATIO_OPTIONS)}"
         )
-    if not 4 <= duration <= 15:
-        raise ValueError(f"视频时长必须在 4 到 15 秒之间: {duration}")
+    if not _VIDEO_DURATION_MIN_SECONDS <= duration <= _VIDEO_DURATION_MAX_SECONDS:
+        raise ValueError(
+            "视频时长必须在 "
+            f"{_VIDEO_DURATION_MIN_SECONDS} 到 "
+            f"{_VIDEO_DURATION_MAX_SECONDS} 秒之间: {duration}"
+        )
 
     trigger, visible_options, trigger_kind = await _open_video_options(page)
     root_trigger = trigger
@@ -2429,6 +2847,24 @@ async def _apply_video_options(
         )
     await ratio_button.click()
     await page.wait_for_timeout(100)
+    if _LOGGER.isEnabledFor(logging.DEBUG):
+        duration_visible, ratio_visible = (
+            await _video_options_visibility_snapshot(page)
+        )
+        try:
+            root_signature = await _video_options_locator_signature_without_text(
+                root_trigger
+            )
+        except Exception:
+            root_signature = None
+        _LOGGER.debug(
+            "event=video_options_after_ratio_click ratio=%s "
+            "duration_visible=%s ratio_visible=%s root_signature=%r",
+            ratio,
+            duration_visible,
+            ratio_visible,
+            root_signature,
+        )
 
     kind, duration_control = await _wait_for_video_duration_control(page)
     if duration_control is None:
