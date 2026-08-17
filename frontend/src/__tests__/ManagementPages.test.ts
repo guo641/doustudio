@@ -1,12 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/vue';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
-const api = vi.hoisted(() => ({
-  listLogs: vi.fn().mockResolvedValue([{ id:1, level:'ERROR', module:'doupool.video', event:'failed', message:'rate limited', created_at:'2026-07-13T12:00:00' }]),
-  clearLogs: vi.fn().mockResolvedValue(undefined),
-  // v0.2.29:每日额度字段从 daily_quota 改为 daily_quota_shared(共享池)。
-  // max_concurrency 默认 1 保留,default_duration 默认 5 保留。
-  getSettings: vi.fn().mockResolvedValue({
+const api = vi.hoisted(() => {
+  const defaultSettings = {
     max_concurrency: 1,
     daily_quota_shared: 50,
     quota_reset_time: '00:00',
@@ -24,10 +20,17 @@ const api = vi.hoisted(() => ({
     max_reject_retries: 2,
     runner_window_visible: true,
     default_timeout_minutes: 7,
-    // v0.2.34:并发任务间隔(秒)—— SettingsPage 新增字段。
     task_interval_seconds: 0,
-  }),
+  };
+  return {
+  listLogs: vi.fn().mockResolvedValue([{ id:1, level:'ERROR', module:'doupool.video', event:'failed', message:'rate limited', created_at:'2026-07-13T12:00:00' }]),
+  clearLogs: vi.fn().mockResolvedValue(undefined),
+  // v0.2.29:每日额度字段从 daily_quota 改为 daily_quota_shared(共享池)。
+  // max_concurrency 默认 1 保留,default_duration 默认 5 保留。
+  getSettings: vi.fn().mockImplementation(async () => ({ ...defaultSettings })),
   saveSettings: vi.fn().mockImplementation(async value=>value),
+  pickDownloadDir: vi.fn().mockResolvedValue({ path: '/chosen/downloads' }),
+  openDownloadDir: vi.fn().mockResolvedValue({ ok: true }),
   backupDatabase: vi.fn().mockResolvedValue({ path:'/tmp/backup.sqlite3' }),
   // v0.2.37.3:AccountTable 不再展示 token 列,getWebMSSDKTokens / refreshWebMSSDKTokens
   // 也从 AccountTable 调用链里删除 —— 老 mock 留着会误导读者以为组件还在用,直接清掉。
@@ -38,7 +41,8 @@ const api = vi.hoisted(() => ({
   resetAllQuotas: vi.fn().mockResolvedValue({ reset_count: 3, reset_at: '2026-08-06T00:00:00' }),
   // v0.2.29:open/close browser status —— 老测试 onMounted 第二轮 poll 会调。
   getAccountBrowserStatus: vi.fn().mockResolvedValue({ open: false }),
-}));
+  };
+});
 vi.mock('../api', () => api);
 
 import AccountTable from '../components/AccountTable.vue';
@@ -55,6 +59,8 @@ beforeEach(() => {
   api.resetAccountQuota.mockClear();
   api.resetAllQuotas.mockClear();
   api.saveSettings.mockClear();
+  api.pickDownloadDir.mockClear();
+  api.openDownloadDir.mockClear();
   api.backupDatabase.mockClear();
   api.listLogs.mockClear();
   api.clearLogs.mockClear();
@@ -205,6 +211,25 @@ it('saves settings and creates a backup', async () => {
   await waitFor(()=>expect(api.saveSettings).toHaveBeenCalledWith(expect.objectContaining({ daily_quota_shared: 8 })));
   await fireEvent.click(screen.getByRole('button', { name:'备份数据库' }));
   expect(api.backupDatabase).toHaveBeenCalled();
+});
+
+it('browses for a download directory and updates the input without saving', async () => {
+  render(SettingsPage);
+  const input = (await screen.findByLabelText('视频下载目录')) as HTMLInputElement;
+  expect(input.value).toBe('/tmp/downloads');
+
+  await fireEvent.click(screen.getByRole('button', { name: '浏览...' }));
+  await waitFor(() => expect(api.pickDownloadDir).toHaveBeenCalledWith('/tmp/downloads'));
+  expect(input.value).toBe('/chosen/downloads');
+  expect(api.saveSettings).not.toHaveBeenCalled();
+});
+
+it('opens the configured download directory', async () => {
+  render(SettingsPage);
+  await screen.findByLabelText('视频下载目录');
+
+  await fireEvent.click(screen.getByRole('button', { name: '打开' }));
+  await waitFor(() => expect(api.openDownloadDir).toHaveBeenCalledWith('/tmp/downloads'));
 });
 
 // v0.2.29:max_concurrency 输入上限 50(default_duration 是 number input 4..10)。

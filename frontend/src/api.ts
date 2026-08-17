@@ -189,6 +189,36 @@ export async function saveSettings(body: Record<string, unknown>) {
     '设置保存失败',
   );
 }
+
+// v0.3.5.13-B:让桌面端通过后端弹出系统原生目录选择器。
+// 这里只返回用户选择的路径,不直接保存 download_dir;用户仍需点击「保存设置」。
+export type PickDownloadDirResponse = { path: string | null };
+
+export async function pickDownloadDir(startDir = ''): Promise<PickDownloadDirResponse> {
+  return json(
+    await fetch('/api/settings/pick-download-dir', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ start_dir: startDir }),
+    }),
+    '选择下载目录失败',
+  );
+}
+
+// v0.3.5.13-B:在系统文件管理器中打开当前下载目录(体验增强,不修改设置)。
+export type OpenDownloadDirResponse = { ok: boolean; message?: string };
+
+export async function openDownloadDir(path: string): Promise<OpenDownloadDirResponse> {
+  return json(
+    await fetch('/api/settings/open-dir', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ path }),
+    }),
+    '打开下载目录失败',
+  );
+}
+
 export async function backupDatabase() {
   return json(await fetch('/api/settings/backup', { method: 'POST', headers }), '数据库备份失败');
 }

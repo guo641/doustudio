@@ -1,12 +1,167 @@
 from __future__ import annotations
 
+import os
+import platform
 import re
 import sqlite3
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+# Keep the native dialog implementation outside the HTTP handler so it can be
+# exercised without starting the FastAPI app (and so cancellation is a normal
+# return value rather than an exception).  All arguments are passed as argv or
+# environment values; no user supplied path is interpolated into a shell
+# command/script.
+_WINDOWS_PICK_DIR_SCRIPT = r"""
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = '选择视频下载目录'
+$start = $env:DOUPOOL_PICK_START_DIR
+if ($start) { $dialog.SelectedPath = $start }
+$result = $dialog.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::WriteLine($dialog.SelectedPath)
+}
+"""
+
+_MACOS_PICK_DIR_SCRIPT = r"""
+on run argv
+    set promptText to "选择视频下载目录"
+    if (count of argv) > 0 and (item 1 of argv) is not "" then
+        set selectedFolder to choose folder with prompt promptText default location (POSIX file (item 1 of argv))
+    else
+        set selectedFolder to choose folder with prompt promptText
+    end if
+    return POSIX path of selectedFolder
+end run
+"""
+
+
+def _dialog_result_path(proc: subprocess.CompletedProcess) -> str | None:
+    """Return a trimmed native-dialog path, treating cancel as ``None``."""
+    if proc.returncode != 0:
+        return None
+    value = str(proc.stdout or "").strip()
+    return value or None
+
+
+def _pick_dir_windows(start_dir: str = "") -> str | None:
+    """Use a Windows Forms FolderBrowserDialog without shell interpolation."""
+    env = os.environ.copy()
+    # The PowerShell source is constant.  The initial directory is supplied
+    # through the child environment, so quotes/newlines in a path cannot alter
+    # the script being executed.
+    env["DOUPOOL_PICK_START_DIR"] = start_dir
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", _WINDOWS_PICK_DIR_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env=env,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    return _dialog_result_path(proc)
+
+
+def _pick_dir_macos(start_dir: str = "") -> str | None:
+    """Use macOS ``choose folder``; path is passed as an osascript argument."""
+    args = ["osascript", "-e", _MACOS_PICK_DIR_SCRIPT]
+    if start_dir:
+        args.append(start_dir)
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    return _dialog_result_path(proc)
+
+
+def _pick_dir_linux(start_dir: str = "") -> str | None:
+    """Try zenity first, then kdialog, on Linux desktop environments."""
+    # Match zenity's documented directory hint format and leave the path as a
+    # single argv item (no shell parsing, even when it contains spaces).
+    filename = f"{start_dir}/" if start_dir else ""
+    commands: list[list[str]] = []
+    if filename:
+        commands.append(["zenity", "--file-selection", "--directory", f"--filename={filename}"])
+    else:
+        commands.append(["zenity", "--file-selection", "--directory"])
+    # kdialog's directory chooser accepts a starting directory as its final
+    # argument.  It is a fallback for KDE/minimal installations without zenity.
+    commands.append(["kdialog", "--getexistingdirectory", start_dir or ".", "选择视频下载目录"])
+
+    for command in commands:
+        try:
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except FileNotFoundError:
+            # Only an absent helper warrants trying the next desktop backend.
+            continue
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        path = _dialog_result_path(proc)
+        if path is not None:
+            return path
+        # A completed helper with no path means cancel (or a chooser error),
+        # not "helper missing".  Never open a second dialog unexpectedly.
+        return None
+    return None
+
+
+def pick_directory(start_dir: str = "") -> str | None:
+    """Open the platform-native directory picker.
+
+    The returned path is absolute for native dialogs.  ``None`` means the
+    dialog was cancelled, the desktop helper is unavailable, or the helper
+    timed out.  This function never changes the persisted settings value.
+    """
+    start = str(start_dir or "")
+    system = platform.system()
+    if system == "Windows":
+        return _pick_dir_windows(start)
+    if system == "Darwin":
+        return _pick_dir_macos(start)
+    if system == "Linux":
+        return _pick_dir_linux(start)
+    return None
+
+
+def open_directory(path: str) -> bool:
+    """Open an existing directory in the platform file manager."""
+    directory = Path(str(path or "")).expanduser()
+    if not directory.is_dir():
+        return False
+    system = platform.system()
+    try:
+        if system == "Windows":
+            startfile = getattr(os, "startfile", None)
+            if startfile is None:  # defensive for non-Windows test hosts
+                return False
+            startfile(str(directory))
+            return True
+        command = ["open", str(directory)] if system == "Darwin" else ["xdg-open", str(directory)]
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+        return proc.returncode == 0
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
 
 
 class SettingsService:

@@ -28,6 +28,7 @@ from doupool.login.browser_sessions import (
 )
 from doupool.login.service import LoginAlreadyRunning
 from doupool.logging.setup import set_log_level
+from doupool.settings.service import open_directory, pick_directory
 from doupool.updater import check_for_update
 from doupool.video.browser import TokenBundleUnavailable, extract_webmssdk_tokens
 from doupool.video.service import NoAvailableAccount, quota_window
@@ -589,6 +590,55 @@ def create_app(
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"数据库备份失败：{exc}") from exc
         return {"path": str(path)}
+
+    @app.post("/api/settings/pick-download-dir")
+    def pick_download_dir(
+        body: dict | None = None,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """弹出系统目录选择器并返回用户选中的路径。
+
+        目录选择本身不写设置；前端把返回路径填入表单，用户点击保存后才
+        通过 ``PUT /api/settings`` 持久化。取消对话框返回 ``{"path": null}``。
+        """
+        authorize_with_license(x_doupool_token, authorization)
+        if settings_service is None:
+            raise HTTPException(status_code=503, detail="设置服务未启动")
+        payload = body or {}
+        start = str(payload.get("start_dir", "") or "").strip()
+        if not start:
+            start = str(settings_service.get().get("download_dir", "") or "")
+        try:
+            path = pick_directory(start)
+        except Exception as exc:  # native helpers are optional desktop integrations
+            logging.getLogger("doupool.api").warning(
+                "目录选择器调用失败: %s", exc,
+                extra={"event": "settings_pick_download_dir_failed"},
+            )
+            path = None
+        return {"path": path}
+
+    @app.post("/api/settings/open-dir")
+    def open_download_dir(
+        body: dict,
+        x_doupool_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """在系统文件管理器中打开下载目录（不修改设置）。"""
+        authorize_with_license(x_doupool_token, authorization)
+        path = str(body.get("path", "") or "").strip()
+        if not path:
+            return {"ok": False}
+        try:
+            opened = open_directory(path)
+        except Exception as exc:  # optional desktop integration must be non-fatal
+            logging.getLogger("doupool.api").warning(
+                "打开下载目录失败: %s", exc,
+                extra={"event": "settings_open_download_dir_failed"},
+            )
+            opened = False
+        return {"ok": bool(opened)}
 
     @app.get("/api/video-tasks")
     def video_tasks(

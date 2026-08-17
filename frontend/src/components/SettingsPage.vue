@@ -1,7 +1,14 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
 import { Database, Save, Download } from '@lucide/vue';
-import { backupDatabase, checkUpdate, getSettings, saveSettings } from '../api';
+import {
+  backupDatabase,
+  checkUpdate,
+  getSettings,
+  openDownloadDir,
+  pickDownloadDir,
+  saveSettings,
+} from '../api';
 import { DpButton, DpCard, DpEmpty, DpField, DpInput, DpSelect } from '@/ui';
 
 type Settings = {
@@ -34,6 +41,7 @@ type Settings = {
 const settings = ref<Settings | null>(null);
 const message = ref('');
 const saving = ref(false);
+const browsingDownloadDir = ref(false);
 const emit = defineEmits<{ saved: [value: Settings] }>();
 
 onMounted(async () => {
@@ -65,6 +73,30 @@ async function backup() {
     message.value = `备份已保存：${result.path}`;
   } catch (e) {
     message.value = e instanceof Error ? e.message : '备份失败';
+  }
+}
+
+async function browseDownloadDirectory() {
+  if (!settings.value || browsingDownloadDir.value) return;
+  browsingDownloadDir.value = true;
+  try {
+    const result = await pickDownloadDir(settings.value.download_dir || '');
+    // 取消目录选择时 path=null,保持输入框和待保存设置不变。
+    if (result?.path) settings.value.download_dir = result.path;
+  } catch (e) {
+    message.value = e instanceof Error ? e.message : '目录选择失败';
+  } finally {
+    browsingDownloadDir.value = false;
+  }
+}
+
+async function openDownloadDirectory() {
+  const path = settings.value?.download_dir?.trim();
+  if (!path) return;
+  try {
+    await openDownloadDir(path);
+  } catch (e) {
+    message.value = e instanceof Error ? e.message : '打开目录失败';
   }
 }
 
@@ -257,8 +289,20 @@ async function onCheckUpdate() {
 
     <DpCard wide title="文件与日志" description="本地下载路径、日志级别与数据备份">
       <div class="fields">
-        <DpField label="视频下载目录" span2>
-          <DpInput v-model="settings.download_dir" />
+        <DpField label="视频下载目录" for-id="setting-download-dir" span2>
+          <div class="download-dir-controls">
+            <DpInput id="setting-download-dir" v-model="settings.download_dir" />
+            <DpButton size="sm" :disabled="browsingDownloadDir" @click="browseDownloadDirectory">
+              {{ browsingDownloadDir ? '选择中…' : '浏览...' }}
+            </DpButton>
+            <DpButton
+              v-if="settings.download_dir"
+              size="sm"
+              @click="openDownloadDirectory"
+            >
+              打开
+            </DpButton>
+          </div>
         </DpField>
         <DpField label="日志级别">
           <DpSelect v-model="settings.log_level">
@@ -335,6 +379,17 @@ async function onCheckUpdate() {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px;
+}
+
+.download-dir-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.download-dir-controls :deep(.dp-input) {
+  flex: 1;
+  min-width: 0;
 }
 
 .footer {
