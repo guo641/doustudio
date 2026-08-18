@@ -303,6 +303,7 @@ async def test_video_entry_falls_back_to_layout_b_chip_after_menu_missing(
     layout_b_ready = AsyncMock(return_value=model_button)
     chip_click = AsyncMock()
     menu_checks = 0
+    seen_skill_selectors: list[tuple[str, ...]] = []
 
     async def wait_exact(_page, _selectors, text, **_kwargs):
         nonlocal menu_checks
@@ -311,6 +312,7 @@ async def test_video_entry_falls_back_to_layout_b_chip_after_menu_missing(
         if text == "更多":
             return more
         assert text == "视频生成"
+        seen_skill_selectors.append(_selectors)
         menu_checks += 1
         return None
 
@@ -327,6 +329,38 @@ async def test_video_entry_falls_back_to_layout_b_chip_after_menu_missing(
     assert page.goto_calls == []
     chip_click.assert_awaited_once_with(page)
     layout_b_ready.assert_awaited_once_with(page)
+    assert browser_module._VIDEO_GENERATION_ACTIONBAR_ITEM_SEL in seen_skill_selectors[0]
+
+
+@pytest.mark.asyncio
+async def test_video_entry_accepts_narrow_layout_actionbar_menu_item(monkeypatch):
+    page = _FakePage(url="https://www.doubao.com/chat")
+    new_conversation = _FakeElement()
+    more = _FakeElement()
+    video_generation = _FakeElement()
+    model_button = MagicMock()
+
+    async def wait_exact(_page, selectors, text, **_kwargs):
+        if text == "新对话":
+            return new_conversation
+        if text == "更多":
+            return more
+        assert text == "视频生成"
+        if browser_module._VIDEO_GENERATION_ACTIONBAR_ITEM_SEL in selectors:
+            return video_generation
+        return None
+
+    ready = AsyncMock(return_value=model_button)
+    monkeypatch.setattr(browser_module, "_wait_for_visible_exact_text", wait_exact)
+    monkeypatch.setattr(browser_module, "_wait_for_video_generation_mode_ready", ready)
+
+    result = await _enter_video_generation_mode(page)
+
+    assert result is model_button
+    assert more.clicks == 1
+    assert video_generation.clicks == 1
+    assert page.keyboard.presses == []
+    ready.assert_awaited_once_with(page)
 
 
 @pytest.mark.asyncio

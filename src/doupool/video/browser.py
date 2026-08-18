@@ -54,6 +54,12 @@ _VIDEO_GENERATION_SKILL_SEL = (
     "[data-skill-id='skill_bar_button_17']"
 )
 _VIDEO_GENERATION_SKILL_FALLBACK_SEL = "button[data-component-type='skill-item']"
+# At narrow desktop widths the overflow menu renders its skill entries as
+# ordinary actionbar buttons without the skill-item metadata used by the
+# wide-layout toolbar.
+_VIDEO_GENERATION_ACTIONBAR_ITEM_SEL = (
+    "button[data-input-engine-action-source='actionbar']"
+)
 _VIDEO_MODE_PLACEHOLDER_SEL = "[data-placeholder='描述你想要的视频']"
 _VIDEO_MODE_CHIP_SEL = (
     "[data-input-engine-action-source='actionbar']"
@@ -3183,6 +3189,7 @@ async def _enter_video_generation_mode(page: Page):
     video_generation = None
     skill_selectors = (
         _VIDEO_GENERATION_SKILL_SEL,
+        _VIDEO_GENERATION_ACTIONBAR_ITEM_SEL,
         _VIDEO_GENERATION_SKILL_FALLBACK_SEL,
     )
     for menu_attempt in range(2):
