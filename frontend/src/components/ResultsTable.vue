@@ -244,14 +244,23 @@ function setGroupBusy(key: string, on: boolean) {
 }
 
 /**
- * v0.2.28 Q2 前端方案:循环触发组内每条下载,间隔 350ms 让浏览器下载
- * 管理器从容接住(实测 WebView2 下 <300ms 会偶发丢失)。任意一条三层
- * fallback 全失败,只让那一组标红,不影响其他组。
+ * 组级下载优先走后端,由后端在设置的下载目录里创建安全的组文件夹。
+ * 这避免 Chromium 把 <a download="组名/文件"> 的斜杠清洗成下划线。
+ * 后端不可用时保留逐条浏览器下载作为降级,间隔 350ms 避免 WebView2 丢失。
  */
 async function downloadGroupFrontend(group: GroupBucket) {
   if (groupBusy.value.has(group.key)) return;
   setGroupBusy(group.key, true);
   try {
+    if (group.group_id) {
+      try {
+        const result = await groupDownload(group.group_id);
+        window.alert(`已下载 ${result.file_count} 个文件到:\n${result.saved_dir}`);
+        return;
+      } catch {
+        // 后端保存不可用时继续走原有逐条下载兜底。
+      }
+    }
     for (const task of group.tasks) {
       if (!pickDownloadUrl(task)) continue;
       // 单条失败不阻断整组(其他任务可能签名 URL 还活着)
@@ -332,7 +341,7 @@ async function downloadGroupBackend(group: GroupBucket) {
                 <DpButton
                   size="sm"
                   :disabled="groupBusy.has(group.key)"
-                  :title="groupBusy.has(group.key) ? '下载中…' : '浏览器下载管理器会自动建子文件夹'"
+                  :title="groupBusy.has(group.key) ? '下载中…' : '保存到设置里的组文件夹'"
                   @click="downloadGroupFrontend(group)"
                 >
                   <FolderDown :size="12" />

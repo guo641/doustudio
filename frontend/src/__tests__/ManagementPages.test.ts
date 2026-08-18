@@ -190,6 +190,11 @@ it('groups batched tasks with collapsible sections and per-group download button
   await fireEvent.click(screen.getByRole('button', { name: '保存到下载目录' }));
   await waitFor(() => expect(api.groupDownload).toHaveBeenCalledWith('abcdef12-group'));
   expect(window.alert).toHaveBeenCalledWith(expect.stringContaining('/tmp/downloads/美女蛇'));
+
+  // “下载全部”也必须走后端组下载,否则 Chromium 会把组名路径清洗成下划线。
+  api.groupDownload.mockClear();
+  await fireEvent.click(screen.getByRole('button', { name: '下载全部' }));
+  await waitFor(() => expect(api.groupDownload).toHaveBeenCalledWith('abcdef12-group'));
 });
 
 it('filters and clears logs', async () => {
