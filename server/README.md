@@ -20,10 +20,25 @@ sudo install -d -o doustudio -g doustudio -m 0750 /var/lib/doustudio
 sudo install -d -o root -g root -m 0755 /etc/doustudio
 ```
 
-Copy this `server/` tree to `/opt/doustudio/license-server/server`, then create
-a virtual environment and install `requirements.txt` as the deployment user.
-The signing PEM must be owned by `doustudio:doustudio` with mode `0600`; the
-environment file containing its passphrase must be owned by `root:root` with
+## Ubuntu 24.04.4 environment
+
+Ubuntu 24.04 marks the system Python as externally managed (PEP 668). Do not
+run `pip install` against `/usr/bin/python3` and do not use a system `uvicorn`.
+Create the venv with Python 3.12 and use its absolute interpreter for every
+package and server command:
+
+```sh
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv python3.12-dev build-essential openssl
+sudo -u doustudio -H python3.12 -m venv /opt/doustudio/license-server/.venv
+sudo -u doustudio -H /opt/doustudio/license-server/.venv/bin/python -m pip install --upgrade pip
+sudo -u doustudio -H /opt/doustudio/license-server/.venv/bin/python -m pip install \
+  -r /opt/doustudio/license-server/server/requirements.txt
+```
+
+Copy this `server/` tree to `/opt/doustudio/license-server/server`. The
+signing PEM must be owned by `doustudio:doustudio` with mode `0600`; the
+The environment file containing its passphrase must be owned by `root:root` with
 mode `0600`.
 
 ## First deployment
@@ -104,6 +119,14 @@ curl --fail --cacert /etc/doustudio/tls/cert.pem \
 The expected response is `{"ok":true,"version":"0.3.1"}`. A self-signed
 certificate is expected; production clients validate the pinned SPKI rather
 than a public certificate authority.
+
+Open the public listener only after the service and local health check are
+working. The host already permits SSH; this is the final deployment step:
+
+```sh
+sudo ufw allow 8443/tcp
+sudo ufw status verbose
+```
 
 ## SSH-only revocation
 
