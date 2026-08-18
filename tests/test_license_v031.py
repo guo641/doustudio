@@ -127,6 +127,30 @@ def test_write_token_v031_roundtrip(isolated_license_dir, generated_license_toke
     assert stored.last_server_sync > 0
 
 
+def test_persistence_roundtrip(isolated_license_dir, generated_license_token, monkeypatch):
+    """activate 写盘后模拟重启,仍能从 v0.3.1 文件恢复 valid 状态。"""
+    import doupool.license as license_api
+
+    if not license_api.is_compiled():
+        pytest.skip("verifier.pyd 未编译")
+
+    from doupool.license import _license_verify as verifier
+
+    original_cache = dict(verifier._cached_status)
+    monkeypatch.setattr(verifier._crypto, "verify", lambda *_args: True)
+    monkeypatch.setattr(verifier, "current_fingerprint", lambda: "0" * 64)
+    try:
+        success, error = verifier.activate(generated_license_token["token_b32"])
+        assert success, error
+
+        verifier._cached_status["loaded"] = False
+        assert verifier.get_activation_status() == "valid"
+        assert verifier.get_activation_detail()["customer"] == "test-customer"
+    finally:
+        verifier._cached_status.clear()
+        verifier._cached_status.update(original_cache)
+
+
 def test_update_heartbeat_fields_preserves_blob(isolated_license_dir, generated_license_token):
     from doupool.license import storage
     blob = bytes.fromhex(generated_license_token["token_hex"])

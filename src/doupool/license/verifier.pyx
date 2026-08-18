@@ -146,7 +146,7 @@ def _load_status_from_disk() -> dict:
     # 先尝试 v0.3.1 格式
     v031 = _storage.read_token_v031()
     if v031 is not None:
-        success, payload, error = verify_token(v031.license_token_blob)
+        success, payload, error, _ = verify_token(v031.license_token_blob)
         if not success or not payload:
             return {
                 "status": "expired",
@@ -180,7 +180,7 @@ def _load_status_from_disk() -> dict:
             "needs_heartbeat": False,
             "grace": False,
         }
-    success, payload, error = verify_token(legacy)
+    success, payload, error, _ = verify_token(legacy)
     if not success or not payload:
         return {
             "status": "expired",
