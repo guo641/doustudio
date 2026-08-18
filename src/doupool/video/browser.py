@@ -59,6 +59,19 @@ _VIDEO_MODE_CHIP_SEL = (
     "[data-input-engine-action-source='actionbar']"
     "[data-value='17'][contenteditable='false']"
 )
+_VIDEO_MODE_SKILL_BUTTON_SEL = (
+    "button[data-component-type='skill-item']"
+    "[data-input-engine-action-source='actionbar']"
+    "[data-skill-id='skill_bar_button_17']"
+)
+_VIDEO_MODE_CHIP_CANDIDATE_SELS = (
+    # Layout B fresh chat: the clickable actionbar entry is a skill button.
+    _VIDEO_MODE_SKILL_BUTTON_SEL,
+    # Layout B after mode activation: the selected chip is a data-value node.
+    _VIDEO_MODE_CHIP_SEL,
+    "[data-input-engine-action-source='actionbar'][data-value='17']",
+    "[data-input-engine-action-source='actionbar'][data-skill-id='skill_bar_button_17']",
+)
 _VIDEO_MODEL_BUTTON_SEL = (
     "button[data-input-engine-actionbar-control-key='video-model']"
 )
@@ -3050,6 +3063,70 @@ async def _wait_for_video_generation_mode_ready(page: Page):
     )
 
 
+async def _click_video_mode_chip(page: Page) -> None:
+    """Click the Layout B actionbar video chip without opening legacy parameter UI.
+
+    The ``data-value=17`` node is sometimes a non-interactive presentation
+    element inside the actual button. Prefer its nearest semantic clickable
+    ancestor, then fall back to the chip itself for accounts whose actionbar
+    uses a clickable ``div`` without an explicit role.
+    """
+    chip = None
+    for selector in _VIDEO_MODE_CHIP_CANDIDATE_SELS:
+        chip = await _first_visible_locator(page.locator(selector))
+        if chip is not None:
+            break
+    if chip is None:
+        raise RuntimeError("该账号未开通视频生成入口")
+
+    candidates = []
+    try:
+        clickable_ancestor = chip.locator(
+            "xpath=ancestor-or-self::*[self::button or @role='button' "
+            "or @tabindex='0'][1]"
+        )
+        candidates.append(clickable_ancestor)
+    except Exception:
+        pass
+    try:
+        # Some actionbar builds attach the handler to an unannotated wrapper;
+        # include the direct parent before falling back to the presentation
+        # node itself (whose click still bubbles on the usual builds).
+        candidates.append(chip.locator("xpath=parent::*[1]"))
+    except Exception:
+        pass
+    candidates.append(chip)
+
+    for candidate_locator in candidates:
+        candidate = await _first_visible_locator(candidate_locator)
+        if candidate is None:
+            continue
+        try:
+            await candidate.click(timeout=3_000)
+        except TypeError:
+            # Minimal test doubles and older Playwright shims do not accept
+            # the timeout keyword; the normal locator click remains identical.
+            try:
+                await candidate.click()
+            except Exception:
+                continue
+        except Exception as exc:
+            _LOGGER.debug(
+                "event=video_generation_layout_b_chip_candidate_failed "
+                "url=%s error=%s",
+                page.url,
+                exc.__class__.__name__,
+            )
+            continue
+        _LOGGER.info(
+            "event=video_generation_layout_b_chip_click url=%s",
+            page.url,
+        )
+        return
+
+    raise RuntimeError("该账号未开通视频生成入口")
+
+
 async def _wait_for_legacy_video_generation_ready(page: Page):
     """旧 create-image 页面没有 actionbar chip，以 TAB、编辑器和模型作校验。"""
     deadline = time.monotonic() + (_VIDEO_MODE_READY_WAIT_MS / 1000)
@@ -3080,7 +3157,13 @@ async def _wait_for_legacy_video_generation_ready(page: Page):
 
 
 async def _enter_video_generation_mode(page: Page):
-    """优先走新对话技能菜单，灰度账号缺入口时回退旧视频 TAB。"""
+    """Enter video mode through the skill menu or actionbar chip.
+
+    Some accounts do not expose the ``视频生成`` skill in the toolbar menu;
+    those accounts expose the same mode as the bottom actionbar chip instead.
+    Never navigate to ``create-image`` here: that legacy page opens the
+    parameter UI which is intentionally retired from the submission path.
+    """
     new_conversation = await _wait_for_visible_exact_text(
         page, (_NEW_CONVERSATION_SEL,), "新对话"
     )
@@ -3131,19 +3214,9 @@ async def _enter_video_generation_mode(page: Page):
             page.url,
             skill_texts,
         )
-        _LOGGER.warning(
-            "event=video_generation_legacy_tab_fallback url=%s",
-            page.url,
-        )
         await page.keyboard.press("Escape")
-        await page.goto(
-            CREATE_IMAGE_URL,
-            wait_until="domcontentloaded",
-            timeout=30_000,
-        )
-        await page.wait_for_timeout(1_000)
-        await _activate_legacy_video_tab(page)
-        return await _wait_for_legacy_video_generation_ready(page)
+        await _click_video_mode_chip(page)
+        return await _wait_for_video_generation_mode_ready(page)
     await video_generation.click()
     return await _wait_for_video_generation_mode_ready(page)
 

@@ -293,15 +293,15 @@ async def test_video_entry_keeps_new_skill_path_primary(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_video_entry_falls_back_to_legacy_tab_only_after_menu_missing(
+async def test_video_entry_falls_back_to_layout_b_chip_after_menu_missing(
     monkeypatch,
 ):
     page = _FakePage(url="https://www.doubao.com/chat")
     new_conversation = _FakeElement()
     more = _FakeElement()
     model_button = MagicMock()
-    legacy_ready = AsyncMock(return_value=model_button)
-    legacy_tab = AsyncMock()
+    layout_b_ready = AsyncMock(return_value=model_button)
+    chip_click = AsyncMock()
     menu_checks = 0
 
     async def wait_exact(_page, _selectors, text, **_kwargs):
@@ -315,12 +315,8 @@ async def test_video_entry_falls_back_to_legacy_tab_only_after_menu_missing(
         return None
 
     monkeypatch.setattr(browser_module, "_wait_for_visible_exact_text", wait_exact)
-    monkeypatch.setattr(
-        browser_module,
-        "_wait_for_legacy_video_generation_ready",
-        legacy_ready,
-    )
-    monkeypatch.setattr(browser_module, "_activate_legacy_video_tab", legacy_tab)
+    monkeypatch.setattr(browser_module, "_wait_for_video_generation_mode_ready", layout_b_ready)
+    monkeypatch.setattr(browser_module, "_click_video_mode_chip", chip_click)
 
     result = await _enter_video_generation_mode(page)
 
@@ -328,14 +324,105 @@ async def test_video_entry_falls_back_to_legacy_tab_only_after_menu_missing(
     assert menu_checks == 2
     assert more.clicks == 2
     assert page.keyboard.presses == ["Escape", "Escape"]
-    assert page.goto_calls == [
-        (
-            browser_module.CREATE_IMAGE_URL,
-            {"wait_until": "domcontentloaded", "timeout": 30_000},
-        )
-    ]
-    legacy_tab.assert_awaited_once_with(page)
-    legacy_ready.assert_awaited_once_with(page)
+    assert page.goto_calls == []
+    chip_click.assert_awaited_once_with(page)
+    layout_b_ready.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_video_entry_missing_skill_without_layout_b_chip_fails_fast(monkeypatch):
+    page = _FakePage(url="https://www.doubao.com/chat")
+    new_conversation = _FakeElement()
+    more = _FakeElement()
+
+    async def wait_exact(_page, _selectors, text, **_kwargs):
+        if text == "新对话":
+            return new_conversation
+        if text == "更多":
+            return more
+        return None
+
+    monkeypatch.setattr(browser_module, "_wait_for_visible_exact_text", wait_exact)
+    monkeypatch.setattr(
+        browser_module,
+        "_click_video_mode_chip",
+        AsyncMock(side_effect=RuntimeError("该账号未开通视频生成入口")),
+    )
+
+    with pytest.raises(RuntimeError, match="未开通视频生成入口"):
+        await _enter_video_generation_mode(page)
+
+    assert page.goto_calls == []
+
+
+@pytest.mark.asyncio
+async def test_layout_b_chip_click_prefers_clickable_ancestor(monkeypatch):
+    page = MagicMock(url="https://www.doubao.com/chat")
+    chip_locator = MagicMock()
+    chip = MagicMock()
+    ancestor_locator = MagicMock()
+    ancestor = MagicMock()
+    chip_locator.selector = browser_module._VIDEO_MODE_CHIP_SEL
+    page.locator.return_value = chip_locator
+    chip.locator.return_value = ancestor_locator
+    ancestor.click = AsyncMock()
+    chip.click = AsyncMock()
+
+    async def first_visible(locator):
+        if locator is chip_locator:
+            return chip
+        if locator is ancestor_locator:
+            return ancestor
+        return None
+
+    monkeypatch.setattr(browser_module, "_first_visible_locator", first_visible)
+
+    await browser_module._click_video_mode_chip(page)
+
+    chip.locator.assert_any_call(
+        "xpath=ancestor-or-self::*[self::button or @role='button' "
+        "or @tabindex='0'][1]"
+    )
+    ancestor.click.assert_awaited_once_with(timeout=3_000)
+    chip.click.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_layout_b_chip_click_falls_back_to_chip_node(monkeypatch):
+    page = MagicMock(url="https://www.doubao.com/chat")
+    chip_locator = MagicMock()
+    chip = MagicMock()
+    ancestor_locator = MagicMock()
+    page.locator.return_value = chip_locator
+    chip.locator.return_value = ancestor_locator
+    chip.click = AsyncMock()
+
+    async def first_visible(locator):
+        if locator is chip_locator:
+            return chip
+        if locator is chip:
+            return chip
+        return None
+
+    monkeypatch.setattr(browser_module, "_first_visible_locator", first_visible)
+
+    await browser_module._click_video_mode_chip(page)
+
+    chip.click.assert_awaited_once_with(timeout=3_000)
+
+
+@pytest.mark.asyncio
+async def test_layout_b_chip_click_without_chip_fails_fast(monkeypatch):
+    page = MagicMock(url="https://www.doubao.com/chat")
+    page.locator.side_effect = lambda _selector: MagicMock()
+
+    async def no_visible(_locator):
+        return None
+
+    monkeypatch.setattr(browser_module, "_first_visible_locator", no_visible)
+
+    with pytest.raises(RuntimeError, match="未开通视频生成入口"):
+        await browser_module._click_video_mode_chip(page)
 
 
 @pytest.mark.asyncio
