@@ -1,0 +1,36 @@
+[Unit]
+Description=DouStudio license heartbeat server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=doustudio
+Group=doustudio
+WorkingDirectory=/opt/doustudio/license-server/server
+EnvironmentFile=/etc/doustudio/license.env
+ExecStart=/opt/doustudio/license-server/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8443 --workers 2 --ssl-keyfile /etc/doustudio/tls/key.pem --ssl-certfile /etc/doustudio/tls/cert.pem
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+# The service never needs privilege escalation or a writable application tree.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/doustudio
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

@@ -44,3 +44,11 @@ src/doupool/license/doupool/
 .env
 .env.local
 
+# License server secrets and runtime state
+server/scripts/.local_server_private.pem
+server/scripts/server_signing_key.pem
+server/scripts/server_public.key
+server/**/*.pem
+server/**/*.sqlite3
+server/**/.env
+server/deploy/*.env
