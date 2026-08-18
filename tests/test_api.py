@@ -27,6 +27,8 @@ class FakeVideoService:
             values["duration"],
             mode=values.get("mode") or "t2v",
             image_paths=None,
+            group_id=values.get("group_id"),
+            group_name=values.get("group_name"),
         )
         return task, []
 
@@ -123,6 +125,35 @@ def test_create_and_list_video_tasks(repository, tmp_path, temp_profile):
     listed = client.get("/api/video-tasks", headers={"X-DouPool-Token": "secret"})
     assert listed.status_code == 200
     assert listed.json()[0]["account_name"] == "账号一"
+
+
+def test_create_video_task_round_trips_group_name(repository, tmp_path, temp_profile):
+    from doupool.db.models import Account
+
+    account = Account.create(
+        id="account-group-name-api", display_name="账号", doubao_user_id="user-group-name-api",
+        profile_dir=temp_profile,
+    )
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login, FakeVideoService(repository),
+    ))
+
+    response = client.post(
+        "/api/video-tasks",
+        headers={"X-DouPool-Token": "secret"},
+        json={
+            "account_id": account.id,
+            "prompt": "一只猫",
+            "model": "seedance_v2.0_mini",
+            "ratio": "1:1",
+            "duration": 5,
+            "group_name": "美女蛇",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["group_name"] == "美女蛇"
 
 
 def test_create_video_task_normalizes_malformed_duration_before_service(
@@ -249,6 +280,10 @@ def test_create_video_task_body_rejects_prompt_over_5000_chars():
         assert "prompts" in str(exc)
     else:
         raise AssertionError("prompts element over 5000 chars should fail validation")
+
+    assert CreateVideoTaskBody(group_name="组" * 40).group_name == "组" * 40
+    with pytest.raises(ValidationError):
+        CreateVideoTaskBody(group_name="组" * 41)
 
 
 def test_create_video_task_returns_partial_rejected_when_accounts_full(repository, tmp_path, temp_profile):
@@ -2109,6 +2144,35 @@ def test_group_download_streams_all_videos(repository, tmp_path, database_manage
         assert not (saved_dir / f"doubao-{tid}.mp4").exists()
     # httpx.stream GET 调用 3 次(每条任务一次)
     assert len(fake.calls) == 3
+
+
+def test_group_download_prefers_sanitized_group_name(
+    repository, tmp_path, database_manager, monkeypatch,
+):
+    """v0.3.8:批量下载目录优先使用组名,并清洗 Windows 非法字符。"""
+    settings = SettingsService(repository, tmp_path, database_manager.path)
+    settings.update({"download_dir": str(tmp_path / "downloads")})
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=FakeVideoService(repository),
+        settings_service=settings,
+    ))
+    headers = {"X-DouPool-Token": "secret"}
+    group_id = "named-group-1"
+    _task_ids, urls = _seed_grouped_tasks(repository, group_id, count=1)
+    from doupool.db.models import VideoTask
+    VideoTask.update(group_name="美女蛇/竖屏").where(VideoTask.group_id == group_id).execute()
+
+    fake = _FakeStreamClient(urls)
+    monkeypatch.setattr("doupool.api.app.httpx.AsyncClient", lambda *a, **kw: fake)
+    response = client.post(
+        "/api/results/group-download", headers=headers, json={"group_id": group_id},
+    )
+
+    assert response.status_code == 200, response.text
+    saved_dir = Path(response.json()["saved_dir"])
+    assert saved_dir.name == "美女蛇_竖屏"
 
 
 def test_group_download_handles_expired_signature(repository, tmp_path, database_manager, monkeypatch):

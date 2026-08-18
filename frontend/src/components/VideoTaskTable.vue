@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { Clapperboard, RotateCcw, ExternalLink, Download, Trash2 } from '@lucide/vue';
+import { Clapperboard, RotateCcw, ExternalLink, Download, Trash2, ChevronDown, ChevronRight } from '@lucide/vue';
 import { DpBadge, DpButton, DpDownloadButton, DpEmpty, DpLink, DpPanel, DpSearchInput, DpSelect, DpTable, DpTag } from '@/ui';
 
 type VideoTaskRow = {
@@ -24,6 +24,7 @@ type VideoTaskRow = {
   quota_total?: number;
   group_id?: string;
   group_index?: number;
+  group_name?: string;
   download_filename?: string;
   created_at: string;
 };
@@ -47,6 +48,7 @@ const query = ref('');
 const status = ref('');
 const account = ref('');
 const expanded = ref(new Set<string>());
+const collapsedGroups = ref(new Set<string>());
 
 const statusLabels: Record<string, string> = {
   queued: '排队中',
@@ -87,6 +89,7 @@ const UNGROUPED = '__ungrouped__';
 type TaskGroup = {
   key: string;
   groupId?: string;
+  groupName?: string;
   tasks: VideoTaskRow[];
   firstCreatedAt: string;
   firstGroupIndex: number | null;
@@ -108,12 +111,14 @@ const visibleGroups = computed<TaskGroup[]>(() => {
       group = {
         key,
         groupId: task.group_id,
+        groupName: task.group_name,
         tasks: [],
         firstCreatedAt: task.created_at,
         firstGroupIndex: task.group_index ?? null,
       };
       buckets.set(key, group);
     }
+    if (!group.groupName && task.group_name) group.groupName = task.group_name;
     group.tasks.push(task);
     if (task.created_at < group.firstCreatedAt) group.firstCreatedAt = task.created_at;
     if (
@@ -146,9 +151,17 @@ const visibleGroups = computed<TaskGroup[]>(() => {
 });
 
 function groupTitle(group: TaskGroup, ordinal: number) {
-  return group.groupId
+  return group.groupName
+    ? `${group.groupName} · ${group.tasks.length} 个任务`
+    : group.groupId
     ? `组 #${ordinal} · ${group.tasks.length} 个任务`
     : `未分组 · ${group.tasks.length} 个任务`;
+}
+
+function toggleGroup(key: string) {
+  const next = new Set(collapsedGroups.value);
+  next.has(key) ? next.delete(key) : next.add(key);
+  collapsedGroups.value = next;
 }
 
 function toggle(id: string) {
@@ -200,9 +213,16 @@ function paramsText(task: VideoTaskRow) {
       </thead>
       <tbody>
         <template v-for="(group, groupOrdinal) in visibleGroups" :key="group.key">
-          <tr class="group-header">
+          <tr
+            class="group-header"
+            :aria-expanded="!collapsedGroups.has(group.key)"
+            style="cursor: pointer"
+            @click="toggleGroup(group.key)"
+          >
             <td colspan="5">
               <div class="group-title">
+                <ChevronRight v-if="collapsedGroups.has(group.key)" :size="14" />
+                <ChevronDown v-else :size="14" />
                 <span>{{ groupTitle(group, groupOrdinal + 1) }}</span>
                 <span v-if="group.groupId" class="group-id" :title="`组 ID: ${group.groupId}`">
                   {{ group.groupId.slice(0, 8) }}
@@ -210,7 +230,7 @@ function paramsText(task: VideoTaskRow) {
               </div>
             </td>
           </tr>
-          <template v-for="task in group.tasks" :key="task.id">
+          <template v-for="task in (collapsedGroups.has(group.key) ? [] : group.tasks)" :key="task.id">
             <tr>
             <td>
               <DpBadge :tone="task.status" dot>

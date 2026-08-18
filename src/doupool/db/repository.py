@@ -429,6 +429,7 @@ class AccountRepository:
         mode: str = "t2v",
         image_paths: list[str] | None = None,
         group_id: str | None = None,
+        group_name: str | None = None,
         group_index: int = 0,
         callback_url: str | None = None,
     ) -> VideoTask:
@@ -445,6 +446,7 @@ class AccountRepository:
                 mode=mode or "t2v",
                 image_paths=json.dumps(image_paths or [], ensure_ascii=False) if image_paths else None,
                 group_id=group_id,
+                group_name=group_name,
                 group_index=group_index,
                 callback_url=callback_url,
                 callback_status="pending" if callback_url else None,
@@ -460,6 +462,7 @@ class AccountRepository:
         rows = list(
             VideoTask.select(
                 VideoTask.group_id,
+                fn.MIN(VideoTask.group_name).alias("group_name"),
                 fn.MIN(VideoTask.created_at).alias("first_at"),
                 fn.COUNT(VideoTask.id).alias("task_count"),
             )
@@ -471,6 +474,7 @@ class AccountRepository:
         return [
             {
                 "group_id": r.group_id,
+                "group_name": r.group_name,
                 "task_count": r.task_count,
                 "first_at": r.first_at.isoformat() if r.first_at else None,
             }
@@ -484,6 +488,25 @@ class AccountRepository:
             .where(VideoTask.group_id == group_id)
             .order_by(VideoTask.group_index.asc(), VideoTask.created_at.asc())
         )
+
+    def get_group_name(self, group_id: str) -> str | None:
+        """Return the persisted name for a group, if any.
+
+        A manual regeneration sends only the original ``group_id``.  Looking up
+        the first named task here keeps that compatibility path from losing the
+        user-facing group name.
+        """
+        task = (
+            VideoTask.select(VideoTask.group_name)
+            .where(
+                (VideoTask.group_id == group_id)
+                & VideoTask.group_name.is_null(False)
+                & (VideoTask.group_name != "")
+            )
+            .order_by(VideoTask.group_index.asc(), VideoTask.created_at.asc())
+            .first()
+        )
+        return task.group_name if task else None
 
     def assign_video_task(self, task_id: str, account_id: str | None) -> VideoTask | None:
         # v0.2.15:DELETE 端点删了任务后,worker 还在 in-flight 时调用这里会

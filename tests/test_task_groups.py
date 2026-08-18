@@ -17,6 +17,7 @@ class _StubRepo:
 
     def __init__(self):
         self.created: list[dict] = []
+        self.group_names: dict[str, str] = {}
 
     def create_video_task(
         self,
@@ -29,6 +30,7 @@ class _StubRepo:
         mode="t2v",
         image_paths=None,
         group_id=None,
+        group_name=None,
         group_index=0,
         callback_url=None,
     ):
@@ -41,6 +43,7 @@ class _StubRepo:
             "duration": duration,
             "mode": mode,
             "group_id": group_id,
+            "group_name": group_name,
             "group_index": group_index,
         }
         self.created.append(record)
@@ -58,6 +61,8 @@ class _StubRepo:
         return _Task(id="x", account=None, prompt="x", model="m", ratio="r", duration=5)
     def mark_account_limited(self, *_args, **_kw): pass
     def increment_account_quota(self, *_args, **_kw): pass
+    def get_group_name(self, group_id):
+        return self.group_names.get(group_id)
 
 
 class _Task:
@@ -97,6 +102,34 @@ def test_single_prompt_no_group(service):
     assert len(repo.created) == 1
     assert repo.created[0]["group_id"] is None
     assert repo.created[0]["group_index"] == 0
+
+
+def test_single_prompt_with_group_name_is_grouped(service):
+    svc, repo = service
+    svc.start(
+        prompt="一只猫",
+        model="seedance_v2.0_mini",
+        ratio="1:1",
+        duration=5,
+        group_name="  美女蛇  ",
+    )
+    assert repo.created[0]["group_id"]
+    assert repo.created[0]["group_name"] == "美女蛇"
+    assert repo.created[0]["group_index"] == 1
+
+
+def test_manual_regeneration_inherits_group_name(service):
+    svc, repo = service
+    repo.group_names["legacy-group"] = "美女蛇"
+    svc.start(
+        prompt="重试",
+        model="seedance_v2.0_mini",
+        ratio="1:1",
+        duration=5,
+        group_id="legacy-group",
+    )
+    assert repo.created[0]["group_id"] == "legacy-group"
+    assert repo.created[0]["group_name"] == "美女蛇"
 
 
 def test_prompts_list_auto_grouped(service):

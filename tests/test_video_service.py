@@ -115,6 +115,16 @@ async def test_manual_regeneration_via_start_normalizes_historical_duration_to_t
     )
     runner = CapturingDurationRunner()
     service = VideoTaskService(repository, runner, StaticSettings(), account_poll_interval=0.01)
+    repository.create_video_task(
+        None,
+        "原任务",
+        "seedance_v2.0_mini",
+        "1:1",
+        5,
+        group_id="legacy-group",
+        group_name="历史组名",
+        group_index=1,
+    )
 
     task, _ = service.start(
         "历史五秒任务重生",
@@ -128,8 +138,37 @@ async def test_manual_regeneration_via_start_normalizes_historical_duration_to_t
     saved = repository.get_video_task(task.id)
     assert saved.duration == 10
     assert saved.group_id == "legacy-group"
+    assert saved.group_name == "历史组名"
     assert runner.duration == 10
     assert Account.get_by_id("account-retry").video_quota_used_shared == 10
+
+
+@pytest.mark.asyncio
+async def test_start_persists_group_name_for_single_prompt(repository, temp_profile):
+    """v0.3.8:单段 prompt 填组名也必须建组并持久化展示名。"""
+    Account.create(
+        id="account-group-name",
+        display_name="group-name",
+        doubao_user_id="user-group-name",
+        profile_dir=temp_profile,
+    )
+    service = VideoTaskService(
+        repository, SuccessfulVideoRunner(), StaticSettings(), account_poll_interval=0.01,
+    )
+
+    task, _ = service.start(
+        "一只猫",
+        "seedance_v2.0_mini",
+        "1:1",
+        5,
+        group_name="  美女蛇  ",
+    )
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    assert saved.group_id
+    assert saved.group_name == "美女蛇"
+    assert saved.group_index == 1
 
 
 @pytest.mark.asyncio

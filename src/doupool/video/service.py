@@ -160,10 +160,20 @@ class VideoTaskService:
         # 归属同一组(结果页按组折叠)。新建路径留 None,由下面按
         # prompt_list 长度自动决定是否打组。
         group_id: str | None = None,
+        group_name: str | None = None,
     ):
         duration = FIXED_VIDEO_DURATION_SECONDS
         prompt = prompt.strip()
         mode = (mode or "t2v").strip().lower()
+        # v0.3.8:组名是用户输入的展示/下载标签,统一在 service 层去空白。
+        # 手动重试只透传 group_id(前端刻意不重复传名字),从原组首条任务继承。
+        group_name = group_name.strip() if group_name else None
+        if group_id and not group_name:
+            get_group_name = getattr(self.repository, "get_group_name", None)
+            if get_group_name:
+                group_name = get_group_name(group_id)
+                if group_name:
+                    group_name = group_name.strip() or None
         # 兼容: 同时支持单 prompt / prompts 列表
         # v0.2.11:只有单 prompt 字段才后端切段(prompts 列表前端已切好,
         # 再切会把"第一段"字样当成标记误伤 prompt 文本)。
@@ -198,12 +208,12 @@ class VideoTaskService:
 
         image_paths: list[str] = []
 
-        # 多个 prompt → 同一 group_id,自动归组
+        # 多个 prompt 或显式组名 → 同一 group_id,自动归组
         # v0.2.32:caller(手动重试)显式传 group_id 时优先用,沿用原组;
-        # 否则按 prompt 数量自决新建组。
+        # 否则按 prompt 数量/组名自决新建组。
         if group_id:
             effective_group_id: str | None = group_id
-        elif len(prompt_list) > 1:
+        elif len(prompt_list) > 1 or group_name:
             effective_group_id = str(uuid4())
         else:
             effective_group_id = None
@@ -256,6 +266,7 @@ class VideoTaskService:
                         mode=mode,
                         image_paths=image_paths or None,
                         group_id=effective_group_id,
+                        group_name=group_name,
                         group_index=index if effective_group_id else 0,
                         callback_url=callback_url,
                     )
@@ -276,6 +287,7 @@ class VideoTaskService:
                         mode=mode,
                         image_paths=image_paths or None,
                         group_id=effective_group_id,
+                        group_name=group_name,
                         group_index=index if effective_group_id else 0,
                         callback_url=callback_url,
                     )

@@ -36,7 +36,7 @@ const api = vi.hoisted(() => {
   // v0.2.37.3:AccountTable 不再展示 token 列,getWebMSSDKTokens / refreshWebMSSDKTokens
   // 也从 AccountTable 调用链里删除 —— 老 mock 留着会误导读者以为组件还在用,直接清掉。
   // v0.2.28:Q2 批量下载 —— ResultsTable 点「保存到下载目录」时调。
-  groupDownload: vi.fn().mockResolvedValue({ saved_dir: '/tmp/downloads/abcdef12_143022', file_count: 3 }),
+  groupDownload: vi.fn().mockResolvedValue({ saved_dir: '/tmp/downloads/美女蛇', file_count: 3 }),
   // v0.2.29:单账号 / 一键全部重置额度 —— 跨日 cron 卡住时的兜底按钮。
   resetAccountQuota: vi.fn().mockResolvedValue({ reset_count: 1, reset_at: '2026-08-06T00:00:00', account_id: 'a1' }),
   resetAllQuotas: vi.fn().mockResolvedValue({ reset_count: 3, reset_at: '2026-08-06T00:00:00' }),
@@ -166,18 +166,18 @@ it('groups batched tasks with collapsible sections and per-group download button
   const tasks = [
     // 同一组(3 段 prompt 一次提交),按 group_index 升序排
     { id:'t1', prompt:'第一段', model:'seedance_v2.0_mini', ratio:'1:1', duration:5, status:'succeeded',
-      result_url:'https://example.test/v1.mp4', group_id:'abcdef12-group', group_index:1, created_at:'2026-07-13T12:00:00' },
+      result_url:'https://example.test/v1.mp4', group_id:'abcdef12-group', group_index:1, group_name:'美女蛇', created_at:'2026-07-13T12:00:00' },
     { id:'t2', prompt:'第二段', model:'seedance_v2.0_mini', ratio:'1:1', duration:5, status:'succeeded',
-      result_url:'https://example.test/v2.mp4', group_id:'abcdef12-group', group_index:2, created_at:'2026-07-13T12:01:00' },
+      result_url:'https://example.test/v2.mp4', group_id:'abcdef12-group', group_index:2, group_name:'美女蛇', created_at:'2026-07-13T12:01:00' },
     { id:'t3', prompt:'第三段', model:'seedance_v2.0_mini', ratio:'1:1', duration:5, status:'succeeded',
-      result_url:'https://example.test/v3.mp4', group_id:'abcdef12-group', group_index:3, created_at:'2026-07-13T12:02:00' },
+      result_url:'https://example.test/v3.mp4', group_id:'abcdef12-group', group_index:3, group_name:'美女蛇', created_at:'2026-07-13T12:02:00' },
     // 老任务,无 group_id,保持扁平
     { id:'t0', prompt:'老任务', model:'seedance_v2.0_mini', ratio:'1:1', duration:5, status:'succeeded',
       result_url:'https://example.test/v0.mp4', created_at:'2026-07-13T11:00:00' },
   ];
   render(ResultsTable, { props: { tasks } });
-  // 组头存在(group_id 前 8 位 + 任务数)
-  expect(screen.getByText(/组 #abcdef12 · 3 个视频/)).toBeTruthy();
+  // 命名组优先显示 group_name,不再暴露内部 group_id 作为标题。
+  expect(screen.getByText(/美女蛇 · 3 个视频/)).toBeTruthy();
   // 两个组级按钮都在
   expect(screen.getByRole('button', { name: '下载全部' })).toBeTruthy();
   expect(screen.getByRole('button', { name: '保存到下载目录' })).toBeTruthy();
@@ -189,7 +189,7 @@ it('groups batched tasks with collapsible sections and per-group download button
   // 点「保存到下载目录」调 groupDownload,并 alert 出 saved_dir
   await fireEvent.click(screen.getByRole('button', { name: '保存到下载目录' }));
   await waitFor(() => expect(api.groupDownload).toHaveBeenCalledWith('abcdef12-group'));
-  expect(window.alert).toHaveBeenCalledWith(expect.stringContaining('/tmp/downloads/abcdef12_143022'));
+  expect(window.alert).toHaveBeenCalledWith(expect.stringContaining('/tmp/downloads/美女蛇'));
 });
 
 it('filters and clears logs', async () => {

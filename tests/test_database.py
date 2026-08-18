@@ -64,7 +64,7 @@ def test_version_three_database_migrates_without_losing_related_rows(tmp_path):
     manager = DatabaseManager(path)
     manager.initialize()
     try:
-        assert manager.database.execute_sql("SELECT MAX(version) FROM schema_version").fetchone()[0] == 10
+        assert manager.database.execute_sql("SELECT MAX(version) FROM schema_version").fetchone()[0] == 11
         assert manager.database.execute_sql("SELECT COUNT(*) FROM account").fetchone()[0] == 1
         assert manager.database.execute_sql("SELECT COUNT(*) FROM loginattempt").fetchone()[0] == 1
         columns = {row[1] for row in manager.database.execute_sql("PRAGMA table_info(videotask)")}
@@ -78,6 +78,7 @@ def test_version_three_database_migrates_without_losing_related_rows(tmp_path):
         assert "callback_status" in columns
         assert "callback_attempts" in columns
         assert "callback_last_error" in columns
+        assert "group_name" in columns
     finally:
         manager.close()
 
@@ -142,7 +143,7 @@ def test_version_eight_database_migrates_to_v9_adding_three_quota_columns(tmp_pa
         # v0.2.10:从 v8 一路升到 v10(v8→v9 quota 三列,v9→v10 callback 四列)
         assert manager.database.execute_sql(
             "SELECT MAX(version) FROM schema_version"
-        ).fetchone()[0] == 10
+        ).fetchone()[0] == 11
         # 三列都已加
         columns = {row[1] for row in manager.database.execute_sql("PRAGMA table_info(account)")}
         assert "video_quota_used_mini" in columns
@@ -167,6 +168,7 @@ def test_version_eight_database_migrates_to_v9_adding_three_quota_columns(tmp_pa
         assert "callback_status" in task_columns
         assert "callback_attempts" in task_columns
         assert "callback_last_error" in task_columns
+        assert "group_name" in task_columns
     finally:
         manager.close()
 
@@ -227,7 +229,7 @@ def test_version_nine_database_migrates_to_v10_adding_four_callback_columns(tmp_
         # 升到 v10
         assert manager.database.execute_sql(
             "SELECT MAX(version) FROM schema_version"
-        ).fetchone()[0] == 10
+        ).fetchone()[0] == 11
         # 4 个 callback 列都已加
         task_columns = {
             row[1] for row in manager.database.execute_sql("PRAGMA table_info(videotask)")
@@ -236,6 +238,7 @@ def test_version_nine_database_migrates_to_v10_adding_four_callback_columns(tmp_
         assert "callback_status" in task_columns
         assert "callback_attempts" in task_columns
         assert "callback_last_error" in task_columns
+        assert "group_name" in task_columns
         # 老 v9 数据不动 — quota 三桶保留原值,老 videotask 行 callback 列默认 NULL
         assert manager.database.execute_sql(
             "SELECT video_quota_used_mini, video_quota_used_v2, video_quota_used_std "
@@ -249,8 +252,8 @@ def test_version_nine_database_migrates_to_v10_adding_four_callback_columns(tmp_
         manager.close()
 
 
-def test_v10_migration_is_idempotent(tmp_path):
-    """v0.2.10:重跑 initialize() 不能报错 / 重复加 callback 列(幂等迁移)。"""
+def test_v11_migration_is_idempotent(tmp_path):
+    """v0.3.8:重跑 initialize() 不能重复加 group_name 列(幂等迁移)。"""
     from doupool.db.database import DatabaseManager
 
     path = tmp_path / "double-init.sqlite3"
@@ -258,11 +261,47 @@ def test_v10_migration_is_idempotent(tmp_path):
     try:
         manager.initialize()
         manager.initialize()
-        # schema_version 只升到 v10,没有重复行
+        # schema_version 只升到 v11,没有重复行
         rows = list(manager.database.execute_sql(
             "SELECT version FROM schema_version ORDER BY version"
         ).fetchall())
-        assert [r[0] for r in rows] == [10]
+        assert [r[0] for r in rows] == [11]
+    finally:
+        manager.close()
+
+
+def test_version_ten_database_adds_nullable_group_name(tmp_path):
+    """v0.3.8:真实 v10 老库升级后保留旧任务,group_name 默认为 NULL。"""
+    import sqlite3
+    from doupool.db.database import DatabaseManager
+
+    path = tmp_path / "v10.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY);
+        INSERT INTO schema_version VALUES (10);
+        CREATE TABLE videotask (
+          id TEXT PRIMARY KEY,
+          group_id VARCHAR(255),
+          group_index INTEGER NOT NULL DEFAULT 0,
+          prompt TEXT NOT NULL
+        );
+        INSERT INTO videotask VALUES ('legacy-task', 'legacy-group', 1, '老任务');
+        """)
+
+    manager = DatabaseManager(path)
+    manager.initialize()
+    try:
+        assert manager.database.execute_sql(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone()[0] == 11
+        columns = {
+            row[1] for row in manager.database.execute_sql("PRAGMA table_info(videotask)")
+        }
+        assert "group_name" in columns
+        assert manager.database.execute_sql(
+            "SELECT id, group_name FROM videotask WHERE id='legacy-task'"
+        ).fetchone() == ("legacy-task", None)
     finally:
         manager.close()
 

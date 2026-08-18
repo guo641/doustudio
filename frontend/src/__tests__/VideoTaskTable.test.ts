@@ -83,7 +83,7 @@ it('partitions visible tasks by group and keeps group order after filtering', as
 
   const view = render(VideoTaskTable, { props: { tasks: groupedTasks } });
   const scoped = within(view.container as HTMLElement);
-  const headers = [...view.container.querySelectorAll('tr.group-header .group-title > span:first-child')].map(
+  const headers = [...view.container.querySelectorAll('tr.group-header .group-title > span:first-of-type')].map(
     (node) => node.textContent?.replace(/\s+/g, ' ').trim(),
   );
   expect(headers).toEqual([
@@ -98,7 +98,7 @@ it('partitions visible tasks by group and keeps group order after filtering', as
 
   const searchInput = view.container.querySelector('input[aria-label="搜索任务"]') as HTMLInputElement;
   await fireEvent.update(searchInput, 'B-');
-  const filteredHeaders = [...view.container.querySelectorAll('tr.group-header .group-title > span:first-child')].map(
+  const filteredHeaders = [...view.container.querySelectorAll('tr.group-header .group-title > span:first-of-type')].map(
     (node) => node.textContent?.replace(/\s+/g, ' ').trim(),
   );
   expect(filteredHeaders).toEqual(['组 #1 · 2 个任务']);
@@ -106,4 +106,34 @@ it('partitions visible tasks by group and keeps group order after filtering', as
   expect(scoped.queryByText('未分组任务')).toBeNull();
   expect(scoped.getByText('B-第一段')).toBeTruthy();
   expect(scoped.getByText('B-第二段')).toBeTruthy();
+});
+
+it('uses the group name as the header and toggles only that group', async () => {
+  const groupedTasks = [
+    {
+      id: 'snake-1', account_name: '账号 A', prompt: '蛇的第一段',
+      model: 'seedance_v2.0_mini', ratio: '9:16', duration: 10, status: 'queued',
+      group_id: 'snake-group', group_index: 1, group_name: '美女蛇', created_at: '2026-07-13T10:00:00',
+    },
+    {
+      id: 'snake-2', account_name: '账号 A', prompt: '蛇的第二段',
+      model: 'seedance_v2.0_mini', ratio: '9:16', duration: 10, status: 'queued',
+      group_id: 'snake-group', group_index: 2, group_name: '美女蛇', created_at: '2026-07-13T10:01:00',
+    },
+  ];
+
+  const view = render(VideoTaskTable, { props: { tasks: groupedTasks } });
+  const groupHeader = view.container.querySelector('tr.group-header') as HTMLTableRowElement;
+  expect(groupHeader.textContent).toContain('美女蛇 · 2 个任务');
+  expect(groupHeader.getAttribute('aria-expanded')).toBe('true');
+  expect(screen.getByText('蛇的第一段')).toBeTruthy();
+
+  await fireEvent.click(groupHeader);
+  expect(groupHeader.getAttribute('aria-expanded')).toBe('false');
+  expect(screen.queryByText('蛇的第一段')).toBeNull();
+  expect(screen.queryByText('蛇的第二段')).toBeNull();
+
+  await fireEvent.click(groupHeader);
+  expect(groupHeader.getAttribute('aria-expanded')).toBe('true');
+  expect(screen.getByText('蛇的第一段')).toBeTruthy();
 });

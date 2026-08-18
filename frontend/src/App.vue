@@ -73,6 +73,7 @@ type VideoTask = {
   // /「保存到下载目录」自动建独立文件夹。
   group_id?: string;
   group_index?: number;
+  group_name?: string;
   created_at: string;
   // v0.2.35:后端 _video_task_dict 注入的建议文件名,与 group_download 同源
   // (`{group_index:02d}_{HHMMSS}_{prompt前12字符}[-clean].mp4`)。
@@ -89,6 +90,7 @@ const showTaskDialog = ref(false);
 const state = ref('');
 const message = ref('');
 const prompt = ref('');
+const groupName = ref('');
 const model = ref('seedance_v2.0_mini');
 const FIXED_VIDEO_DURATION_SECONDS = 10;
 
@@ -292,8 +294,10 @@ async function submitVideo() {
       account_id: null,
       mode: 't2v',
       images: [],
+      group_name: groupName.value.trim() || undefined,
     });
     prompt.value = '';
+    groupName.value = '';
     showTaskDialog.value = false;
     // v0.2.35:跨账号凑余额 —— 后端 200 OK + {task, partial_rejected};
     // partial_rejected 非空时告知用户哪几条 prompt 暂时无账号可用、稍后会被自动重试
@@ -703,6 +707,15 @@ onBeforeUnmount(() => {
           {{ prompt.length }} / 5000 ·
           {{ segmentCount }} 段(用「第一段」「第二段」分隔自动归组)
         </div>
+
+        <DpField label="组名" for-id="video-group-name" hint="可选；填写后该任务会归入此组">
+          <DpInput
+            id="video-group-name"
+            v-model="groupName"
+            :maxlength="40"
+            placeholder="例如：美女蛇"
+          />
+        </DpField>
 
         <div class="form-grid">
           <DpField label="模型" for-id="video-model">

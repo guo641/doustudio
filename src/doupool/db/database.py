@@ -28,7 +28,7 @@ class DatabaseManager:
         if version is None:
             with self.database.atomic():
                 self.database.create_tables(ALL_MODELS)
-                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (10)")
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (11)")
             return
         if version < 2:
             with self.database.atomic():
@@ -170,6 +170,19 @@ class DatabaseManager:
                         "ALTER TABLE videotask ADD COLUMN callback_last_error TEXT"
                     )
                 self.database.execute_sql("INSERT INTO schema_version(version) VALUES (10)")
+        if version < 11:
+            # v0.3.8:用户可为任务组指定名称。旧任务保持 NULL,名称仅由新建
+            # 任务写入;PRAGMA 守卫使重复启动/半迁移 DB 幂等。
+            task_columns = {
+                row[1] for row in self.database.execute_sql("PRAGMA table_info(videotask)").fetchall()
+            }
+            with self.database.atomic():
+                if "group_name" not in task_columns:
+                    self.database.execute_sql(
+                        "ALTER TABLE videotask ADD COLUMN group_name VARCHAR(255)"
+                    )
+                self.database.execute_sql("INSERT INTO schema_version(version) VALUES (11)")
+            version = 11
 
     def _make_video_account_nullable(self) -> None:
         self.database.execute_sql("""

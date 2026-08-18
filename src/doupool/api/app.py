@@ -60,6 +60,8 @@ class CreateVideoTaskBody(BaseModel):
     # 不会漏掉这条新任务。只在手动重试路径传,普通新建留 None 让
     # service 端按 prompt 数量决定是否打组。
     group_id: str | None = None
+    # v0.3.8:用户可为本次提交指定组名;service 负责去空白并在需要时建组。
+    group_name: str | None = Field(default=None, max_length=40)
 
     @field_validator("duration", mode="before")
     @classmethod
@@ -202,6 +204,7 @@ def _video_task_dict(task, daily_quota: int = 50) -> dict:
     return {
         "id": task.id,
         "group_id": task.group_id,
+        "group_name": getattr(task, "group_name", None),
         "group_index": task.group_index,
         "account_id": account.id if account else None,
         "account_name": account.display_name if account else None,
@@ -858,9 +861,22 @@ def create_app(
         if not tasks:
             raise HTTPException(status_code=404, detail=f"group_id {body.group_id} 不存在")
 
-        # batch_folder:{group_id 前 8 位}_{HHMMSS},同秒重名追加 -2 / -3 ...
+        # v0.3.8:有组名时目录直接使用清洗后的组名;旧任务/无名组继续
+        # 使用 group_id 前缀 + 时间戳,同秒重名追加 -2 / -3 ...。
         timestamp = datetime.now().strftime("%H%M%S")
-        base_folder = f"{body.group_id[:8]}_{timestamp}"
+        raw_group_name = next(
+            (
+                task.group_name
+                for task in tasks
+                if getattr(task, "group_name", None)
+                and task.group_name.strip()
+            ),
+            None,
+        )
+        if raw_group_name and raw_group_name.strip():
+            base_folder = _sanitize_filename_part(raw_group_name.strip(), max_len=40)
+        else:
+            base_folder = f"{body.group_id[:8]}_{timestamp}"
         batch_folder = download_dir / base_folder
         n = 2
         while batch_folder.exists():

@@ -124,6 +124,7 @@ export async function listVideoTasks(): Promise<Array<{
   // v0.2.28:批量任务被后端打成同一 group_id,结果页按组折叠展示。
   group_id?: string;
   group_index?: number;
+  group_name?: string;
   created_at: string;
 }>> {
   return json(await fetch('/api/video-tasks', { headers }), '任务加载失败');
@@ -139,6 +140,7 @@ export async function createVideoTask(body: {
   images?: { name: string; data_base64: string }[];
   // v0.2.32:手动重试路径透传原 task.group_id,新任务仍归属同组。
   group_id?: string;
+  group_name?: string;
 }) {
   // v0.2.35:跨账号凑余额 —— 200 OK + {task, partial_rejected} 包装。
   // 解析返 {task, partial_rejected},App.vue 据此 Toast 提示哪几条 prompt

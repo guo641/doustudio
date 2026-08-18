@@ -32,6 +32,7 @@ type ResultTask = {
   // 会被后端打成同一 group_id,结果页按组折叠展示。
   group_id?: string;
   group_index?: number;
+  group_name?: string;
   created_at: string;
   // v0.2.35:后端 _video_task_dict 注入的建议文件名,与 group_download 同源
   // (`{group_index:02d}_{HHMMSS}_{prompt前12字符}[-clean].mp4`)
@@ -75,6 +76,7 @@ const UNGROUPED = '__ungrouped__';
 type GroupBucket = {
   key: string;
   group_id?: string;
+  group_name?: string;
   tasks: ResultTask[];
 };
 
@@ -84,9 +86,10 @@ const groupedTasks = computed<GroupBucket[]>(() => {
     const key = task.group_id || UNGROUPED;
     let bucket = buckets.get(key);
     if (!bucket) {
-      bucket = { key, group_id: task.group_id, tasks: [] };
+      bucket = { key, group_id: task.group_id, group_name: task.group_name, tasks: [] };
       buckets.set(key, bucket);
     }
+    if (!bucket.group_name && task.group_name) bucket.group_name = task.group_name;
     bucket.tasks.push(task);
   }
   // 顺序:有组的组(group_id 不为空)按最小 created_at 升序排前面;
@@ -137,24 +140,29 @@ function sanitizeFilenamePart(text: string, maxLen = 12): string {
   return out.slice(0, maxLen) || 'video';
 }
 
-function filenameForTask(task: ResultTask, groupId: string | undefined): string {
+function filenameForTask(
+  task: ResultTask,
+  groupId: string | undefined,
+  groupName?: string,
+): string {
   // v0.2.35:后端主推 —— 命名一致;用户单条下载与 group_download 同格式
   if (task.download_filename) {
-    return groupId ? `${batchFolderName(groupId)}/${task.download_filename}` : task.download_filename;
+    return groupId ? `${batchFolderName(groupId, groupName)}/${task.download_filename}` : task.download_filename;
   }
   // v0.2.28 兼容:无 download_filename(老后端)时退化到 {group_id前8}_{HHMMSS}/doubao-{id}[-clean].mp4
   const stem = `doubao-${task.id}${hasCleanVideo(task) ? '-clean' : ''}.mp4`;
-  return groupId ? `${batchFolderName(groupId)}/${stem}` : stem;
+  return groupId ? `${batchFolderName(groupId, groupName)}/${stem}` : stem;
 }
 
-// v0.2.28:组 ID 前 8 位 + HHMMSS,作为浏览器下载管理器自动建子目录的
-// 文件名前缀。仅用于 filename 拼接,不在 FS 真建目录(那是后端的事)。
-function batchFolderName(groupId: string): string {
+// 组名优先作为浏览器下载管理器的子目录名;旧组回退到组 ID 前 8 位 + HHMMSS。
+// 仅用于 filename 拼接,不在 FS 真建目录(那是后端的事)。
+function batchFolderName(groupId: string, groupName?: string): string {
   const d = new Date();
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
-  return `${groupId.slice(0, 8)}_${hh}${mm}${ss}`;
+  const safeName = groupName?.replace(/[\\/:*?"<>|\r\n\t]/g, '_').trim().slice(0, 40);
+  return safeName || `${groupId.slice(0, 8)}_${hh}${mm}${ss}`;
 }
 
 /**
@@ -194,10 +202,14 @@ function openInSystemBrowser(url: string): boolean {
  * 只是 filename 走 `${folder}/doubao-${id}.mp4` 让浏览器下载管理器
  * 自动建子目录(实测 WebView2/Edge 桌面版 Chromium 内核支持子目录字符)。
  */
-async function downloadOne(task: ResultTask, groupId: string | undefined): Promise<boolean> {
+async function downloadOne(
+  task: ResultTask,
+  groupId: string | undefined,
+  groupName?: string,
+): Promise<boolean> {
   const url = pickDownloadUrl(task);
   if (!url) return false;
-  const filename = filenameForTask(task, groupId);
+  const filename = filenameForTask(task, groupId, groupName);
 
   // 1) cors
   try {
@@ -243,7 +255,7 @@ async function downloadGroupFrontend(group: GroupBucket) {
     for (const task of group.tasks) {
       if (!pickDownloadUrl(task)) continue;
       // 单条失败不阻断整组(其他任务可能签名 URL 还活着)
-      const ok = await downloadOne(task, group.group_id);
+      const ok = await downloadOne(task, group.group_id, group.group_name);
       if (!ok) {
         // 触发 App.vue 的 refresh 兜底链(单条刷新,不影响组里其他条)
         emit('download-failed', task.id);
@@ -310,7 +322,7 @@ async function downloadGroupBackend(group: GroupBucket) {
                 <ChevronDown v-if="expandedGroups.has(group.key)" :size="14" />
                 <ChevronRight v-else :size="14" />
                 <span class="group-title">
-                  组 #{{ group.group_id.slice(0, 8) }} · {{ group.tasks.length }} 个视频
+                  {{ group.group_name || `组 #${group.group_id.slice(0, 8)}` }} · {{ group.tasks.length }} 个视频
                 </span>
                 <span class="group-hint">
                   下载会自动归到独立文件夹
@@ -364,7 +376,7 @@ async function downloadGroupBackend(group: GroupBucket) {
                 <DownloadButton
                   v-if="pickDownloadUrl(task)"
                   :href="pickDownloadUrl(task)!"
-                  :filename="filenameForTask(task, group.group_id)"
+                  :filename="filenameForTask(task, group.group_id, group.group_name)"
                   @download-failed="() => emit('download-failed', task.id)"
                 >
                   <Download :size="12" />

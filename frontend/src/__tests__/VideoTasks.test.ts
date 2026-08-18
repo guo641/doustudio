@@ -47,6 +47,7 @@ it('creates a text-to-video task from the video task page', async () => {
   expect(durationInput.value).toBe('10');
   expect(durationInput.disabled).toBe(true);
   await fireEvent.update(screen.getByLabelText('画面描述'), '一只猫在草地上行走');
+  await fireEvent.update(screen.getByLabelText('组名'), '美女蛇');
   await fireEvent.click(screen.getByRole('button', { name: '添加文生任务' }));
 
   await waitFor(() => expect(createVideoTask).toHaveBeenCalledWith(expect.objectContaining({
@@ -56,7 +57,10 @@ it('creates a text-to-video task from the video task page', async () => {
     account_id: null,
     mode: 't2v',
     images: [],
+    group_name: '美女蛇',
   })));
+  await fireEvent.click(screen.getByRole('button', { name: '＋ 添加任务' }));
+  expect((screen.getByLabelText('组名') as HTMLInputElement).value).toBe('');
 });
 
 it('retries a historical text task with its model and ratio but fixed 10 second duration', async () => {
