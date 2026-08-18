@@ -5,10 +5,15 @@ import logging
 import time
 from uuid import uuid4
 
-# v0.2.21:复用 prompt_reviser 已有的 policy 关键词(侵权/违规/换个主题/无法返回该内容
+# v0.2.21:复用 prompt_reviser 已有的拒绝关键词(侵权/违规/换个主题/无法返回该内容
 # 等),chain 响应任意 message 文本命中即抛 DoubaoContentRejected,让 service 层
-# 立即标 failed + 退还额度,而不是等 5min timeout。
-from doupool.prompt_reviser import _POLICY_PATTERNS
+# 立即处理,而不是等本地 deadline。生成失败文案与策略拒绝走同一条
+# DoubaoContentRejected -> prompt revise/retry 链路,但不改变 classify_failure 的
+# 分类优先级(特别是「视频生成超时」必须仍然是 TIMEOUT)。
+from doupool.prompt_reviser import (
+    _GENERATION_FAILED_PATTERNS,
+    _POLICY_PATTERNS,
+)
 
 # v0.3.4.1:race 防御放宽 — 当服务端 envelope id 不匹配但 creation 合法时,
 # 需要打 WARNING 暴露服务端 id 漂移,便于后续观测 / 排查。
@@ -446,6 +451,28 @@ _NON_TEXT_KEYS = {
 _MAX_TEXT_LEN = 8000  # 防御:豆包偶然回超大 base64 / 视频 URL 也只取前 N 字
 
 
+def _match_rejection_pattern(text: str) -> str | None:
+    """返回拒绝/生成失败文案中的首个命中片段。
+
+    策略拒绝优先保持既有匹配顺序；生成失败只额外补一组明确的失败
+    关键词。这里不调用 ``classify_failure``，避免把轮询层的 TIMEOUT
+    语义和本地 deadline 处理混在一起。
+    """
+    for pattern in _POLICY_PATTERNS:
+        match = pattern.search(text)
+        if match is not None:
+            return match.group(0)[:200]
+    for pattern in _GENERATION_FAILED_PATTERNS:
+        match = pattern.search(text)
+        if match is not None:
+            # 生成失败模式通常只是整段气泡的前缀（例如“视频生成失败，
+            # 生成额度未扣除”）。把命中点附近的原文带回异常，便于日志和
+            # classify_failure 保留豆包真实文案，而不是只剩一个短标签。
+            start = max(0, match.start() - 40)
+            return " ".join(text[start:start + 240].split())[:200]
+    return None
+
+
 def scan_sse_for_policy_rejection(sse_text: str) -> str | None:
     """v0.2.24:扫描豆包 SSE 响应文本里的拒绝文案。
 
@@ -510,11 +537,7 @@ def scan_sse_for_policy_rejection(sse_text: str) -> str | None:
     if not chunks:
         return None
     combined = "\n".join(chunks)
-    for pat in _POLICY_PATTERNS:
-        m = pat.search(combined)
-        if m:
-            return m.group(0)[:200]
-    return None
+    return _match_rejection_pattern(combined)
 
 
 def _scan_chain_response_for_rejection(response: dict) -> str | None:
@@ -554,11 +577,8 @@ def _scan_chain_response_for_rejection(response: dict) -> str | None:
         if not isinstance(text, str) or not text:
             return None
         candidate = text[:_MAX_TEXT_LEN]
-        for pattern in _POLICY_PATTERNS:
-            match = pattern.search(candidate)
-            if match is None:
-                continue
-            reason = match.group(0)[:200]
+        reason = _match_rejection_pattern(candidate)
+        if reason is not None:
             snippet = " ".join(candidate.split())[:200]
             _LOGGER.warning(
                 "event=video_chain_policy_rejected path=%s snippet=%s",
@@ -923,11 +943,7 @@ def _find_policy_rejection(decoded_blocks: list[list[dict]]) -> str | None:
     def _scan_text(text: str) -> str | None:
         if not text:
             return None
-        for pat in _POLICY_PATTERNS:
-            m = pat.search(text)
-            if m:
-                return m.group(0)[:200]
-        return None
+        return _match_rejection_pattern(text)
 
     for blocks in decoded_blocks:
         for block in blocks:

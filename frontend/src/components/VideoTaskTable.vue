@@ -82,6 +82,75 @@ const visibleTasks = computed(() => {
   );
 });
 
+const UNGROUPED = '__ungrouped__';
+
+type TaskGroup = {
+  key: string;
+  groupId?: string;
+  tasks: VideoTaskRow[];
+  firstCreatedAt: string;
+  firstGroupIndex: number | null;
+};
+
+/**
+ * Keep grouping after all filters have run so an empty group never leaves a
+ * stale header behind.  group_index is the order inside a group; using the
+ * smallest available value as a group-level tie breaker keeps ordering stable
+ * for older payloads that provide it, then creation time preserves submission
+ * order when every group starts at index 1.
+ */
+const visibleGroups = computed<TaskGroup[]>(() => {
+  const buckets = new Map<string, TaskGroup>();
+  for (const task of visibleTasks.value) {
+    const key = task.group_id || UNGROUPED;
+    let group = buckets.get(key);
+    if (!group) {
+      group = {
+        key,
+        groupId: task.group_id,
+        tasks: [],
+        firstCreatedAt: task.created_at,
+        firstGroupIndex: task.group_index ?? null,
+      };
+      buckets.set(key, group);
+    }
+    group.tasks.push(task);
+    if (task.created_at < group.firstCreatedAt) group.firstCreatedAt = task.created_at;
+    if (
+      task.group_index != null &&
+      (group.firstGroupIndex == null || task.group_index < group.firstGroupIndex)
+    ) {
+      group.firstGroupIndex = task.group_index;
+    }
+  }
+
+  for (const group of buckets.values()) {
+    group.tasks.sort((a, b) => {
+      if (group.groupId) {
+        const ai = a.group_index ?? Number.MAX_SAFE_INTEGER;
+        const bi = b.group_index ?? Number.MAX_SAFE_INTEGER;
+        if (ai !== bi) return ai - bi;
+      }
+      return a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id);
+    });
+  }
+
+  return [...buckets.values()].sort((a, b) => {
+    if (a.key === UNGROUPED) return 1;
+    if (b.key === UNGROUPED) return -1;
+    if (a.firstGroupIndex != null && b.firstGroupIndex != null && a.firstGroupIndex !== b.firstGroupIndex) {
+      return a.firstGroupIndex - b.firstGroupIndex;
+    }
+    return a.firstCreatedAt.localeCompare(b.firstCreatedAt) || a.key.localeCompare(b.key);
+  });
+});
+
+function groupTitle(group: TaskGroup, ordinal: number) {
+  return group.groupId
+    ? `组 #${ordinal} · ${group.tasks.length} 个任务`
+    : `未分组 · ${group.tasks.length} 个任务`;
+}
+
 function toggle(id: string) {
   const next = new Set(expanded.value);
   next.has(id) ? next.delete(id) : next.add(id);
@@ -130,8 +199,19 @@ function paramsText(task: VideoTaskRow) {
         </tr>
       </thead>
       <tbody>
-        <template v-for="task in visibleTasks" :key="task.id">
-          <tr>
+        <template v-for="(group, groupOrdinal) in visibleGroups" :key="group.key">
+          <tr class="group-header">
+            <td colspan="5">
+              <div class="group-title">
+                <span>{{ groupTitle(group, groupOrdinal + 1) }}</span>
+                <span v-if="group.groupId" class="group-id" :title="`组 ID: ${group.groupId}`">
+                  {{ group.groupId.slice(0, 8) }}
+                </span>
+              </div>
+            </td>
+          </tr>
+          <template v-for="task in group.tasks" :key="task.id">
+            <tr>
             <td>
               <DpBadge :tone="task.status" dot>
                 {{ statusLabels[task.status] || task.status }}
@@ -217,23 +297,24 @@ function paramsText(task: VideoTaskRow) {
               </DpButton>
               <span v-if="!task.result_url && !task.clean_video_url && task.status !== 'failed' && RUNNING_STATUSES.has(task.status)" class="dash">—</span>
             </td>
-          </tr>
-          <tr v-if="expanded.has(task.id)" class="detail-row">
-            <td colspan="5">
-              <div class="detail-body">
-                <p>{{ task.prompt }}</p>
-                <p class="detail-meta">
-                  {{ modeLabels[task.mode || 't2v'] || '文生' }}
-                  <template v-if="(task.mode || 't2v') === 'i2v' && task.image_count">
-                    · {{ task.image_count }} 张图
-                  </template>
-                  · {{ paramsText(task) }}
-                  · {{ task.account_name || '未分配账号' }}
-                </p>
-                <p v-if="task.error" class="error">{{ task.error }}</p>
-              </div>
-            </td>
-          </tr>
+            </tr>
+            <tr v-if="expanded.has(task.id)" class="detail-row">
+              <td colspan="5">
+                <div class="detail-body">
+                  <p>{{ task.prompt }}</p>
+                  <p class="detail-meta">
+                    {{ modeLabels[task.mode || 't2v'] || '文生' }}
+                    <template v-if="(task.mode || 't2v') === 'i2v' && task.image_count">
+                      · {{ task.image_count }} 张图
+                    </template>
+                    · {{ paramsText(task) }}
+                    · {{ task.account_name || '未分配账号' }}
+                  </p>
+                  <p v-if="task.error" class="error">{{ task.error }}</p>
+                </div>
+              </td>
+            </tr>
+          </template>
         </template>
         <tr v-if="!visibleTasks.length">
           <td colspan="5">
@@ -253,6 +334,30 @@ function paramsText(task: VideoTaskRow) {
   color: var(--text-muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+}
+
+.group-header td {
+  height: 38px !important;
+  padding: 0 14px !important;
+  border-top: 10px solid var(--bg-panel);
+  border-bottom: 1px solid var(--border-soft, var(--border));
+  background: var(--bg-muted);
+}
+
+.group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.group-id {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
 }
 
 .task-cell {

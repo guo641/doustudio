@@ -1503,6 +1503,7 @@ class VideoTaskService:
                         max_reject_retries=max_reject_retries,
                         window_visible=runner_window_visible,
                         owner_task_id=task_id,
+                        prompt_retry_count=getattr(task, "prompt_retry_count", 0) or 0,
                     )
                     self.repository.update_video_task(task_id, status="succeeded", **result)
                     self.logger.info(
@@ -1573,16 +1574,54 @@ class VideoTaskService:
                     # 直到用户去点刷新 token。
                     return
                 except DoubaoContentRejected as exc:
-                    # v0.2.21:豆包在 chain 响应里给了真人能看到的「侵权/违规/换个
-                    # 主题」等拒绝文案(protocol.parse_creation_result 兜底扫描到
-                    # 命中)。之前这条路径会让 polling 一直返回 None,直到
-                    # runner.timeout 5min 才抛「视频生成超时」,期间用户看任务
-                    # 永远「生成中」。现在立即标 failed + 退还额度 + 触发
-                    # callback。**不**触发 prompt 改写重试 —— 同 prompt 必拒,
-                    # 改写反而浪费额度再撞同样的 reject(用户的真实反馈:
-                    # 「加拒绝识别,不用调阈值」)。
+                    # browser.run 通常已在同一 page/profile 内完成改词重试。
+                    # 这里是 runner 未启用内部重试时的兜底：只有豆包明确返回
+                    # 「视频生成失败」才走 service 级改词重入队；策略拒绝仍保持
+                    # 既有的立即失败语义，避免改变历史行为。
                     refund_quota_if_recorded()
                     response_excerpt = (exc.response_text or "").replace("\r\n", " ")[:500]
+                    failure = classify_failure(exc.error_message)
+                    current_task = self.repository.get_video_task(task_id) or task
+                    attempt = getattr(current_task, "prompt_retry_count", 0) or 0
+                    max_attempts = int(settings.get("max_prompt_retries", 2))
+                    if (
+                        failure.kind == FailureKind.GENERATION_FAILED
+                        and failure.revise_prompt
+                        and attempt < max_attempts
+                    ):
+                        new_prompt = revise_prompt(
+                            current_task.prompt,
+                            failure,
+                            attempt=attempt + 1,
+                        )
+                        if new_prompt and new_prompt != current_task.prompt:
+                            self.repository.update_video_task(
+                                task_id,
+                                prompt=new_prompt,
+                                prompt_retry_count=attempt + 1,
+                                status="queued",
+                                error_message=(
+                                    f"生成失败，改写 prompt 第 {attempt + 1}/"
+                                    f"{max_attempts} 次重试"
+                                ),
+                            )
+                            self.logger.warning(
+                                "event=video_generation_failed_requeued "
+                                "account_id=%s task_id=%s attempt=%d max=%d reason=%s",
+                                account.id,
+                                task_id,
+                                attempt + 1,
+                                max_attempts,
+                                exc.error_message,
+                                extra={
+                                    "event": "video_generation_failed_requeued",
+                                    "account_id": account.id,
+                                    "task_id": task_id,
+                                },
+                            )
+                            # 保留 account_id：下一轮继续使用同一账号。当前失败
+                            # 已退本次预扣，下一轮进入 generating 时再扣一次。
+                            continue
                     self.repository.update_video_task(
                         task_id,
                         status="failed",

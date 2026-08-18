@@ -3557,6 +3557,7 @@ class PlaywrightVideoRunner:
         max_reject_retries: int = 0,
         window_visible: bool = False,
         owner_task_id: str | None = None,
+        prompt_retry_count: int = 0,
     ) -> dict[str, str]:
         """单账号一次性视频生成。
 
@@ -3641,6 +3642,9 @@ class PlaywrightVideoRunner:
             # quota 扣款发生在 service._run_inner.update("generating") 时,
             # 且有 quota_recorded 闸门只扣 1 次 —— 重试不重复扣。
             prompt_to_send = prompt
+            # 保留 task 已有的改词次数；同一 runner 内的生成失败重试也
+            # 要写回 DB，避免 UI 一直显示 0 次、下一轮任务又从旧 prompt 开始。
+            base_prompt_retry_count = max(0, int(prompt_retry_count or 0))
             attempt = 0
             while True:
                 try:
@@ -3674,7 +3678,13 @@ class PlaywrightVideoRunner:
                         "event=video_content_reject_revise attempt=%d max=%d reason=%s",
                         attempt, max_reject_retries, exc.error_message,
                     )
-                    update(error_message=f"豆包拒绝(第 {attempt}/{max_reject_retries} 次改写重试中)")
+                    update(
+                        prompt=new_prompt,
+                        prompt_retry_count=base_prompt_retry_count + attempt,
+                        error_message=(
+                            f"豆包拒绝(第 {attempt}/{max_reject_retries} 次改写重试中)"
+                        ),
+                    )
                     prompt_to_send = new_prompt
                     continue
         except AegisBlocked:

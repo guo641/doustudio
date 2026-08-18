@@ -333,6 +333,7 @@ def _wrap(content_blocks: list[dict]) -> dict:
 _CHAIN_COPYRIGHT_REJECTION = (
     "抱歉，由于版权相关限制，暂时无法创作对应的内容，换其他主题试试吧。"
 )
+_GENERATION_FAILED_BUBBLE = "视频生成失败，生成额度未扣除。"
 
 
 def test_fixed_video_duration_constant_keeps_legacy_protocol_durations():
@@ -461,6 +462,22 @@ def test_chain_rejection_helper_matches_generic_refusal_text():
 
     assert reason is not None
     assert "无法生成" in reason
+
+
+def test_chain_envelope_generation_failed_bubble_raises_immediately():
+    """生成失败气泡出现在最新 bot envelope 时，不能继续返回 None 轮询。"""
+    response = _wrap_chain_envelope({
+        "content_block": _pending_direct_content_blocks(
+            rejection_text=_GENERATION_FAILED_BUBBLE,
+        ),
+    })
+
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_creation_result(response, owner_task_id="owner-generation-failed")
+
+    assert excinfo.value.error_message.startswith("视频生成失败")
+    assert "生成额度未扣除" in excinfo.value.error_message
+    assert _GENERATION_FAILED_BUBBLE in excinfo.value.response_text
 
 
 @pytest.mark.parametrize(
@@ -656,6 +673,21 @@ def test_parse_creation_result_raises_on_new_rejection_template():
     assert excinfo.value.response_text
 
 
+def test_parse_creation_result_raises_on_generation_failed_content_block():
+    """兼容旧 content JSON blocks：明确生成失败也必须立即结束 polling。"""
+    response = _wrap([{
+        "block_type": 10000,
+        "content": {"text_block": {"text": _GENERATION_FAILED_BUBBLE}},
+    }])
+
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_creation_result(response)
+
+    assert excinfo.value.error_message.startswith("视频生成失败")
+    assert "生成额度未扣除" in excinfo.value.error_message
+    assert "超时" not in excinfo.value.error_message
+
+
 def test_parse_creation_result_raises_on_creation_block_error_msg():
     """creation_block 失败状态附带的 error_msg / disallow_reason 也要识别。"""
     response = _wrap([{
@@ -741,6 +773,29 @@ def test_scan_sse_for_policy_rejection_detects_text_message():
     assert "无法生成" in excinfo.value.error_message
     # raw SSE (≤2000 字符)透传进 response_text,跟 DoubaoRateLimited 一致
     assert excinfo.value.response_text == text
+
+
+def test_scan_sse_for_generation_failed_bubble_raises_immediately():
+    """SSE 直接回生成失败时，ACK 解析必须抛错而不是进入 420s polling。"""
+    failure_payload = {
+        "content_block": [{
+            "content": {"text_block": {"text": _GENERATION_FAILED_BUBBLE}},
+        }],
+    }
+    text = (
+        "event: TEXT_MESSAGE\ndata: "
+        + json.dumps(failure_payload, ensure_ascii=False)
+        + "\n\n"
+        'event: SSE_ACK\ndata: {"ack_client_meta":{"conversation_id":"c1",'
+        '"section_id":"s1"},"query_list":[{"question_id":"q1"}]}\n\n'
+    )
+
+    with pytest.raises(DoubaoContentRejected) as excinfo:
+        parse_sse_ack(text)
+
+    assert excinfo.value.error_message.startswith("视频生成失败")
+    assert "生成额度未扣除" in excinfo.value.error_message
+    assert "超时" not in str(excinfo.value)
 
 
 def test_scan_sse_for_policy_rejection_detects_copyright_creation_message():

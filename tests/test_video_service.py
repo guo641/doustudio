@@ -1,7 +1,9 @@
 import asyncio
 import contextlib
+import threading
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,8 +12,10 @@ from doupool.db.models import Account
 from doupool.video.browser import (
     AEGIS_BLOCKED_MESSAGE,
     AegisBlocked,
+    PlaywrightVideoRunner,
     TokenBundleUnavailable,
 )
+import doupool.video.browser as browser_module
 from doupool.video.protocol import DoubaoContentRejected, DoubaoRateLimited
 from doupool.video.service import NoAvailableAccount, VideoTaskService
 
@@ -1184,6 +1188,44 @@ class ContentRejectedRunner:
         )
 
 
+class GenerationFailedThenSuccessRunner:
+    """模拟「生成失败，生成额度未扣除」后同账号重投成功。"""
+
+    def __init__(self):
+        self.calls = 0
+        self.prompts: list[str] = []
+        self.profile_dirs: list[Path] = []
+        self.retry_counts: list[int] = []
+
+    async def run(
+        self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs
+    ):
+        self.calls += 1
+        self.prompts.append(prompt)
+        self.profile_dirs.append(profile_dir)
+        self.retry_counts.append(int(kwargs.get("prompt_retry_count", 0) or 0))
+        update(status="generating", conversation_id=f"conv-generation-{self.calls}")
+        if self.calls == 1:
+            raise DoubaoContentRejected("视频生成失败", response_text="视频生成失败，生成额度未扣除")
+        return {
+            "remote_task_id": "remote-generation-success",
+            "result_url": "https://example.test/generation-success.mp4",
+            "cover_url": "https://example.test/generation-success.jpg",
+        }
+
+
+class GenerationFailedAlwaysRunner(GenerationFailedThenSuccessRunner):
+    async def run(
+        self, profile_dir, prompt, model, ratio, duration, update, cancel_event, **kwargs
+    ):
+        self.calls += 1
+        self.prompts.append(prompt)
+        self.profile_dirs.append(profile_dir)
+        self.retry_counts.append(int(kwargs.get("prompt_retry_count", 0) or 0))
+        update(status="generating", conversation_id=f"conv-generation-{self.calls}")
+        raise DoubaoContentRejected("视频生成失败", response_text="视频生成失败，生成额度未扣除")
+
+
 @pytest.mark.asyncio
 async def test_service_marks_failed_and_refunds_on_content_rejected(repository, temp_profile):
     """v0.2.21:豆包 chain 拒绝 → 立即 failed + 退还 5 点 mini 额度 + 不重试。"""
@@ -1231,6 +1273,137 @@ async def test_content_rejected_skips_prompt_retry(repository, temp_profile):
     assert saved.prompt == "违规再测"
     # runner 只跑一次(没重试)
     assert runner.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_generation_failed_bubble_revises_and_retries_same_account(
+    repository, temp_profile,
+):
+    """生成失败气泡走 service 兜底改词，下一次仍使用同一 profile。"""
+    Account.create(
+        id="acc-generation-retry",
+        display_name="generation-retry",
+        doubao_user_id="u-generation-retry",
+        profile_dir=temp_profile,
+    )
+    runner = GenerationFailedThenSuccessRunner()
+    service = VideoTaskService(
+        repository, runner, StaticSettings(), account_poll_interval=0.01,
+    )
+
+    task, _ = service.start("一段会触发生成失败的提示词", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    assert saved.status == "succeeded"
+    assert saved.prompt_retry_count == 1
+    assert "把这段提示词修改成" in saved.prompt
+    assert runner.calls == 2
+    assert runner.profile_dirs == [temp_profile, temp_profile]
+    assert runner.retry_counts == [0, 1]
+    # 首次预扣退回后，重投成功只保留一次 10 秒成本。
+    assert Account.get_by_id("acc-generation-retry").video_quota_used_shared == 10
+
+
+@pytest.mark.asyncio
+async def test_generation_failed_bubble_stops_at_prompt_retry_limit(
+    repository, temp_profile,
+):
+    """生成失败一直出现时，改词次数到上限后 failed，不无限重试。"""
+    Account.create(
+        id="acc-generation-limit",
+        display_name="generation-limit",
+        doubao_user_id="u-generation-limit",
+        profile_dir=temp_profile,
+    )
+    runner = GenerationFailedAlwaysRunner()
+    service = VideoTaskService(
+        repository, runner, StaticSettings(), account_poll_interval=0.01,
+    )
+
+    task, _ = service.start("始终会触发生成失败的提示词", "seedance_v2.0_mini", "1:1", 5)
+    await asyncio.wait_for(service._tasks[task.id], timeout=2)
+
+    saved = repository.get_video_task(task.id)
+    assert saved.status == "failed"
+    assert saved.prompt_retry_count == 2
+    assert runner.calls == 3  # 原始 + max_prompt_retries(2)
+    assert all("视频生成失败" not in prompt for prompt in runner.prompts)
+    assert "超时" not in (saved.error_message or "")
+    assert Account.get_by_id("acc-generation-limit").video_quota_used_shared == 0
+
+
+@pytest.mark.asyncio
+async def test_browser_generation_failed_revise_updates_retry_count(monkeypatch, tmp_path):
+    """真实 PlaywrightVideoRunner loop 会改词，并把 prompt_retry_count 写入 update。"""
+    runner = PlaywrightVideoRunner()
+    page = SimpleNamespace(
+        url="https://www.doubao.com/chat/",
+        close=MagicMock(),
+    )
+    # run() awaits page.close(); use an async callable on the fake page.
+    async def close_page():
+        return None
+
+    page.close = close_page
+
+    class FakeContext:
+        async def new_page(self):
+            return page
+
+    context = FakeContext()
+    token_bundle = SimpleNamespace(device_id="device", web_id="web")
+    monkeypatch.setattr(browser_module, "_is_context_alive", lambda value: True)
+    monkeypatch.setattr(
+        runner,
+        "_get_shared_context",
+        lambda *args, **kwargs: _async_value((context, token_bundle)),
+    )
+    monkeypatch.setattr(
+        browser_module,
+        "_pre_submit_aegis_gate",
+        lambda *args, **kwargs: _async_value(None),
+    )
+
+    calls = 0
+
+    async def fake_submit(page_obj, prompt, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise DoubaoContentRejected(
+                "视频生成失败",
+                response_text="视频生成失败，生成额度未扣除",
+            )
+        return {
+            "remote_task_id": "remote-browser-generation",
+            "result_url": "https://example.test/browser-generation.mp4",
+            "cover_url": "https://example.test/browser-generation.jpg",
+        }
+
+    runner._submit_and_poll = fake_submit
+    updates: list[dict] = []
+    result = await runner.run(
+        tmp_path,
+        "原始提示词",
+        "seedance_v2.0_mini",
+        "1:1",
+        10,
+        lambda **values: updates.append(values),
+        threading.Event(),
+        max_reject_retries=2,
+        prompt_retry_count=3,
+    )
+
+    assert result["remote_task_id"] == "remote-browser-generation"
+    assert calls == 2
+    revised = [item for item in updates if "prompt_retry_count" in item]
+    assert revised and revised[-1]["prompt_retry_count"] == 4
+    assert "把这段提示词修改成" in revised[-1]["prompt"]
+
+
+async def _async_value(value):
+    return value
 
 
 # ---------- v0.2.22 Q1:内容审核拒绝自动改写 prompt 重试(opt-in,默认 0) ----------

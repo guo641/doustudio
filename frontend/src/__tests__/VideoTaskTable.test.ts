@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/vue';
+import { fireEvent, render, screen, within } from '@testing-library/vue';
 import { expect, it } from 'vitest';
 import VideoTaskTable from '../components/VideoTaskTable.vue';
 
@@ -50,4 +50,60 @@ it('renders and filters the video task table', async () => {
   expect(view.emitted('retry')[0]).toEqual([tasks[0]]);
   expect(screen.queryByRole('button', { name: '重试任务 failed-i2v' })).toBeNull();
   expect(screen.getByText('历史图生任务')).toBeTruthy();
+});
+
+it('partitions visible tasks by group and keeps group order after filtering', async () => {
+  const groupedTasks = [
+    {
+      id: 'b-2', account_name: '账号 B', prompt: 'B-第二段',
+      model: 'seedance_v2.0_mini', ratio: '16:9', duration: 10, status: 'queued',
+      group_id: 'group-b', group_index: 2, created_at: '2026-07-13T11:01:00',
+    },
+    {
+      id: 'a-2', account_name: '账号 A', prompt: 'A-第二段',
+      model: 'seedance_v2.0_mini', ratio: '1:1', duration: 10, status: 'succeeded',
+      group_id: 'group-a', group_index: 2, created_at: '2026-07-13T10:01:00',
+    },
+    {
+      id: 'b-1', account_name: '账号 B', prompt: 'B-第一段',
+      model: 'seedance_v2.0_mini', ratio: '16:9', duration: 10, status: 'queued',
+      group_id: 'group-b', group_index: 1, created_at: '2026-07-13T11:00:00',
+    },
+    {
+      id: 'a-1', account_name: '账号 A', prompt: 'A-第一段',
+      model: 'seedance_v2.0_mini', ratio: '1:1', duration: 10, status: 'succeeded',
+      group_id: 'group-a', group_index: 1, created_at: '2026-07-13T10:00:00',
+    },
+    {
+      id: 'legacy-1', account_name: '旧账号', prompt: '未分组任务',
+      model: 'seedance_v2.0_mini', ratio: '9:16', duration: 10, status: 'failed',
+      created_at: '2026-07-13T09:00:00',
+    },
+  ];
+
+  const view = render(VideoTaskTable, { props: { tasks: groupedTasks } });
+  const scoped = within(view.container as HTMLElement);
+  const headers = [...view.container.querySelectorAll('tr.group-header .group-title > span:first-child')].map(
+    (node) => node.textContent?.replace(/\s+/g, ' ').trim(),
+  );
+  expect(headers).toEqual([
+    '组 #1 · 2 个任务',
+    '组 #2 · 2 个任务',
+    '未分组 · 1 个任务',
+  ]);
+
+  const prompts = [...view.container.querySelectorAll('tbody tr:not(.group-header):not(.detail-row) .prompt-btn')]
+    .map((node) => node.textContent?.trim());
+  expect(prompts).toEqual(['A-第一段', 'A-第二段', 'B-第一段', 'B-第二段', '未分组任务']);
+
+  const searchInput = view.container.querySelector('input[aria-label="搜索任务"]') as HTMLInputElement;
+  await fireEvent.update(searchInput, 'B-');
+  const filteredHeaders = [...view.container.querySelectorAll('tr.group-header .group-title > span:first-child')].map(
+    (node) => node.textContent?.replace(/\s+/g, ' ').trim(),
+  );
+  expect(filteredHeaders).toEqual(['组 #1 · 2 个任务']);
+  expect(scoped.queryByText('A-第一段')).toBeNull();
+  expect(scoped.queryByText('未分组任务')).toBeNull();
+  expect(scoped.getByText('B-第一段')).toBeTruthy();
+  expect(scoped.getByText('B-第二段')).toBeTruthy();
 });
