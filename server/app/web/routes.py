@@ -157,6 +157,20 @@ def licenses_page(
         raise HTTPException(status_code=404, detail="Page not found")
 
     for license_row in licenses:
+        # 计算激活时长
+        first_seen = license_row["first_seen_at"]
+        if first_seen:
+            activation_seconds = now - first_seen
+            if activation_seconds < 3600:
+                license_row["activation_duration"] = f"{activation_seconds // 60} 分钟"
+            elif activation_seconds < 86400:
+                license_row["activation_duration"] = f"{activation_seconds // 3600} 小时"
+            else:
+                license_row["activation_duration"] = f"{activation_seconds // 86400} 天"
+        else:
+            license_row["activation_duration"] = "-"
+
+        # 计算到期剩余时间
         expires_at = license_row["expires_at"]
         if expires_at is None:
             license_row["expiry_state"] = "unset"
@@ -166,12 +180,18 @@ def licenses_page(
             if seconds_left < 0:
                 license_row["expiry_state"] = "expired"
                 elapsed = -seconds_left
-                license_row["days_label"] = (
-                    "不足 1 天" if elapsed < 86400 else f"{elapsed // 86400} 天"
-                )
+                if elapsed < 3600:
+                    license_row["days_label"] = f"{elapsed // 60} 分钟"
+                elif elapsed < 86400:
+                    license_row["days_label"] = f"{elapsed // 3600} 小时"
+                else:
+                    license_row["days_label"] = f"{elapsed // 86400} 天"
+            elif seconds_left < 3600:
+                license_row["expiry_state"] = "expiring"
+                license_row["days_label"] = f"{seconds_left // 60} 分钟"
             elif seconds_left < 86400:
                 license_row["expiry_state"] = "expiring"
-                license_row["days_label"] = "不足 1 天"
+                license_row["days_label"] = f"{seconds_left // 3600} 小时"
             else:
                 license_row["expiry_state"] = (
                     "expiring" if seconds_left <= 30 * 86400 else "active"

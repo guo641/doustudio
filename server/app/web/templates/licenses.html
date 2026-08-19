@@ -36,7 +36,7 @@
     <thead>
       <tr>
         <th><input id="select-page" type="checkbox" aria-label="选择当前页"></th>
-        <th>HMAC 前缀</th><th>首次激活</th><th>最后心跳</th><th>服务端到期覆盖</th><th>剩余天数</th><th>心跳次数</th><th>操作</th>
+        <th>HMAC 前缀</th><th>激活时间</th><th>最后心跳</th><th>服务端到期覆盖</th><th>剩余时间</th><th>心跳次数</th><th>操作</th>
       </tr>
     </thead>
     <tbody>
@@ -44,7 +44,10 @@
       <tr>
         <td><input class="row-select" type="checkbox" value="{{ lic.license_hmac }}" aria-label="选择 {{ lic.license_hmac[:16] }}"></td>
         <td><code title="{{ lic.license_hmac }}">{{ lic.license_hmac[:16] }}…</code></td>
-        <td>{{ lic.first_seen_at | timestamp_to_datetime }}</td>
+        <td>
+          {{ lic.first_seen_at | timestamp_to_datetime }}
+          <div class="subtle" style="font-size:0.85em;margin-top:2px">{{ lic.activation_duration }}</div>
+        </td>
         <td>{{ lic.last_seen_at | timestamp_to_datetime }}</td>
         <td>
           {% if lic.expires_at is none %}<span class="badge">未设置</span>
@@ -58,7 +61,7 @@
         </td>
         <td>{{ lic.heartbeat_count }}</td>
         <td style="white-space:nowrap">
-          <button class="row-extend" data-hmac="{{ lic.license_hmac }}" {% if lic.expires_at is none %}disabled title="未设置到期覆盖，保持不变"{% endif %}>延期</button>
+          <button class="row-extend" data-hmac="{{ lic.license_hmac }}" {% if lic.expires_at is none %}disabled title="未设置到期覆盖,保持不变"{% endif %}>延期</button>
           <button class="row-revoke danger" data-hmac="{{ lic.license_hmac }}">撤销</button>
         </td>
       </tr>
