@@ -3170,9 +3170,21 @@ async def _enter_video_generation_mode(page: Page):
     Never navigate to ``create-image`` here: that legacy page opens the
     parameter UI which is intentionally retired from the submission path.
     """
-    new_conversation = await _wait_for_visible_exact_text(
-        page, (_NEW_CONVERSATION_SEL,), "新对话"
-    )
+    # v0.3.10: 豆包页面改版,「新对话」按钮文本变为「新对话Ctrl Shift K」,
+    # 不再是纯文本,精确匹配失效。改用 get_by_text 模糊匹配 + XPath 向上查找。
+    new_conversation = None
+    try:
+        # 找到包含「新对话」文本的元素
+        text_elem = page.get_by_text("新对话", exact=False).first
+        # 向上查找包含 cursor-pointer 的可点击父元素
+        clickable_parent = text_elem.locator(
+            'xpath=ancestor::div[contains(@class, "cursor-pointer")]'
+        ).first
+        if await clickable_parent.count() > 0 and await clickable_parent.is_visible():
+            new_conversation = clickable_parent
+    except Exception:
+        pass
+
     if new_conversation is None:
         raise RuntimeError("左侧「新对话」入口未找到")
     await new_conversation.click()
