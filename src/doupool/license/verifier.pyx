@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import sys
 import time
 
@@ -210,13 +211,55 @@ def _evaluate_status_with_fresh(payload, *, fresh_until: int, last_server_sync: 
       - fresh_until < now < fresh+grace    → status=valid, needs_heartbeat=True,  grace=True
       - now > fresh+grace                  → status=expired(闸门静默退出)
       - fresh_until == 0(旧格式无心跳)     → status=valid(grace 期内), needs_heartbeat=True
+
+    P1-A 防时钟回拨:如果 last_server_sync > 0,检查 now 是否回拨到 last_server_sync 之前。
     """
     now = int(time.time())
     needs_heartbeat = False
     grace = False
 
+    # P1-A: 防本地时钟回拨攻击
+    if last_server_sync > 0 and now < last_server_sync:
+        # 系统时钟回拨到上次心跳之前 → 拒绝(攻击者试图让过期 token 看起来有效)
+        logger = logging.getLogger(__name__)
+        logger.error(
+            "检测到系统时钟回拨: now=%d < last_server_sync=%d,拒绝验证",
+            now, last_server_sync
+        )
+        return {
+            "status": "expired",
+            "fingerprint_hex": payload.get("fingerprint_hex", ""),
+            "customer": payload.get("customer", ""),
+            "issued_at": int(payload.get("issued_at", 0)),
+            "expires_at": int(payload.get("expires_at", 0)),
+            "fresh_until": fresh_until,
+            "last_server_sync": last_server_sync,
+            "needs_heartbeat": True,
+            "grace": False,
+            "error": "clock_rollback",
+        }
+
+    # P1-B: 修复 fresh_until<=0 永不过期洞
+    # 恶意 server 可能返回 fresh_until=0 让客户端永久有效
+    # 旧逻辑: if fresh_until <= 0 → 给 7 天 grace,但不会走到过期分支
+    # 新逻辑: fresh_until<=0 视为"已过期",但允许 grace(基于 last_server_sync)
     if fresh_until <= 0:
-        # 旧 v0.3.0 token,没有 fresh_until → 默认给 7 天 grace
+        # 旧 v0.3.0 token(last_server_sync=0) → 给 7 天 grace
+        # 新 v0.3.1 但 fresh_until=0 → 同样给 grace,但基于 last_server_sync
+        if last_server_sync > 0 and now > last_server_sync + _GRACE_DAYS * 86400:
+            # grace 用完
+            return {
+                "status": "expired",
+                "fingerprint_hex": payload.get("fingerprint_hex", ""),
+                "customer": payload.get("customer", ""),
+                "issued_at": int(payload.get("issued_at", 0)),
+                "expires_at": int(payload.get("expires_at", 0)),
+                "fresh_until": fresh_until,
+                "last_server_sync": last_server_sync,
+                "needs_heartbeat": True,
+                "grace": False,
+            }
+        # 仍在 grace 期内 → 标记 needs_heartbeat
         needs_heartbeat = True
         grace = True
     elif now > fresh_until + _GRACE_DAYS * 86400:

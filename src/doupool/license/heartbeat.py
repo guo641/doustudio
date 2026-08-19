@@ -182,11 +182,24 @@ def _verify_server_response(
 ) -> Tuple[bool, str]:
     """验 server 响应:server_sig + clock skew + nonce 一次性。
 
+    P1-C: 显式校验响应里的 client_pubkey 回显是否匹配请求。
+
     Returns:
         (ok, error_code)
     """
     server_sig_hex = response.get("server_sig", "")
     server_timestamp = int(response.get("server_timestamp", 0))
+
+    # P1-C: 响应 client_pubkey 回显显式校验
+    # 防止攻击者返回不同的 pubkey 混淆客户端状态
+    response_client_pubkey = response.get("client_pubkey", "")
+    if response_client_pubkey != expected_client_pubkey_hex:
+        logger.error(
+            "响应 client_pubkey 不匹配: expected=%s, got=%s",
+            expected_client_pubkey_hex[:16] + "...",
+            response_client_pubkey[:16] + "..." if response_client_pubkey else "(empty)",
+        )
+        return False, ErrCode.BAD_RESPONSE
 
     # clock skew 校验
     if abs(client_local_time - server_timestamp) > CLOCK_SKEW_TOLERANCE_SEC:

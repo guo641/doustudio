@@ -55,11 +55,12 @@ def test_embed_server_pubkey_script_accepts_direct_hex(tmp_path):
     assert decoded == bytes.fromhex(SERVER_PUBKEY_HEX)
 
 
-def _response_for_nonce(nonce: bytes) -> dict:
+def _response_for_nonce(nonce: bytes, client_pubkey_hex: str = "11" * 32) -> dict:
     return {
         "server_timestamp": int(time.time()),
         "nonce": nonce.hex(),
         "server_sig": "00" * 64,
+        "client_pubkey": client_pubkey_hex,
     }
 
 
