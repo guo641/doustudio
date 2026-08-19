@@ -293,6 +293,7 @@ def test_handshake_happy_path(isolated_license_dir, generated_license_token, emb
             "server_timestamp": signed_dict["server_timestamp"],
             "revoked_prefixes": signed_dict["revoked_prefixes"],
             "nonce": req["nonce"],
+            "client_pubkey": signed_dict["client_pubkey"],
             "server_sig": sig.hex(),
         }
 
@@ -340,6 +341,7 @@ def test_handshake_rejects_fake_server_sig(isolated_license_dir, generated_licen
             "server_timestamp": signed_dict["server_timestamp"],
             "revoked_prefixes": [],
             "nonce": req["nonce"],
+            "client_pubkey": signed_dict["client_pubkey"],
             "server_sig": sig.hex(),
         }
 
@@ -381,6 +383,7 @@ def test_handshake_rejects_clock_skew(isolated_license_dir, generated_license_to
             "server_timestamp": signed_dict["server_timestamp"],
             "revoked_prefixes": [],
             "nonce": req["nonce"],
+            "client_pubkey": signed_dict["client_pubkey"],
             "server_sig": sig.hex(),
         }
 

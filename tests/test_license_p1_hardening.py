@@ -101,6 +101,58 @@ def test_fresh_until_zero_within_grace_period_allows_temporary_use(monkeypatch):
     assert result["grace"] is True
 
 
+def test_fresh_until_zero_without_sync_uses_issued_at_anchor(monkeypatch):
+    """P1-B: 首次心跳前 last_server_sync=0 也必须按 issued_at 结束 grace。"""
+    pytest.importorskip("doupool.license._license_verify", reason="需要编译的 .pyd")
+    from doupool.license import _license_verify as verifier
+
+    issued_at = 1000000000
+    payload = {
+        "fingerprint_hex": "dd" * 32,
+        "customer": "test-customer",
+        "issued_at": issued_at,
+        "expires_at": 2000000000,
+    }
+
+    monkeypatch.setattr(time, "time", lambda: issued_at + 8 * 86400)
+
+    result = verifier._evaluate_status_with_fresh(
+        payload,
+        fresh_until=0,
+        last_server_sync=0,
+    )
+
+    assert result["status"] == "expired"
+    assert result["needs_heartbeat"] is True
+    assert result["grace"] is False
+
+
+def test_fresh_until_zero_without_sync_allows_issued_at_grace(monkeypatch):
+    """P1-B: 首次心跳前仍保留 issued_at 后 7 天内的离线 grace。"""
+    pytest.importorskip("doupool.license._license_verify", reason="需要编译的 .pyd")
+    from doupool.license import _license_verify as verifier
+
+    issued_at = 1000000000
+    payload = {
+        "fingerprint_hex": "ee" * 32,
+        "customer": "test-customer",
+        "issued_at": issued_at,
+        "expires_at": 2000000000,
+    }
+
+    monkeypatch.setattr(time, "time", lambda: issued_at + 3 * 86400)
+
+    result = verifier._evaluate_status_with_fresh(
+        payload,
+        fresh_until=0,
+        last_server_sync=0,
+    )
+
+    assert result["status"] == "valid"
+    assert result["needs_heartbeat"] is True
+    assert result["grace"] is True
+
+
 def test_response_client_pubkey_mismatch_is_rejected():
     """P1-C: 响应里的 client_pubkey 与请求不匹配 → bad_response。"""
     from doupool.license import heartbeat

@@ -240,13 +240,12 @@ def _evaluate_status_with_fresh(payload, *, fresh_until: int, last_server_sync: 
         }
 
     # P1-B: 修复 fresh_until<=0 永不过期洞
-    # 恶意 server 可能返回 fresh_until=0 让客户端永久有效
-    # 旧逻辑: if fresh_until <= 0 → 给 7 天 grace,但不会走到过期分支
-    # 新逻辑: fresh_until<=0 视为"已过期",但允许 grace(基于 last_server_sync)
+    # 恶意 server 可能返回 fresh_until=0 让客户端永久有效。
+    # 首次成功心跳前 last_server_sync=0,此时必须用签名 payload 的
+    # issued_at 作为 grace 起点;否则永远没有可比较的时间锚点。
     if fresh_until <= 0:
-        # 旧 v0.3.0 token(last_server_sync=0) → 给 7 天 grace
-        # 新 v0.3.1 但 fresh_until=0 → 同样给 grace,但基于 last_server_sync
-        if last_server_sync > 0 and now > last_server_sync + _GRACE_DAYS * 86400:
+        grace_anchor = last_server_sync or int(payload.get("issued_at", 0))
+        if grace_anchor <= 0 or now > grace_anchor + _GRACE_DAYS * 86400:
             # grace 用完
             return {
                 "status": "expired",
