@@ -36,8 +36,10 @@ _HMAC_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
 def timestamp_to_datetime(value: int | None) -> str:
     if value is None:
         return "-"
-    return dt.datetime.fromtimestamp(value, tz=dt.timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
+    # 北京时间 UTC+8
+    beijing_tz = dt.timezone(dt.timedelta(hours=8))
+    return dt.datetime.fromtimestamp(value, tz=beijing_tz).strftime(
+        "%Y-%m-%d %H:%M:%S +08"
     )
 
 
