@@ -1,0 +1,39 @@
+{% extends "layout.html" %}
+{% block title %}Dashboard · DouStudio License{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>运行概览</h1><p class="subtle">激活与心跳状态，时间均按 UTC 统计。</p></div>
+  <a class="button" href="/admin/licenses">查看全部用户</a>
+</div>
+<section class="grid" aria-label="License 统计">
+  <div class="metric"><div class="metric-label">历史激活总数</div><div class="metric-value">{{ stats.total }}</div></div>
+  <div class="metric"><div class="metric-label">24 小时活跃</div><div class="metric-value">{{ stats.active_24h }}</div></div>
+  <div class="metric"><div class="metric-label">7 天活跃</div><div class="metric-value">{{ stats.active_7d }}</div></div>
+  <div class="metric warning"><div class="metric-label">30 天内到期</div><div class="metric-value">{{ stats.expiring_30d }}</div></div>
+  <div class="metric danger"><div class="metric-label">已撤销</div><div class="metric-value">{{ stats.revoked }}</div></div>
+</section>
+<section class="panel">
+  <h2>最近心跳分布</h2>
+  <div class="bars">
+    {% for bucket in heartbeat_distribution %}
+    <div class="bar-row">
+      <span>{{ bucket.label }}</span>
+      <div class="bar-track" aria-label="{{ bucket.label }} {{ bucket.count }} 个">
+        <div class="bar-fill" style="width: {{ bucket.percent }}%"></div>
+      </div>
+      <strong>{{ bucket.count }}</strong>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+<section class="panel">
+  <h2>快速查看</h2>
+  <div class="toolbar">
+    <a class="button" href="/admin/licenses?filter=active_24h">24 小时活跃</a>
+    <a class="button" href="/admin/licenses?filter=active_7d">7 天活跃</a>
+    <a class="button" href="/admin/licenses?filter=expiring_30d">30 天内到期</a>
+    <a class="button" href="/admin/licenses?filter=expired">已过期</a>
+    <a class="button" href="/admin/revoked">撤销记录</a>
+  </div>
+</section>
+{% endblock %}

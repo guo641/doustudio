@@ -1,0 +1,20 @@
+{% extends "layout.html" %}
+{% block title %}已撤销 · DouStudio License{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>已撤销</h1><p class="subtle">共 {{ revoked|length }} 条撤销前缀；原因文本按原值转义显示。</p></div>
+  <a class="button" href="/admin/licenses">返回用户列表</a>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>HMAC 前缀</th><th>撤销时间</th><th>原因</th></tr></thead>
+    <tbody>
+      {% for item in revoked %}
+      <tr><td><code>{{ item.prefix }}</code></td><td>{{ item.revoked_at | timestamp_to_datetime }}</td><td>{{ item.reason or '-' }}</td></tr>
+      {% else %}
+      <tr><td class="empty" colspan="3">当前没有撤销记录</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

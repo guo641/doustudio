@@ -1,0 +1,207 @@
+{% extends "layout.html" %}
+{% block title %}用户列表 · DouStudio License{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>用户列表</h1><p class="subtle">{{ total }} 条未撤销记录；服务端到期覆盖为空时保持不变。</p></div>
+</div>
+<div id="message" class="message" role="status" aria-live="polite"></div>
+<section class="panel" style="margin-top:0">
+  <div class="toolbar">
+    <a class="button {% if not filter %}primary{% endif %}" href="/admin/licenses?sort={{ sort }}&order={{ order }}">全部</a>
+    <a class="button {% if filter == 'active_24h' %}primary{% endif %}" href="/admin/licenses?filter=active_24h&sort={{ sort }}&order={{ order }}">24h 活跃</a>
+    <a class="button {% if filter == 'active_7d' %}primary{% endif %}" href="/admin/licenses?filter=active_7d&sort={{ sort }}&order={{ order }}">7d 活跃</a>
+    <a class="button {% if filter == 'expiring_30d' %}primary{% endif %}" href="/admin/licenses?filter=expiring_30d&sort={{ sort }}&order={{ order }}">30 天内到期</a>
+    <a class="button {% if filter == 'expired' %}primary{% endif %}" href="/admin/licenses?filter=expired&sort={{ sort }}&order={{ order }}">已过期</a>
+    <span class="toolbar-spacer"></span>
+    <label for="sort-field">排序</label>
+    <select id="sort-field">
+      <option value="last_seen_at" {% if sort == 'last_seen_at' %}selected{% endif %}>最后心跳</option>
+      <option value="first_seen_at" {% if sort == 'first_seen_at' %}selected{% endif %}>首次激活</option>
+      <option value="expires_at" {% if sort == 'expires_at' %}selected{% endif %}>服务端到期</option>
+      <option value="heartbeat_count" {% if sort == 'heartbeat_count' %}selected{% endif %}>心跳次数</option>
+    </select>
+    <select id="sort-order" aria-label="排序方向">
+      <option value="desc" {% if order == 'desc' %}selected{% endif %}>降序</option>
+      <option value="asc" {% if order == 'asc' %}selected{% endif %}>升序</option>
+    </select>
+  </div>
+  <div class="toolbar">
+    <button id="batch-extend" disabled>批量延期</button>
+    <button id="batch-revoke" class="danger" disabled>批量撤销</button>
+    <span id="selection-count" class="subtle">未选择 License</span>
+  </div>
+</section>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th><input id="select-page" type="checkbox" aria-label="选择当前页"></th>
+        <th>HMAC 前缀</th><th>首次激活</th><th>最后心跳</th><th>服务端到期覆盖</th><th>剩余天数</th><th>心跳次数</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for lic in licenses %}
+      <tr>
+        <td><input class="row-select" type="checkbox" value="{{ lic.license_hmac }}" aria-label="选择 {{ lic.license_hmac[:16] }}"></td>
+        <td><code title="{{ lic.license_hmac }}">{{ lic.license_hmac[:16] }}…</code></td>
+        <td>{{ lic.first_seen_at | timestamp_to_datetime }}</td>
+        <td>{{ lic.last_seen_at | timestamp_to_datetime }}</td>
+        <td>
+          {% if lic.expires_at is none %}<span class="badge">未设置</span>
+          {% else %}{{ lic.expires_at | timestamp_to_datetime }}{% endif %}
+        </td>
+        <td>
+          {% if lic.expiry_state == 'unset' %}<span class="badge">{{ lic.days_label }}</span>
+          {% elif lic.expiry_state == 'expired' %}<span class="badge bad">已过期 {{ lic.days_label }}</span>
+          {% elif lic.expiry_state == 'expiring' %}<span class="badge warn">{{ lic.days_label }}</span>
+          {% else %}<span class="badge good">{{ lic.days_label }}</span>{% endif %}
+        </td>
+        <td>{{ lic.heartbeat_count }}</td>
+        <td style="white-space:nowrap">
+          <button class="row-extend" data-hmac="{{ lic.license_hmac }}" {% if lic.expires_at is none %}disabled title="未设置到期覆盖，保持不变"{% endif %}>延期</button>
+          <button class="row-revoke danger" data-hmac="{{ lic.license_hmac }}">撤销</button>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td class="empty" colspan="8">当前筛选下没有用户</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% if total_pages > 1 %}
+<nav class="pagination" aria-label="分页">
+  {% if page > 1 %}<a class="button" href="?page={{ page - 1 }}{% if filter %}&filter={{ filter }}{% endif %}&sort={{ sort }}&order={{ order }}" aria-label="上一页">‹</a>{% endif %}
+  {% for number in page_numbers %}<a class="button {% if number == page %}active{% endif %}" href="?page={{ number }}{% if filter %}&filter={{ filter }}{% endif %}&sort={{ sort }}&order={{ order }}">{{ number }}</a>{% endfor %}
+  {% if page < total_pages %}<a class="button" href="?page={{ page + 1 }}{% if filter %}&filter={{ filter }}{% endif %}&sort={{ sort }}&order={{ order }}" aria-label="下一页">›</a>{% endif %}
+</nav>
+{% endif %}
+
+<div id="action-dialog" class="dialog-backdrop" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+  <div class="dialog">
+    <h2 id="dialog-title">确认操作</h2>
+    <p id="dialog-summary"></p>
+    <div id="extend-fields">
+      <label for="extend-preset">延长时间</label>
+      <select id="extend-preset" style="width:100%">
+        <option value="30">30 天</option>
+        <option value="90">90 天</option>
+        <option value="365" selected>1 年</option>
+        <option value="custom">自定义</option>
+      </select>
+      <div id="custom-days-field" hidden>
+        <label for="extend-days">自定义天数</label>
+        <input id="extend-days" type="number" min="1" max="3650" value="365">
+      </div>
+    </div>
+    <div id="revoke-fields">
+      <label for="revoke-reason">撤销原因</label>
+      <input id="revoke-reason" type="text" maxlength="200" autocomplete="off">
+    </div>
+    <div class="dialog-actions">
+      <button id="dialog-cancel">取消</button>
+      <button id="dialog-confirm" class="primary">确认</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+(() => {
+  const csrf = document.querySelector('meta[name="doustudio-csrf"]').content;
+  const checks = [...document.querySelectorAll('.row-select')];
+  const selectPage = document.getElementById('select-page');
+  const batchExtend = document.getElementById('batch-extend');
+  const batchRevoke = document.getElementById('batch-revoke');
+  const selectionCount = document.getElementById('selection-count');
+  const dialog = document.getElementById('action-dialog');
+  const extendFields = document.getElementById('extend-fields');
+  const revokeFields = document.getElementById('revoke-fields');
+  let pending = null;
+
+  const selected = () => checks.filter(item => item.checked).map(item => item.value);
+  const updateSelection = () => {
+    const count = selected().length;
+    batchExtend.disabled = count === 0;
+    batchRevoke.disabled = count === 0;
+    selectionCount.textContent = count ? `已选择 ${count} 条` : '未选择 License';
+    if (selectPage) {
+      selectPage.checked = count > 0 && count === checks.length;
+      selectPage.indeterminate = count > 0 && count < checks.length;
+    }
+  };
+  checks.forEach(item => item.addEventListener('change', updateSelection));
+  if (selectPage) selectPage.addEventListener('change', () => {
+    checks.forEach(item => { item.checked = selectPage.checked; }); updateSelection();
+  });
+
+  const showMessage = (message, ok) => {
+    const element = document.getElementById('message');
+    element.textContent = message;
+    element.className = `message show ${ok ? 'ok' : 'error'}`;
+  };
+  const openDialog = (action, targets) => {
+    pending = {action, targets};
+    const isExtend = action === 'extend';
+    document.getElementById('dialog-title').textContent = isExtend ? '延期确认' : '撤销确认';
+    document.getElementById('dialog-summary').textContent = `将操作 ${targets.length} 条 License。`;
+    extendFields.hidden = !isExtend;
+    revokeFields.hidden = isExtend;
+    document.getElementById('dialog-confirm').className = isExtend ? 'primary' : 'danger';
+    dialog.classList.add('open');
+    (isExtend ? document.getElementById('extend-preset') : document.getElementById('revoke-reason')).focus();
+  };
+  const closeDialog = () => { pending = null; dialog.classList.remove('open'); };
+  document.getElementById('dialog-cancel').addEventListener('click', closeDialog);
+  dialog.addEventListener('click', event => { if (event.target === dialog) closeDialog(); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') closeDialog(); });
+  batchExtend.addEventListener('click', () => openDialog('extend', selected()));
+  batchRevoke.addEventListener('click', () => openDialog('revoke', selected()));
+  document.querySelectorAll('.row-extend').forEach(button => button.addEventListener('click', () => openDialog('extend', [button.dataset.hmac])));
+  document.querySelectorAll('.row-revoke').forEach(button => button.addEventListener('click', () => openDialog('revoke', [button.dataset.hmac])));
+  const extendPreset = document.getElementById('extend-preset');
+  const customDaysField = document.getElementById('custom-days-field');
+  extendPreset.addEventListener('change', () => {
+    customDaysField.hidden = extendPreset.value !== 'custom';
+    if (!customDaysField.hidden) document.getElementById('extend-days').focus();
+  });
+
+  document.getElementById('dialog-confirm').addEventListener('click', async () => {
+    if (!pending) return;
+    const isExtend = pending.action === 'extend';
+    const body = {license_hmacs: pending.targets};
+    if (isExtend) body.days = Number(extendPreset.value === 'custom' ? document.getElementById('extend-days').value : extendPreset.value);
+    else body.reason = document.getElementById('revoke-reason').value.trim();
+    if ((!isExtend && !body.reason) || (isExtend && (!Number.isInteger(body.days) || body.days < 1 || body.days > 3650))) {
+      showMessage(isExtend ? '延期天数必须在 1 到 3650 之间。' : '请填写撤销原因。', false); return;
+    }
+    const confirmButton = document.getElementById('dialog-confirm');
+    confirmButton.disabled = true;
+    try {
+      const response = await fetch(`/admin/licenses/${pending.action}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json', 'X-DouStudio-CSRF': csrf}, body: JSON.stringify(body)
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      closeDialog();
+      showMessage(isExtend
+        ? `延期完成：更新 ${result.updated} 条，未设置到期覆盖而保持不变 ${result.skipped_unbounded} 条。`
+        : `撤销完成：新增 ${result.revoked} 条，已撤销 ${result.already_revoked} 条。`, true);
+      window.setTimeout(() => window.location.reload(), 700);
+    } catch (error) {
+      showMessage(`操作失败：${error.message}`, false);
+    } finally { confirmButton.disabled = false; }
+  });
+
+  const applySort = () => {
+    const params = new URLSearchParams(window.location.search);
+    params.set('sort', document.getElementById('sort-field').value);
+    params.set('order', document.getElementById('sort-order').value);
+    params.delete('page');
+    window.location.search = params.toString();
+  };
+  document.getElementById('sort-field').addEventListener('change', applySort);
+  document.getElementById('sort-order').addEventListener('change', applySort);
+  updateSelection();
+})();
+</script>
+{% endblock %}

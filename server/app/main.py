@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from .api import heartbeat as heartbeat_api
 from .crypto.kms_adapter import KmsAdapter
 from .storage.db import init_db
+from .web import routes as web_routes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +44,7 @@ app = FastAPI(
 )
 
 app.include_router(heartbeat_api.router)
+app.include_router(web_routes.router)
 
 
 @app.get("/healthz")

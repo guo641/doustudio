@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="doustudio-csrf" content="{{ csrf_token }}">
+  <title>{% block title %}DouStudio License 管理{% endblock %}</title>
+  <style>
+    :root {
+      --ink: #182028; --muted: #66717d; --line: #d9dee3; --surface: #fff;
+      --canvas: #f4f6f7; --nav: #20262d; --nav-muted: #b8c1ca; --accent: #146c5a;
+      --danger: #b42318; --warning: #9a6700; --success: #147d64; --radius: 6px;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--canvas); color: var(--ink); font: 14px/1.5 system-ui, sans-serif; letter-spacing: 0; }
+    a { color: inherit; }
+    .topbar { min-height: 54px; background: var(--nav); color: white; display: flex; align-items: center; padding: 0 24px; gap: 28px; }
+    .brand { font-size: 16px; font-weight: 700; text-decoration: none; white-space: nowrap; }
+    .nav { display: flex; align-items: stretch; gap: 2px; flex: 1; }
+    .nav a { color: var(--nav-muted); text-decoration: none; padding: 17px 14px 15px; border-bottom: 2px solid transparent; }
+    .nav a:hover, .nav a.active { color: #fff; border-bottom-color: #4fc3a5; }
+    .operator { color: var(--nav-muted); font-size: 13px; white-space: nowrap; }
+    main { width: min(1440px, 100%); margin: 0 auto; padding: 24px; }
+    .page-head { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: 24px; font-weight: 700; }
+    h2 { margin: 0 0 14px; font-size: 16px; }
+    .subtle { color: var(--muted); margin: 4px 0 0; }
+    .grid { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 12px; }
+    .metric, .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+    .metric { padding: 16px; min-height: 108px; }
+    .metric-label { color: var(--muted); font-size: 13px; }
+    .metric-value { font-size: 30px; font-weight: 750; margin-top: 10px; }
+    .metric.warning .metric-value { color: var(--warning); }
+    .metric.danger .metric-value { color: var(--danger); }
+    .panel { margin-top: 16px; padding: 18px; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+    .toolbar-spacer { flex: 1; }
+    button, .button, select, input { font: inherit; letter-spacing: 0; }
+    button, .button { min-height: 34px; border: 1px solid #b7c0c8; border-radius: 5px; background: #fff; padding: 6px 11px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; gap: 6px; color: var(--ink); }
+    button:hover, .button:hover { border-color: #77838f; background: #f8f9fa; }
+    button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    button.danger { background: #fff; color: var(--danger); border-color: #e0aaa5; }
+    button:disabled { opacity: .48; cursor: not-allowed; }
+    select, input[type="number"], input[type="text"] { height: 34px; border: 1px solid #b7c0c8; border-radius: 5px; background: #fff; padding: 5px 9px; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: #fff; }
+    table { border-collapse: collapse; width: 100%; min-width: 920px; }
+    th, td { border-bottom: 1px solid #e6eaed; text-align: left; padding: 10px 12px; vertical-align: middle; }
+    th { background: #f7f8f9; color: #3c4650; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    tbody tr:hover { background: #fafcfc; }
+    tbody tr:last-child td { border-bottom: 0; }
+    code { font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; background: #f1f3f4; border-radius: 4px; padding: 2px 5px; }
+    .badge { display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #edf0f2; color: #44505b; white-space: nowrap; }
+    .badge.good { background: #e4f4ee; color: var(--success); }
+    .badge.warn { background: #fff3cd; color: var(--warning); }
+    .badge.bad { background: #fde8e7; color: var(--danger); }
+    .empty { padding: 38px; text-align: center; color: var(--muted); }
+    .pagination { display: flex; align-items: center; justify-content: flex-end; gap: 5px; margin-top: 14px; }
+    .pagination .button { min-width: 34px; }
+    .pagination .active { background: var(--nav); color: #fff; border-color: var(--nav); }
+    .bars { display: grid; gap: 12px; }
+    .bar-row { display: grid; grid-template-columns: 90px 1fr 54px; align-items: center; gap: 12px; }
+    .bar-track { height: 12px; background: #edf0f2; border-radius: 3px; overflow: hidden; }
+    .bar-fill { height: 100%; min-width: 0; background: var(--accent); }
+    .message { display: none; padding: 10px 12px; margin: 0 0 12px; border-radius: 5px; border: 1px solid; }
+    .message.show { display: block; }
+    .message.ok { color: #116149; background: #e9f6f1; border-color: #a8d8c9; }
+    .message.error { color: #8a1c15; background: #fff0ef; border-color: #e8b1ad; }
+    .dialog-backdrop { position: fixed; inset: 0; background: rgba(15, 20, 25, .45); display: none; align-items: center; justify-content: center; padding: 20px; }
+    .dialog-backdrop.open { display: flex; }
+    .dialog { width: min(430px, 100%); background: #fff; border-radius: 7px; border: 1px solid #c8cfd5; padding: 20px; box-shadow: 0 18px 55px rgba(0,0,0,.24); }
+    .dialog p { color: var(--muted); }
+    .dialog label { display: block; font-weight: 650; margin: 13px 0 6px; }
+    .dialog input { width: 100%; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } .operator { display: none; } }
+    @media (max-width: 620px) { .topbar { padding: 0 8px; gap: 0; overflow-x: auto; } .brand { display: none; } .nav { min-width: max-content; } .nav a { padding-inline: 10px; } main { padding: 16px 12px; } .grid { grid-template-columns: 1fr; } .page-head { align-items: start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/admin/">DouStudio License</a>
+    <nav class="nav" aria-label="管理导航">
+      <a href="/admin/" class="{% if current_path == '/admin/' %}active{% endif %}">Dashboard</a>
+      <a href="/admin/licenses" class="{% if current_path == '/admin/licenses' %}active{% endif %}">用户列表</a>
+      <a href="/admin/revoked" class="{% if current_path == '/admin/revoked' %}active{% endif %}">已撤销</a>
+    </nav>
+    <span class="operator">操作员 {{ username }}</span>
+  </header>
+  <main>{% block content %}{% endblock %}</main>
+  {% block scripts %}{% endblock %}
+</body>
+</html>
