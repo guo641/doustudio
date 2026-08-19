@@ -27,18 +27,27 @@ v0.3.1:半在线心跳 — 客户端启动同步握手 + 后台 daemon 续期。
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
+import http.client
 import json
 import logging
 import os
 import secrets
+import ssl
 import time
+import urllib.request
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from . import _embedded_server_pubkey as _server_pk_module
 
@@ -48,8 +57,9 @@ logger = logging.getLogger(__name__)
 # 常量(跟 server/app/config.py 对齐,集中维护)
 DEFAULT_SERVER_URL: str = os.environ.get(
     "DOUSTUDIO_LICENSE_SERVER_URL",
-    "https://license.example.com",  # 占位,生产部署时改成真域名
+    "https://124.221.210.12:8443",
 )
+SERVER_SPKI_PIN = "sha256/HnTrss/ACEvZ47WvSMdfdIvdhkwlwC2BUuw9m3LJ+4w="
 HANDSHAKE_TIMEOUT_SEC: int = 5  # 启动握手不能拖过 5s
 NONCE_LEN: int = 16
 CLOCK_SKEW_TOLERANCE_SEC: int = 300  # ±5 分钟
@@ -80,8 +90,50 @@ class HeartbeatResult:
     revoked_prefixes: tuple = ()  # 元组而非 list,方便 immutable 缓存
 
 
+def _stored_token_hex_to_wire_hex(token_hex: str) -> str:
+    """Normalize the persisted token representation to protocol wire hex.
+
+    v0.3.1 activation files created by the Cython verifier retain the
+    user-facing Base32 text as bytes, while test/new callers may already pass
+    the raw wire blob encoded as hex.  The heartbeat protocol always sends the
+    raw wire blob as hex; this compatibility step changes no field or schema.
+    """
+    try:
+        stored = bytes.fromhex(token_hex)
+    except (TypeError, ValueError):
+        return token_hex
+
+    # Base32 text is ASCII and contains only RFC 4648 alphabet characters.
+    # Decode only when the whole stored value has that shape; arbitrary raw
+    # wire bytes remain untouched.
+    try:
+        text = stored.decode("ascii").strip().replace("=", "")
+    except UnicodeDecodeError:
+        return stored.hex()
+    if not text or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567" for char in text.upper()):
+        return stored.hex()
+    try:
+        padding = "=" * ((8 - len(text) % 8) % 8)
+        wire = base64.b32decode(text.upper() + padding, casefold=True)
+    except (ValueError, binascii.Error):
+        return stored.hex()
+    if len(wire) < 129:
+        return stored.hex()
+    return wire.hex()
+
+
+def _spki_pin_from_certificate_der(certificate_der: bytes) -> str:
+    """Return the Chrome-style ``sha256/<base64>`` pin for a leaf cert."""
+    certificate = x509.load_der_x509_certificate(certificate_der)
+    spki = certificate.public_key().public_bytes(
+        Encoding.DER,
+        PublicFormat.SubjectPublicKeyInfo,
+    )
+    return "sha256/" + base64.b64encode(hashlib.sha256(spki).digest()).decode("ascii")
+
+
 def _decode_server_pubkey() -> bytes:
-    """XOR 解码 server 公钥(没配 → b"" → 跳过验签)。"""
+    """XOR 解码 server 公钥;缺失或全零占位时返回空字节。"""
     enc = _server_pk_module.ENCRYPTED_SERVER_PUBKEY
     mask = _server_pk_module.XOR_SERVER_MASK
     if len(enc) != 32 or len(mask) != 32:
@@ -96,7 +148,7 @@ _SERVER_PUBKEY: bytes = _decode_server_pubkey()
 
 
 def server_pubkey_configured() -> bool:
-    """是否嵌入了 server 公钥(没配 → 跳过 server_sig 校验,仅开发用)。"""
+    """是否已解码出 server 公钥。"""
     return bool(_SERVER_PUBKEY)
 
 
@@ -149,10 +201,17 @@ def _verify_server_response(
     if resp_nonce != expected_nonce:
         return False, ErrCode.BAD_RESPONSE
 
-    # 验签(如果 server pubkey 没嵌 → 跳过,仅 dev)
+    # 生产环境公钥缺失必须拒绝。只有显式的独立开发开关允许跳过，
+    # 不能再把“空公钥”本身当成放行条件。
     if not _SERVER_PUBKEY:
-        logger.debug("server pubkey 未嵌入,跳过 server_sig 验签(仅开发用)")
-        return True, ""
+        if os.environ.get("DOUSTUDIO_DEV_SKIP_SIG") == "1":
+            logger.warning(
+                "SECURITY WARNING: DOUSTUDIO_DEV_SKIP_SIG=1,跳过 server_sig 验签;"
+                "该模式仅允许本地开发使用"
+            )
+            return True, ""
+        logger.error("server 公钥未嵌入或解码失败,拒绝心跳响应")
+        return False, ErrCode.BAD_SIGNATURE
 
     if not server_sig_hex or len(server_sig_hex) != 128:
         return False, ErrCode.BAD_SIGNATURE
@@ -177,12 +236,46 @@ def _verify_server_response(
     return True, ""
 
 
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that accepts the self-signed cert only by SPKI pin."""
+
+    def connect(self) -> None:
+        super().connect()
+        if self.sock is None:
+            raise OSError("TLS socket 未建立")
+        try:
+            certificate_der = self.sock.getpeercert(binary_form=True)
+            actual_pin = _spki_pin_from_certificate_der(certificate_der)
+            if not hmac.compare_digest(actual_pin, SERVER_SPKI_PIN):
+                raise ssl.SSLError("server certificate SPKI pin 不匹配")
+        except Exception as exc:
+            self.close()
+            raise OSError("server certificate SPKI pin 校验失败") from exc
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    """urllib handler using an unverified TLS context plus mandatory SPKI pin."""
+
+    def __init__(self) -> None:
+        # The certificate is intentionally self-signed. Identity is established
+        # exclusively by _PinnedHTTPSConnection's SPKI pin check above.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        super().__init__(context=context, check_hostname=False)
+
+    def https_open(self, req):
+        return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
+
+
 def _do_http_post(url: str, payload: dict, timeout_sec: int) -> Tuple[Optional[dict], str]:
     """POST payload 到 url,返 (response_dict, error_code)。
 
     不引入额外 HTTP 依赖(用 stdlib urllib),避免 license 子包依赖膨胀。
     """
     import urllib.error
+    import urllib.parse
     import urllib.request
 
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -196,7 +289,20 @@ def _do_http_post(url: str, payload: dict, timeout_sec: int) -> Tuple[Optional[d
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        if scheme == "https":
+            opener = urllib.request.build_opener(_PinnedHTTPSHandler())
+            response_context = opener.open(req, timeout=timeout_sec)
+        elif scheme == "http" and os.environ.get("DOUSTUDIO_DEV_ALLOW_HTTP") == "1":
+            logger.warning(
+                "SECURITY WARNING: DOUSTUDIO_DEV_ALLOW_HTTP=1,使用未加密 HTTP 心跳;"
+                "该模式仅允许本地开发测试"
+            )
+            response_context = urllib.request.urlopen(req, timeout=timeout_sec)
+        else:
+            logger.error("拒绝非 HTTPS license server URL: %s", url)
+            return None, ErrCode.NETWORK
+        with response_context as resp:
             raw = resp.read()
             try:
                 return json.loads(raw.decode("utf-8")), ""
@@ -267,7 +373,7 @@ def perform_handshake(
         return HeartbeatResult(ok=False, error_code=ErrCode.BAD_RESPONSE)
 
     payload = {
-        "license_token": license_token_hex,
+        "license_token": _stored_token_hex_to_wire_hex(license_token_hex),
         "fingerprint": fingerprint_hex,
         "client_pubkey": client_pubkey_hex,
         "timestamp": local_ts,

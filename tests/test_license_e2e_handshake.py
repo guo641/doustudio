@@ -51,6 +51,9 @@ def server_test_client():
 @pytest.fixture
 def isolated_license_dir(monkeypatch, tmp_path):
     """activated.bin 落到 tmp_path,跟真实数据隔离。"""
+    # Legacy in-process/localhost heartbeat fixtures intentionally use HTTP;
+    # production transport rejects it unless this explicit test switch exists.
+    monkeypatch.setenv("DOUSTUDIO_DEV_ALLOW_HTTP", "1")
     new_data = tmp_path / "data"
     new_log = tmp_path / "log"
     new_data.mkdir(parents=True)

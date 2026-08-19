@@ -34,6 +34,9 @@ import pytest
 @pytest.fixture
 def isolated_license_dir(monkeypatch, tmp_path):
     """指 activated.bin 到 tmp_path,避免污染真实数据。"""
+    # Legacy unit fixtures use a plain localhost mock; production rejects HTTP
+    # URLs unless this explicit test-only development switch is set.
+    monkeypatch.setenv("DOUSTUDIO_DEV_ALLOW_HTTP", "1")
     new_data = tmp_path / "data"
     new_log = tmp_path / "log"
     new_data.mkdir(parents=True)
