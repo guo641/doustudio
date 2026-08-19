@@ -377,7 +377,7 @@ export function fileToBase64(file: File): Promise<string> {
 // /api/license/quit 后端走 os._exit(0) 强杀进程 —— webview 随之关。
 // 前端 fire-and-forget:fetch 不一定能拿到响应。
 export type LicenseStatus = {
-  status: 'valid' | 'expired' | 'missing' | 'uncompiled';
+  status: 'valid' | 'expired' | 'missing' | 'revoked' | 'uncompiled';
   fingerprint: string;
   customer: string;
   expires_at: number | null;
@@ -388,7 +388,8 @@ export type LicenseStatus = {
 // 'valid':已激活,渲染主 UI
 // 'needs-activation':未激活,渲染激活窗 (state=needs-activation 输入框可用)
 // 'expired':已过期,渲染激活窗 (state=expired 输入框禁用)
-export type LicenseState = 'loading' | 'valid' | 'needs-activation' | 'expired';
+// 'revoked':已撤销,渲染激活窗并允许输入管理员签发的新激活码
+export type LicenseState = 'loading' | 'valid' | 'needs-activation' | 'expired' | 'revoked';
 
 const licenseHeaders = { 'Content-Type': 'application/json' };
 

@@ -95,7 +95,7 @@ const model = ref('seedance_v2.0_mini');
 const FIXED_VIDEO_DURATION_SECONDS = 10;
 
 // v0.3.0:激活闸门 —— 'loading' 是首屏瞬间;'valid' 渲染主 UI;
-// 'needs-activation' / 'expired' 渲染 ActivationDialog。
+// 'needs-activation' / 'expired' / 'revoked' 渲染 ActivationDialog。
 // licenseInfo 缓存 fingerprint + expires_at 给 dialog 显示。
 const licenseState = ref<LicenseState>('loading');
 const licenseInfo = ref<{ fingerprint: string; expires_at: number | null }>({
@@ -115,6 +115,10 @@ let taskTimer: ReturnType<typeof setInterval> | undefined;
  * 写回 tasks,stale 响应直接丢弃。
  */
 let tasksFetchSeq = 0;
+
+// 首次启动和重新激活共用完整初始化。序号避免较早的一轮异步设置响应
+// 覆盖较新授权状态；任务列表自身仍由 tasksFetchSeq 防止乱序覆盖。
+let licensedWorkspaceInitSeq = 0;
 
 /**
  * 当前激活的登录 EventSource。
@@ -486,6 +490,8 @@ async function refreshLicense() {
       licenseState.value = 'valid';
     } else if (status.status === 'expired') {
       licenseState.value = 'expired';
+    } else if (status.status === 'revoked') {
+      licenseState.value = 'revoked';
     } else {
       // 'missing' / 'uncompiled'(开发态) → 都要求激活
       licenseState.value = 'needs-activation';
@@ -496,9 +502,26 @@ async function refreshLicense() {
   }
 }
 
+async function initializeLicensedWorkspace() {
+  const initSeq = ++licensedWorkspaceInitSeq;
+  await refreshLicense();
+  if (initSeq !== licensedWorkspaceInitSeq || licenseState.value !== 'valid') return;
+
+  const settingsPromise = getSettings().catch(() => null);
+  await Promise.all([refreshAccounts(), refreshTasks()]);
+  const settings = await settingsPromise;
+  if (
+    settings &&
+    initSeq === licensedWorkspaceInitSeq &&
+    licenseState.value === 'valid'
+  ) {
+    applyDefaults(settings);
+  }
+}
+
 function onLicenseActivated() {
-  // 重新查一次 → 200 + status=valid → 切到主 UI
-  void refreshLicense();
+  // 激活成功后必须完整加载账号、任务和设置，不能只切换 UI 状态。
+  void initializeLicensedWorkspace();
 }
 
 async function onLicenseQuit() {
@@ -507,14 +530,7 @@ async function onLicenseQuit() {
 
 onMounted(async () => {
   // 闸门最优先 —— 未激活就不去拉账号/任务,减少无意义请求 + 防止 race
-  await refreshLicense();
-  if (licenseState.value !== 'valid') return;
-  await refreshAccounts();
-  try {
-    applyDefaults(await getSettings());
-  } catch {
-    /* defaults stay as-is */
-  }
+  await initializeLicensedWorkspace();
 });
 
 onBeforeUnmount(() => {

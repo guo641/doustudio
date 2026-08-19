@@ -19,32 +19,19 @@ if sys.stderr is None:
 # 之后、其余模块 import 之前**,这样闸门才能在 Playwright / FastAPI / 数据库
 # 任何重活之前拒收未授权进程。哪怕用户 monkey-patch 掉 main() 函数体,这行
 # import 仍会按设计触发 sys.exit(7) / 静默退出(expired)。
-import doupool.license.verify_at_import  # noqa: F401, E402  # v0.3.0 激活闸门
+try:
+    import doupool.license.verify_at_import  # noqa: F401, E402  # v0.3.0 激活闸门
+except SystemExit as _license_exit:
+    # v0.3.12: revoked uses a distinct code so the desktop can render the
+    # restricted ActivationDialog and let the operator enter a replacement
+    # token. Expired/grace exhaustion still exits immediately.
+    if _license_exit.code != 73:
+        raise
 
 from doupool.paths import configure_runtime_environment
 
 # Must run before any Playwright import.
 configure_runtime_environment()
-
-# v0.3.1:半在线心跳 — 启动握手 + 后台 daemon。
-#
-# 设计:
-#   - 启动握手是同步的(主 UI 渲染前),网络抽风 / 撤销命令也只 log,
-#     绝不阻塞 UI —— grace 7d 兜底。
-#   - daemon.start() 是非阻塞的:内部启守护线程,默认 24h 一次。
-#   - 必须先 import verify_at_import(闸门已经先 import 了 .pyd),
-#     否则 heartbeat / bootstrap 调 current_fingerprint() 拿到 'uncompiled'。
-#
-# --print-fingerprint 旁路:开发者子命令不应该 daemon 长跑 / 触发网络。
-# 把握手 + daemon 放到 if 块外,但加 sys.argv 排除。
-_IS_FINGERPRINT_CMD = "--print-fingerprint" in sys.argv
-
-if not _IS_FINGERPRINT_CMD:
-    from doupool.license import bootstrap as _license_bootstrap
-    from doupool.license import heartbeat_daemon as _heartbeat_daemon
-
-    _license_bootstrap.run_startup_handshake()
-    _heartbeat_daemon.start()
 
 # v0.3.0:开发者无 GUI 抓指纹用 --print-fingerprint 子命令。在做任何数据库 /
 # Playwright / 浏览器初始化之前就走,免得开发者重发一次码要等 GUI 起。
@@ -99,6 +86,15 @@ def _resolve_api_token() -> str:
 
 
 def main() -> None:
+    # Keep network and disk mutations out of module import. Test discovery and
+    # helper tools import constants from this module; only the real desktop
+    # entrypoint is allowed to run the startup handshake.
+    from doupool.license import bootstrap as _license_bootstrap
+    from doupool.license import heartbeat_daemon as _heartbeat_daemon
+
+    _license_bootstrap.run_startup_handshake()
+    _heartbeat_daemon.start()
+
     settings = Settings.from_environment()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     manager = DatabaseManager(settings.data_dir / "doupool.sqlite3")

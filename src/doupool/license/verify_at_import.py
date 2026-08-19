@@ -17,8 +17,13 @@ verifier.import-time side-effect。
 行为:
   - missing  → 直接通过(主 UI 渲染激活窗引导用户)
   - valid    → 通过
+  - revoked  → 直接通过到受限激活窗;业务 API 仍全部拒绝
   - expired  → sys.exit(0),无 UI,无 log,无声触发(见 plan §H.7)
   - uncompiled → 通过(开发机 / keygen 工具会命中此分支)
+
+底层 verifier.ensure_activated_or_exit() 对 revoked 仍会 sys.exit(73)。桌面入口在
+main.py 的最外层捕获这个专用退出码,继续启动受限激活 UI；其他显式导入闸门的入口
+仍得到 73。CLI --print-fingerprint 也会由 main.py 捕获后输出 status=revoked。
 """
 from __future__ import annotations
 

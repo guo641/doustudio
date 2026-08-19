@@ -280,7 +280,7 @@ def test_handshake_happy_path(isolated_license_dir, generated_license_token, emb
         signed_dict = {
             "fresh_until": int(time.time()) + 86400 * 30,
             "server_timestamp": int(time.time()),
-            "revoked_prefixes": ["deadbeef"],
+            "revoked_prefixes": ["deadbeefdeadbeef"],
             "client_pubkey": req["client_pubkey"],
             "nonce": req["nonce"],
         }
@@ -311,7 +311,7 @@ def test_handshake_happy_path(isolated_license_dir, generated_license_token, emb
 
     assert result.ok, f"握手失败: {result.error_code}"
     assert result.fresh_until > int(time.time())
-    assert result.revoked_prefixes == ("deadbeef",)
+    assert result.revoked_prefixes == ("deadbeefdeadbeef",)
     # 请求字段
     assert "client_sig" in captured["req"]
     assert len(captured["req"]["client_sig"]) == 128  # 64 bytes hex

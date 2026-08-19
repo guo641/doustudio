@@ -15,6 +15,7 @@ vi.mock('../api', () => ({
     customer: '测试',
     expires_at: Math.floor(Date.now() / 1000) + 86400,
   }),
+  getSettings: vi.fn().mockResolvedValue({}),
 }));
 
 import App from '../App.vue';

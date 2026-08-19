@@ -12,7 +12,7 @@
        只留「退出」+「复制机器码」两个出口。
 
   Props:
-    state: 'loading' | 'needs-activation' | 'expired'
+    state: 'loading' | 'needs-activation' | 'expired' | 'revoked'
     fingerprint: 64-hex HMAC,激活码生成时绑定的就是它
     expires_at: 仅 expired 状态有值(Unix 秒)
 
@@ -44,12 +44,16 @@ const submitting = ref(false);
 const error = ref('');
 
 const title = computed(() => {
+  if (props.state === 'revoked') return '授权已被撤销';
   if (props.state === 'expired') return '激活码已过期';
   if (props.state === 'loading') return '正在校验激活';
   return '请输入激活码';
 });
 
 const description = computed(() => {
+  if (props.state === 'revoked') {
+    return '当前授权已被管理员撤销，无法继续使用。请联系管理员获取新的激活码。';
+  }
   if (props.state === 'expired') {
     return '当前激活码已到期。请联系开发者续期,并将下方机器码一并发给开发者。';
   }
@@ -131,6 +135,14 @@ function onQuit() {
             <span>
               到期时间:{{ expires_at ? new Date(expires_at * 1000).toLocaleString('zh-CN') : '未知' }}
             </span>
+          </div>
+
+          <div v-if="state === 'revoked'" class="revoked-info" role="alert">
+            <ShieldAlert :size="16" :stroke-width="2" />
+            <div>
+              <strong>授权已被撤销</strong>
+              <p>请联系管理员获取新的激活码。</p>
+            </div>
           </div>
 
           <div class="code-field">
@@ -241,6 +253,26 @@ function onQuit() {
   border-radius: var(--r-md);
   background: var(--bg-soft);
   font-size: 12px;
+  color: var(--text-muted);
+}
+.revoked-info {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 11px 12px;
+  border: 1px solid color-mix(in srgb, var(--text-failed, #e85c3c) 35%, transparent);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--text-failed, #e85c3c) 8%, var(--bg-soft));
+  color: var(--text-failed, #e85c3c);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.revoked-info strong {
+  display: block;
+  margin-bottom: 2px;
+}
+.revoked-info p {
+  margin: 0;
   color: var(--text-muted);
 }
 .code-input {

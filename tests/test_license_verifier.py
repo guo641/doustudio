@@ -71,6 +71,16 @@ def fresh_license_dir(monkeypatch, tmp_path):
     import doupool.config as _config
 
     monkeypatch.setattr(_config, "_resolve_app_dirs", lambda: (new_data, new_log))
+    # verifier caches the disk result; clear it when this fixture switches the
+    # activated.bin root so tests cannot inherit a prior revoked/valid status.
+    if getattr(_v, "_cached_status", None) is not None:
+        original = dict(_v._cached_status)
+        _v._cached_status.clear()
+        _v._cached_status.update({"status": "missing", "loaded": False})
+        yield new_data / "license"
+        _v._cached_status.clear()
+        _v._cached_status.update(original)
+        return
     yield new_data / "license"
 
 

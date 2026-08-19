@@ -25,6 +25,8 @@ verifier 仍按设计校验签名 → 失败 sys.exit。
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import sys
@@ -50,6 +52,7 @@ _FRESH_DAYS: int = 30
 _GRACE_DAYS: int = 7
 # grace 用完时,verifier 行为: sys.exit(0) 静默退出(避免弹窗被逆向)
 _GRACE_EXIT_CODE: int = 0
+_REVOKED_EXIT_CODE: int = 73
 
 # v0.3.1 wire format 最小长度: 32B priv + 32B pub + 1B payload + 64B sig
 _MIN_TOKEN_LEN_V031: int = 129
@@ -137,30 +140,109 @@ def current_fingerprint() -> str:
     return _fingerprint.hmac_hex(pubkey_hex)
 
 
+def _license_hmac_prefix(bytes client_pubkey, str fingerprint_hex) -> str:
+    """与 server hmac_fingerprint_hex() 逐字节一致的 64-bit 前缀。"""
+    if len(client_pubkey) != 32:
+        raise ValueError("client_pubkey 必须 32 字节")
+    if len(fingerprint_hex) != 64:
+        raise ValueError("fingerprint 必须 64 字符 hex")
+    bytes.fromhex(fingerprint_hex)
+    return hmac.new(
+        client_pubkey,
+        fingerprint_hex.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:16]
+
+
+def _stored_status_error(str error, payload=None) -> dict:
+    """Return a fail-closed status for a structurally untrusted DSA record."""
+    payload = payload if isinstance(payload, dict) else {}
+    return {
+        "status": "expired",
+        "fingerprint_hex": payload.get("fingerprint_hex", ""),
+        "customer": payload.get("customer", ""),
+        "issued_at": int(payload.get("issued_at", 0)),
+        "expires_at": int(payload.get("expires_at", 0)),
+        "error": error,
+        "fresh_until": 0,
+        "last_server_sync": 0,
+        "needs_heartbeat": False,
+        "grace": False,
+    }
+
+
+def _verified_stored_keypair(stored, extra):
+    """Bind duplicate DSA header keys to the developer-verified token keys."""
+    if not isinstance(extra, dict) or int(extra.get("wire_version", 0)) != 2:
+        raise ValueError("signed token missing v0.3.1 keypair")
+    token_priv = extra.get("client_priv_seed")
+    token_pub = extra.get("client_pubkey")
+    if not isinstance(token_priv, bytes) or len(token_priv) != 32:
+        raise ValueError("signed token client_priv_seed invalid")
+    if not isinstance(token_pub, bytes) or len(token_pub) != 32:
+        raise ValueError("signed token client_pubkey invalid")
+    if not hmac.compare_digest(stored.client_priv_seed, token_priv):
+        raise ValueError("DSA header client_priv_seed mismatch")
+    if not hmac.compare_digest(stored.client_pubkey, token_pub):
+        raise ValueError("DSA header client_pubkey mismatch")
+    return token_priv, token_pub
+
+
 def _load_status_from_disk() -> dict:
     """读 activated.bin → 跑 verify_token → 缓存结果。无文件 → status='missing'。
 
     v0.3.1 新增:
       - detect v0.3.1 新格式(DSA1 头部) → 走 read_token_v031,加载 fresh_until
       - 旧格式 → 走 read_token_legacy,无 fresh_until 字段,标记 needs_heartbeat
+    v0.3.12 新增:
+      - 优先读 DSA2,校验服务器同步的撤销前缀
     """
-    # 先尝试 v0.3.1 格式
+    # v0.3.2:先验 token,再按服务端同源 HMAC 算法检查撤销前缀。
+    v032 = _storage.read_token_v032()
+    if v032 is not None:
+        success, payload, error, extra = verify_token(v032.license_token_blob)
+        if not success or not payload:
+            return _stored_status_error(error)
+        try:
+            _, token_pubkey = _verified_stored_keypair(v032, extra)
+        except Exception:
+            return _stored_status_error("storage_key_mismatch", payload)
+        status = _evaluate_status_with_fresh(
+            payload,
+            fresh_until=v032.fresh_until,
+            last_server_sync=v032.last_server_sync,
+        )
+        try:
+            own_prefix = _license_hmac_prefix(
+                token_pubkey,
+                current_fingerprint(),
+            )
+        except Exception:
+            # DSA2 已存在却无法完成撤销校验时必须 fail closed。
+            status["status"] = "expired"
+            status["error"] = "revocation_check_failed"
+            status["needs_heartbeat"] = True
+            status["grace"] = False
+            return status
+        for revoked_prefix in v032.revoked_prefixes:
+            if hmac.compare_digest(own_prefix, revoked_prefix):
+                status["status"] = "revoked"
+                status["error"] = "revoked"
+                status["needs_heartbeat"] = False
+                status["grace"] = False
+                return status
+        return status
+
+    # v0.3.1 向后兼容路径
     v031 = _storage.read_token_v031()
     if v031 is not None:
-        success, payload, error, _ = verify_token(v031.license_token_blob)
+        success, payload, error, extra = verify_token(v031.license_token_blob)
         if not success or not payload:
-            return {
-                "status": "expired",
-                "fingerprint_hex": "",
-                "customer": "",
-                "issued_at": 0,
-                "expires_at": 0,
-                "error": error,
-                "fresh_until": 0,
-                "last_server_sync": 0,
-                "needs_heartbeat": False,
-                "grace": False,
-            }
+            return _stored_status_error(error)
+        try:
+            _verified_stored_keypair(v031, extra)
+        except Exception:
+            return _stored_status_error("storage_key_mismatch", payload)
         return _evaluate_status_with_fresh(
             payload,
             fresh_until=v031.fresh_until,
@@ -297,7 +379,7 @@ def _evaluate_status_with_fresh(payload, *, fresh_until: int, last_server_sync: 
 
 
 def get_activation_status() -> str:
-    """返 'valid' | 'expired' | 'missing' | 'needs_heartbeat'。
+    """返 'valid' | 'expired' | 'missing' | 'revoked'。
 
     v0.3.1 加 'needs_heartbeat' 状态:license_token 本身有效(没过期),
     但 fresh_until 即将到期 / 已进入 grace,前端应该渲染红色 banner 提示
@@ -308,6 +390,27 @@ def get_activation_status() -> str:
         _cached_status = _load_status_from_disk()
         _cached_status["loaded"] = True
     return _cached_status.get("status", "missing")
+
+
+def reload_activation_status() -> str:
+    """丢弃进程缓存并从 activated.bin 重读;心跳写盘后调用。"""
+    global _cached_status
+    _cached_status = _load_status_from_disk()
+    _cached_status["loaded"] = True
+    return _cached_status.get("status", "missing")
+
+
+def mark_activation_revoked() -> str:
+    """Fail closed in-process before the trusted revoked result is persisted."""
+    global _cached_status
+    if not _cached_status.get("loaded"):
+        _cached_status = _load_status_from_disk()
+    _cached_status["status"] = "revoked"
+    _cached_status["error"] = "revoked"
+    _cached_status["needs_heartbeat"] = False
+    _cached_status["grace"] = False
+    _cached_status["loaded"] = True
+    return "revoked"
 
 
 def get_activation_detail() -> dict:
@@ -482,7 +585,7 @@ def _verify_token_v031(str text):
 
 
 def activate(str code):
-    """校验 code,通过 → write_token_v031(persist)。返 (success, error_message)。
+    """校验 code,通过 → write_token_v032(persist)。返 (success, error_message)。
 
     v0.3.1 升级:
       - 自动 detect v0.3.0 / v0.3.1 wire format
@@ -505,32 +608,55 @@ def activate(str code):
     if not success:
         return False, error or "激活码无效"
 
+    # Preserve the trusted DSA2 snapshot across replacement activation.  The
+    # same revoked client key must not be able to erase its own marker simply
+    # by pasting the original activation code again.
+    existing_v032 = _storage.read_token_v032()
+    existing_revoked = tuple(
+        existing_v032.revoked_prefixes if existing_v032 is not None else ()
+    )
+
     # 持久化路径选择
     wire_version = extra.get("wire_version", 0)
+    if existing_v032 is not None and wire_version != 2:
+        return False, "已有授权状态不能降级，请使用新版激活码"
     try:
         if wire_version == 2 and extra.get("client_priv_seed") and extra.get("client_pubkey"):
-            # v0.3.1 新格式 → 写带 DSA1 头部的 v0.3.1 格式
-            _storage.write_token_v031(
+            candidate_pubkey = extra["client_pubkey"]
+            try:
+                candidate_prefix = _license_hmac_prefix(
+                    candidate_pubkey,
+                    current_fingerprint(),
+                )
+            except Exception:
+                return False, "无法校验激活码撤销状态"
+            if any(
+                hmac.compare_digest(candidate_prefix, revoked_prefix)
+                for revoked_prefix in existing_revoked
+            ):
+                return False, "该激活码已被撤销，请使用新的激活码"
+            # v0.3.12 起新激活直接写 DSA2,避免等待首次心跳才迁移。
+            _storage.write_token_v032(
                 license_token_blob=blob,
                 client_priv_seed=extra["client_priv_seed"],
                 client_pubkey=extra["client_pubkey"],
                 fresh_until=0,  # 第一次激活 fresh_until=0 → 触发后台心跳
                 clock_offset_ms=0,
                 last_server_sync=0,
+                revoked_prefixes=existing_revoked,
             )
         else:
             # v0.3.0 旧格式 → legacy 写(用户后续会被引导重激活)
             _storage.write_token(blob)
     except OSError:
         return False, "无法写入激活信息,请检查目录权限"
-    # 失效缓存
+    # Re-evaluate the exact bytes that were persisted; do not manufacture a
+    # valid cache entry that bypasses DSA header/key or revocation checks.
     global _cached_status
-    _cached_status = _evaluate_status_with_fresh(
-        payload,
-        fresh_until=0,
-        last_server_sync=0,
-    )
+    _cached_status = _load_status_from_disk()
     _cached_status["loaded"] = True
+    if _cached_status.get("status") == "revoked":
+        return False, "该激活码已被撤销，请使用新的激活码"
     return True, ""
 
 
@@ -542,6 +668,7 @@ def ensure_activated_or_exit():
       - valid(grace=False)→ 通过,正常进入主 UI
       - valid(grace=True) → 通过(显示 banner 提示续期),**不**exit
       - expired(fresh_until + grace 用完) → sys.exit(0) 静默退出
+      - revoked           → sys.exit(73);桌面 import gate 会改走受限激活 UI
 
     设计选择:missing / grace 不 sys.exit,因为用户刚装软件没输入激活码
     / 断网期间 → 应该看到激活窗 / 主 UI 提示续期,而不是被踢。
@@ -552,6 +679,8 @@ def ensure_activated_or_exit():
         _cached_status = _load_status_from_disk()
         _cached_status["loaded"] = True
     status = _cached_status.get("status", "missing")
+    if status == "revoked":
+        sys.exit(_REVOKED_EXIT_CODE)
     if status == "expired":
         # grace 已用完 → 静默退出,避免弹窗被逆向
         sys.exit(_GRACE_EXIT_CODE)

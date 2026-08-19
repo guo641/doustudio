@@ -4,7 +4,7 @@
 // cleanup() 是关键:多个 render() 不清理 DOM 会让前一个 App 实例的 sidebar / workspace
 // 残留,导致后续测试 queryByRole('button', {name: '账号池'}) 命中前一个组件的节点。
 // @testing-library/vue v8 不再自动注入 cleanup —— 显式调。
-import { cleanup, render, screen, waitFor } from '@testing-library/vue';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/vue';
 import { afterEach, expect, it, vi } from 'vitest';
 import App from '../App.vue';
 
@@ -111,4 +111,82 @@ it('过期时输入框禁用 + 显退出按钮', async () => {
   });
 
   expect(screen.queryByRole('button', { name: '账号池' })).toBeNull();
+});
+
+it('撤销时隐藏主界面并显示撤销提示和重新激活入口', async () => {
+  vi.stubGlobal(
+    'fetch',
+    mockJsonFetch({
+      status: 'revoked',
+      fingerprint: 'abcd1234abcd1234abcd1234abcd1234',
+      customer: '测试用户',
+      expires_at: null,
+    }),
+  );
+
+  render(App);
+
+  await waitFor(() => {
+    expect(screen.getByRole('alert').textContent).toContain('授权已被撤销');
+  });
+
+  expect(screen.getByRole('button', { name: '激活' })).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '账号池' })).toBeNull();
+});
+
+it('重新激活后完整加载账号、任务和设置', async () => {
+  let licenseStatusCalls = 0;
+  const requested: string[] = [];
+  const response = (payload: unknown) =>
+    Promise.resolve({
+      ok: true,
+      status: 200,
+      url: '',
+      text: async () => JSON.stringify(payload),
+      json: async () => payload,
+    });
+  const fetchMock = vi.fn().mockImplementation((input: string) => {
+    const url = String(input);
+    requested.push(url);
+    if (url === '/api/license/status') {
+      licenseStatusCalls += 1;
+      return response(
+        licenseStatusCalls === 1
+          ? {
+              status: 'missing',
+              fingerprint: 'abcd1234abcd1234abcd1234abcd1234',
+              customer: '',
+              expires_at: null,
+            }
+          : {
+              status: 'valid',
+              fingerprint: 'abcd1234abcd1234abcd1234abcd1234',
+              customer: '新用户',
+              expires_at: Math.floor(Date.now() / 1000) + 86400,
+            },
+      );
+    }
+    if (url === '/api/license/activate') return response({ ok: true });
+    if (url === '/api/accounts') return response([]);
+    if (url === '/api/video-tasks') return response([]);
+    if (url === '/api/settings') {
+      return response({ default_model: 'seedance_v2.0_mini', default_ratio: '1:1' });
+    }
+    return response({});
+  });
+  vi.stubGlobal('fetch', fetchMock);
+
+  render(App);
+  await waitFor(() => expect(screen.getByRole('button', { name: '激活' })).toBeTruthy());
+
+  await fireEvent.update(screen.getByLabelText('激活码'), 'VALID-LICENSE-CODE');
+  await fireEvent.click(screen.getByRole('button', { name: '激活' }));
+
+  await waitFor(() => {
+    expect(screen.getByRole('button', { name: '账号池' })).toBeTruthy();
+    expect(requested).toContain('/api/accounts');
+    expect(requested).toContain('/api/video-tasks');
+    expect(requested).toContain('/api/settings');
+  });
+  expect(licenseStatusCalls).toBe(2);
 });

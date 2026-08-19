@@ -21,6 +21,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import sysconfig
 import urllib.parse
 import zipfile
 from pathlib import Path
@@ -105,55 +106,38 @@ def _run(cmd: list[str], cwd: Path, what: str) -> None:
 
 def compile_cython_extensions() -> None:
     """
-    v0.3.0:编译 verifier.pyx → _license_verify.cp312-win_amd64.pyd。
+    v0.3.0:编译 verifier.pyx → 当前 Python ABI 对应的 _license_verify*.pyd。
     必须在 PyInstaller 之前跑,因为 spec 依赖 _license_verify 存在(否则 hiddenimports 落空)。
-    - 如果 .pyd 已存在 + 比 .pyx 新,跳过(本地开发 iter 提速)
+    - 如果当前 ABI 的 .pyd 已存在且比 .pyx 新,跳过
     - 否则调 setup.py build_ext --inplace
-    - 编译失败(常见原因:MSVC 没装)→ 退到 _license_verify.py 纯 Python 兜底,
-      Python 模块查找顺序 (.pyd → .py) 保证优先用 .pyd;没 .pyd 就用 .py。
-      安全保证跟 .pyd 路径一致:签发仍需私钥 → 兜底只是「源可见 vs 二进制不可见」的差别。
+    - 编译失败或产物 ABI 不匹配时直接终止;发布包绝不降级到纯 Python verifier。
     """
     pyx = REPO_ROOT / "src" / "doupool" / "license" / "verifier.pyx"
     if not pyx.exists():
         raise RuntimeError(f"找不到 {pyx},请确认仓库结构")
-    # 找最新生成的 .pyd(支持 cp312 / cp311 等)
-    pyd_candidates = list((pyx.parent).glob("_license_verify.*.pyd"))
-    if pyd_candidates and all(p.stat().st_mtime > pyx.stat().st_mtime for p in pyd_candidates):
-        newest = max(pyd_candidates, key=lambda p: p.stat().st_mtime)
-        print(f"[cython] .pyd 已存在且比 .pyx 新,跳过编译 -> {newest.name}")
+    extension_suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    if not extension_suffix or not extension_suffix.endswith(".pyd"):
+        raise RuntimeError(
+            f"当前解释器没有 Windows .pyd 扩展后缀: {extension_suffix!r}"
+        )
+    expected_pyd = pyx.parent / f"_license_verify{extension_suffix}"
+    if expected_pyd.exists() and expected_pyd.stat().st_mtime > pyx.stat().st_mtime:
+        print(f"[cython] 当前 ABI 的 .pyd 已是最新,跳过编译 -> {expected_pyd.name}")
         return
     setup_py = REPO_ROOT / "setup.py"
     if not setup_py.exists():
         raise RuntimeError(f"找不到 {setup_py},请确认仓库根有 setup.py(Cython 编译入口)")
     print(f"[cython] 编译 {pyx.name} ...")
-    try:
-        _run(
-            [sys.executable, str(setup_py), "build_ext", "--inplace"],
-            cwd=REPO_ROOT,
-            what="Cython build_ext --inplace",
-        )
-    except RuntimeError as exc:
-        fallback_py = REPO_ROOT / "src" / "doupool" / "license" / "_license_verify.py"
-        if not fallback_py.exists():
-            raise RuntimeError(
-                f"Cython 编译失败,且 {fallback_py} 也不存在 —— 无 fallback 可用\n"
-                f"  原错误: {exc}"
-            ) from exc
-        print(
-            f"[cython] ⚠ Cython 编译失败(常见原因:MSVC Build Tools 未安装),"
-            f"退到纯 Python fallback: {fallback_py.name}\n"
-            f"  激活流程仍可用 —— Python 模块查找顺序(.pyd → .py)在 .pyd 缺失时"
-            f"会加载 _license_verify.py。\n"
-            f"  想拿到二进制加固版,装 MSVC Build Tools 后重跑 build_exe。"
-        )
-        return
-    pyd_after = list((pyx.parent).glob("_license_verify.*.pyd"))
-    if not pyd_after:
+    _run(
+        [sys.executable, str(setup_py), "build_ext", "--inplace"],
+        cwd=REPO_ROOT,
+        what="Cython build_ext --inplace",
+    )
+    if not expected_pyd.exists():
         raise RuntimeError(
-            f"Cython 编译跑完但 {pyx.parent}/_license_verify.*.pyd 不存在,"
-            "常见原因:MSVC Build Tools 没装,或者 setup.py compiler_directives 配置错"
+            f"Cython 编译跑完但当前 ABI 产物不存在: {expected_pyd}"
         )
-    print(f"[cython] ok -> {pyd_after[0].name}")
+    print(f"[cython] ok -> {expected_pyd.name}")
 
 
 def build_keygen() -> Path:
@@ -281,6 +265,29 @@ def build(mode: str = "onedir") -> Path:
         raise RuntimeError(f"build finished but {dist} missing")
     print(f"[build] ok -> {dist}")
     return dist
+
+
+def assert_compiled_verifier_in_dist(dist: Path) -> Path:
+    """Fail the release if PyInstaller omitted the current-ABI verifier."""
+    extension_suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    if not extension_suffix or not extension_suffix.endswith(".pyd"):
+        raise RuntimeError(
+            f"当前解释器没有 Windows .pyd 扩展后缀: {extension_suffix!r}"
+        )
+    expected_name = f"_license_verify{extension_suffix}"
+    matches = [path for path in dist.rglob(expected_name) if path.is_file()]
+    if not matches:
+        bundled = sorted(path.name for path in dist.rglob("_license_verify*.pyd"))
+        raise RuntimeError(
+            "PyInstaller 产物缺少当前 ABI 的 compiled verifier: "
+            f"{expected_name};发现={bundled or '(无)'}"
+        )
+    selected = matches[0]
+    print(
+        f"[cython] bundle verified -> {selected.relative_to(dist)} "
+        f"sha256={_sha256(selected)}"
+    )
+    return selected
 
 
 def package_zip(dist: Path, mode: str, version: str) -> Path:
@@ -441,11 +448,6 @@ def main() -> int:
         "不重建会打包进陈旧的 UI(就是 v0.2.34 '字段不见了' 的根因)",
     )
     ap.add_argument(
-        "--skip-cython",
-        action="store_true",
-        help="跳过 Cython .pyd 编译(默认会自动跑)。如果 .pyd 已是最新,本步会自动跳过",
-    )
-    ap.add_argument(
         "--keygen",
         action="store_true",
         help="只构建 LicenseKeygen.exe(给开发者签发激活码的工具),不构建主程序",
@@ -470,11 +472,11 @@ def main() -> int:
             raise SystemExit(f"--upload-only 需要 {zip_path} 与 {sha_path} 存在")
         print(f"[upload-only] 跳过 build,直接用 {zip_path.name} ({zip_path.stat().st_size // 1024} KB)")
     else:
-        if not args.skip_cython:
-            compile_cython_extensions()
+        compile_cython_extensions()
         if not args.skip_frontend_build:
             build_frontend()
         dist = build(args.mode)
+        assert_compiled_verifier_in_dist(dist)
         if args.mode == "onedir":
             lift_up_browsers(dist)
         zip_path = package_zip(dist, args.mode, version)

@@ -261,12 +261,9 @@ def create_app(
                 "v0.2.29:quota 迁移失败(非致命,继续): %s", exc,
                 extra={"event": "quota_migration_failed"},
             )
-        if video_service is not None and hasattr(video_service, "resume_queued"):
-            await video_service.resume_queued()
-        # v0.2.29:启动独立重置 cron —— 到 quota_reset_time 跨日清桶,
-        # 不依赖任务在跑。
-        if video_service is not None and hasattr(video_service, "start_reset_cron"):
-            video_service.start_reset_cron()
+        # v0.3.12:启动握手已在 main() 进入 DesktopRuntime 前完成；只有
+        # 最终 valid 才恢复排队任务和启动调度 cron。
+        await _start_licensed_video_runtime()
         yield
         # v0.2.20:app 退出时关掉所有「📂 打开浏览器」留下的窗口,避免
         # Chromium 进程游离在系统里。
@@ -284,6 +281,36 @@ def create_app(
     # API runs in worker threads, so serialize calls while leaving the rest of
     # the app concurrent.
     _pick_lock = threading.Lock()
+    _license_activation_lock = asyncio.Lock()
+    _license_runtime_lock = asyncio.Lock()
+    _license_runtime_started = False
+
+    async def _start_licensed_video_runtime() -> bool:
+        """Start video recovery/cron once, only while the license is valid."""
+        nonlocal _license_runtime_started
+        from doupool.license import get_activation_status
+
+        async with _license_runtime_lock:
+            status = get_activation_status()
+            if _license_runtime_started:
+                return status == "valid"
+            if status != "valid":
+                if video_service is not None:
+                    logging.getLogger("doupool.api").warning(
+                        "授权状态为 %s,跳过视频任务恢复和调度 cron",
+                        status,
+                        extra={
+                            "event": "video_runtime_skipped_by_license",
+                            "license_status": status,
+                        },
+                    )
+                return False
+            if video_service is not None and hasattr(video_service, "resume_queued"):
+                await video_service.resume_queued()
+            if video_service is not None and hasattr(video_service, "start_reset_cron"):
+                video_service.start_reset_cron()
+            _license_runtime_started = True
+            return True
 
     def authorize(
         x_doupool_token: str | None = Header(default=None),
@@ -310,20 +337,22 @@ def create_app(
             'valid'        → 通过
             'missing'      → 403(前端显示激活窗)
             'expired'      → 403(前端显示「已过期」窗)
-            'uncompiled'   → 通过(开发机 / 测试场景;生产应走 .pyd)
-
-        为什么不强制 'uncompiled' 拒绝:开发者在 macOS / Linux 上跑测试,
-        _license_verify.pyd 没编但仍要能调 API。生产 PyInstaller onedir
-        打包一定会带 .pyd,这条 fallback 永远不命中。
+            'revoked'      → 403(前端显示「已撤销」窗)
+            'uncompiled'   → 403(发布包缺少 .pyd 时 fail-closed)
+            其它未知状态   → 403(fail-closed)
         """
         authorize(x_doupool_token, authorization)
         # 内部 import 避免模块加载顺序敏感
         from doupool.license import get_activation_status
         status = get_activation_status()
-        if status == "missing":
-            raise HTTPException(status_code=403, detail={"error": "license_missing"})
-        if status == "expired":
-            raise HTTPException(status_code=403, detail={"error": "license_expired"})
+        if status != "valid":
+            error = {
+                "missing": "license_missing",
+                "expired": "license_expired",
+                "revoked": "license_revoked",
+                "uncompiled": "license_uncompiled",
+            }.get(status, "license_invalid_state")
+            raise HTTPException(status_code=403, detail={"error": error})
 
     @app.get("/api/health")
     def health():
@@ -343,29 +372,19 @@ def create_app(
         """无授权检查 —— 前端在未激活时也要能调。
 
         Returns:
-            {status: 'valid'|'expired'|'missing'|'uncompiled',
+            {status: 'valid'|'expired'|'missing'|'revoked'|'uncompiled',
              fingerprint: str, customer: str, expires_at: int|null}
         """
-        from doupool.license import current_fingerprint, get_activation_status
-        from doupool.license.storage import read_token
+        from doupool.license import (
+            current_fingerprint,
+            get_activation_detail,
+            get_activation_status,
+        )
         status = get_activation_status()
         fingerprint = current_fingerprint()
-        customer = ""
-        expires_at = 0
-        if status == "valid":
-            blob = read_token()
-            if blob:
-                # 解码 payload 取 customer / expires_at(轻量,verifier 已有
-                # decode 路径,这里复用)
-                try:
-                    from doupool.license import _license_verify as _v
-                    if _v is not None:
-                        _, payload, _ = _v.verify_token(blob)
-                        if payload:
-                            customer = str(payload.get("customer", ""))
-                            expires_at = int(payload.get("expires_at", 0))
-                except Exception:
-                    pass
+        detail = get_activation_detail()
+        customer = str(detail.get("customer", ""))
+        expires_at = int(detail.get("expires_at", 0))
         return {
             "status": status,
             "fingerprint": fingerprint,
@@ -374,7 +393,7 @@ def create_app(
         }
 
     @app.post("/api/license/activate")
-    def license_activate(body: dict):
+    async def license_activate(body: dict):
         """无授权检查 —— 用户的「首次激活」路径。
 
         Body: {code: str}
@@ -383,11 +402,30 @@ def create_app(
         code = str(body.get("code", "")).strip()
         if not code:
             raise HTTPException(status_code=400, detail="激活码不能为空")
-        from doupool.license import activate as _activate
-        success, err = _activate(code)
-        if not success:
-            raise HTTPException(status_code=400, detail=err)
-        return {"ok": True}
+        async with _license_activation_lock:
+            from doupool.license import activate as _activate
+            success, err = await asyncio.to_thread(_activate, code)
+            if not success:
+                raise HTTPException(status_code=400, detail=err)
+            # 新激活不应等到 24h daemon 才同步撤销状态或恢复 queued worker。
+            # 网络失败沿用 grace 语义：只要本地状态仍 valid，就接受激活。
+            from doupool.license import get_activation_status
+            from doupool.license import bootstrap as _license_bootstrap
+
+            await asyncio.to_thread(_license_bootstrap.run_startup_handshake)
+            # Bootstrap refreshes the verifier cache on success and marks it
+            # revoked before attempting disk persistence on a revoked response.
+            # Read that cache directly: reloading disk here could turn a
+            # persistence failure into a stale-valid fail-open.
+            if not await _start_licensed_video_runtime():
+                status = get_activation_status()
+                error = {
+                    "revoked": "license_revoked",
+                    "expired": "license_expired",
+                    "uncompiled": "license_uncompiled",
+                }.get(status, "license_invalid_state")
+                raise HTTPException(status_code=403, detail={"error": error})
+            return {"ok": True}
 
     @app.post("/api/license/quit")
     def license_quit():
@@ -461,9 +499,9 @@ def create_app(
     ):
         # v0.2.9:SSE 同时接受 ?access_token= 旧约定(浏览器 EventSource 不能
         # 自定义 Header)和 Authorization: Bearer 新约定(curl / 集成友好)。
-        candidate = _extract_bearer(authorization) or access_token
-        if not candidate or not secrets.compare_digest(candidate, token):
-            raise HTTPException(status_code=401, detail="invalid local token")
+        # v0.3.12:这里也必须经过 license 闸门,避免 revoked 客户端仍能保持
+        # 登录事件流。authorize_with_license 内部仍保持 Bearer 优先级。
+        authorize_with_license(access_token, authorization)
 
         async def stream():
             async for event in login_service.events(attempt_id):

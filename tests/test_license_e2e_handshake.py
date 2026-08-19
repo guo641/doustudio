@@ -351,7 +351,7 @@ def test_perform_handshake_round_trips_via_in_process_server(
     monkeypatch.setattr(_lic, "get_activation_status", lambda: "valid")
 
     bootstrap.run_startup_handshake()
-    stored_after = storage.read_token_v031()
+    stored_after = storage.read_token_v032()
     assert stored_after is not None
     assert stored_after.fresh_until == result.fresh_until
     assert stored_after.last_server_sync > 0

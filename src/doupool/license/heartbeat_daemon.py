@@ -62,29 +62,48 @@ def _daemon_loop(interval_sec: int) -> None:
 
 def _run_one_heartbeat() -> None:
     """读 activated.bin → 调 handshake → 成功就 update 字段。"""
-    stored = _storage.read_token_v031()
+    from . import reload_activation_status
+
+    stored = _storage.read_token_v032()
+    if stored is None:
+        stored = _storage.read_token_v031()
     if stored is None:
         # v0.3.0 旧格式 / 无 token → 不跑心跳
         return
 
+    fingerprint_hex = _current_fingerprint_hex()
     result = _hb.perform_handshake(
         license_token_hex=stored.license_token_blob.hex(),
         client_priv_seed=stored.client_priv_seed,
-        fingerprint_hex=_current_fingerprint_hex(),
+        fingerprint_hex=fingerprint_hex,
     )
     if not result.ok:
+        if result.error_code == _hb.ErrCode.REVOKED:
+            from .bootstrap import _mark_process_revoked
+
+            _mark_process_revoked()
+            _storage.mark_current_license_revoked(fingerprint_hex=fingerprint_hex)
+            if reload_activation_status() != "revoked":
+                _mark_process_revoked()
+            logger.warning("后台心跳确认授权已撤销,已持久化本机撤销状态")
+            return
         logger.info("后台心跳失败: %s", result.error_code)
         return
 
     # 成功 → 更新 activated.bin 的 heartbeat 字段
-    _storage.update_heartbeat_fields(
+    _storage.update_heartbeat_fields_v032(
         fresh_until=result.fresh_until,
         clock_offset_ms=result.clock_offset_ms,
         last_server_sync=result.server_timestamp,
+        revoked_prefixes=result.revoked_prefixes,
     )
+    status_after_sync = reload_activation_status()
     logger.info(
-        "后台心跳成功 fresh_until=%d offset=%dms",
-        result.fresh_until, result.clock_offset_ms,
+        "后台心跳成功 fresh_until=%d offset=%dms revoked_count=%d status=%s",
+        result.fresh_until,
+        result.clock_offset_ms,
+        len(result.revoked_prefixes),
+        status_after_sync,
     )
 
 

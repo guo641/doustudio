@@ -63,6 +63,8 @@ SERVER_SPKI_PIN = "sha256/HnTrss/ACEvZ47WvSMdfdIvdhkwlwC2BUuw9m3LJ+4w="
 HANDSHAKE_TIMEOUT_SEC: int = 5  # 启动握手不能拖过 5s
 NONCE_LEN: int = 16
 CLOCK_SKEW_TOLERANCE_SEC: int = 300  # ±5 分钟
+REVOKED_PREFIX_HEX_LEN: int = 16
+MAX_REVOKED_PREFIXES: int = 10_000
 
 
 # 失败 error_code 集合
@@ -249,6 +251,29 @@ def _verify_server_response(
     return True, ""
 
 
+def _normalize_revoked_prefixes(value) -> Optional[tuple[str, ...]]:
+    """Validate the signed server snapshot before it reaches disk."""
+    if not isinstance(value, list) or len(value) > MAX_REVOKED_PREFIXES:
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for prefix in value:
+        if not isinstance(prefix, str):
+            return None
+        item = prefix.strip().lower()
+        if len(item) != REVOKED_PREFIX_HEX_LEN:
+            return None
+        try:
+            if len(bytes.fromhex(item)) != REVOKED_PREFIX_HEX_LEN // 2:
+                return None
+        except ValueError:
+            return None
+        if item not in seen:
+            seen.add(item)
+            normalized.append(item)
+    return tuple(normalized)
+
+
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """HTTPS connection that accepts the self-signed cert only by SPKI pin."""
 
@@ -424,7 +449,13 @@ def perform_handshake(
 
     server_ts = int(response.get("server_timestamp", 0))
     fresh_until = int(response.get("fresh_until", 0))
-    revoked = tuple(response.get("revoked_prefixes", []))
+    revoked = _normalize_revoked_prefixes(response.get("revoked_prefixes"))
+    if revoked is None:
+        return HeartbeatResult(
+            ok=False,
+            error_code=ErrCode.BAD_RESPONSE,
+            server_timestamp=server_ts,
+        )
 
     return HeartbeatResult(
         ok=True,

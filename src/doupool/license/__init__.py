@@ -16,6 +16,7 @@ MSVC 缺失) → 模块级 import 走可选分支,所有对外函数返降级值
 from __future__ import annotations
 
 import sys as _sys
+from pathlib import Path as _Path
 from typing import Tuple as _Tuple
 
 # 平台检查 —— Cython .pyd 只能 cp312-win_amd64 加载。其他平台一律跳过编译后模块
@@ -30,6 +31,9 @@ _verify_failure: str = ""
 try:
     if _IS_TARGET:
         from doupool.license import _license_verify as _verifier  # noqa: F401
+        if _Path(getattr(_verifier, "__file__", "")).suffix.lower() != ".pyd":
+            _verify_failure = "compiled verifier .pyd missing"
+            _verifier = None
 except Exception as exc:
     _verify_failure = f"{type(exc).__name__}: {exc}"
     _verifier = None
@@ -72,13 +76,42 @@ def current_fingerprint() -> str:
 
 
 def get_activation_status() -> str:
-    """'valid' | 'expired' | 'missing' | 'uncompiled'。"""
+    """'valid' | 'expired' | 'missing' | 'revoked' | 'uncompiled'。"""
     if _verifier is None:
         return "uncompiled"
     try:
         return _verifier.get_activation_status()
     except Exception:
         return "missing"
+
+
+def reload_activation_status() -> str:
+    """心跳写盘后强制 verifier 丢弃进程缓存并重读状态。"""
+    if _verifier is None:
+        return "uncompiled"
+    try:
+        return _verifier.reload_activation_status()
+    except Exception:
+        return "missing"
+
+
+def get_activation_detail() -> dict:
+    if _verifier is None:
+        return {
+            "status": "uncompiled",
+            "fingerprint_hex": "uncompiled",
+            "customer": "",
+            "expires_at": 0,
+        }
+    try:
+        return _verifier.get_activation_detail()
+    except Exception:
+        return {
+            "status": "missing",
+            "fingerprint_hex": "",
+            "customer": "",
+            "expires_at": 0,
+        }
 
 
 def activate(code: str) -> _Tuple[bool, str]:
@@ -107,6 +140,8 @@ __all__ = [
     "is_compiled",
     "current_fingerprint",
     "get_activation_status",
+    "reload_activation_status",
+    "get_activation_detail",
     "activate",
     "ensure_activated_or_exit",
 ]
