@@ -42,9 +42,9 @@ class ImageAttachmentBody(BaseModel):
 
 
 class CreateVideoTaskBody(BaseModel):
-    # v0.2.37.3:画面描述上限 2000→5000 字。用户反馈 2000 太短,复杂场景
-    # 描述常常被截断。`prompts` 列表中每个元素也按 5000 字封顶(单段 prompt)。
-    prompt: str = Field(default="", max_length=5000)
+    # v0.3.15:画面描述上限 5000→20000 字。用户反馈 5000 仍不够用,复杂
+    # 场景描述常常被截断。`prompts` 列表中每个元素也按 20000 字封顶(单段 prompt)。
+    prompt: str = Field(default="", max_length=20000)
     prompts: list[str] = Field(default_factory=list, max_length=20)
     model: str = "seedance_v2.0_mini"
     ratio: str = "1:1"
@@ -74,15 +74,15 @@ class CreateVideoTaskBody(BaseModel):
             raise ValueError("当前版本仅支持文生视频")
         return self
 
-    # v0.2.37.3:`prompts` 列表中每个元素也按 5000 字封顶(单段 prompt),跟
+    # v0.3.15:`prompts` 列表中每个元素也按 20000 字封顶(单段 prompt),跟
     # 上面的 `prompt` 单值一致。`max_length=20` 是段数上限,这里再加单段字符
     # 上限,避免有人写 5 万字一段触发模型限流。
     @field_validator("prompts")
     @classmethod
     def _prompts_max_length(cls, value: list[str]) -> list[str]:
         for idx, item in enumerate(value):
-            if len(item) > 5000:
-                raise ValueError(f"prompts[{idx}] exceeds 5000 characters")
+            if len(item) > 20000:
+                raise ValueError(f"prompts[{idx}] exceeds 20000 characters")
         return value
 
 

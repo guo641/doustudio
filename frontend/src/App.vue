@@ -93,6 +93,7 @@ const prompt = ref('');
 const groupName = ref('');
 const model = ref('seedance_v2.0_mini');
 const FIXED_VIDEO_DURATION_SECONDS = 10;
+const MAX_PROMPT_CHARS = 20000;
 
 // v0.3.0:激活闸门 —— 'loading' 是首屏瞬间;'valid' 渲染主 UI;
 // 'needs-activation' / 'expired' / 'revoked' 渲染 ActivationDialog。
@@ -714,13 +715,13 @@ onBeforeUnmount(() => {
             id="video-prompt"
             v-model="prompt"
             :rows="7"
-            :maxlength="5000"
+            :maxlength="MAX_PROMPT_CHARS"
             autofocus
             placeholder="描述主体、动作、场景、镜头和光线…\n\n多段 prompt 用「第一段」「第二段」…分隔,自动归到同一组"
           />
         </DpField>
         <div class="char-hint">
-          {{ prompt.length }} / 5000 ·
+          {{ prompt.length }} / {{ MAX_PROMPT_CHARS }} ·
           {{ segmentCount }} 段(用「第一段」「第二段」分隔自动归组)
         </div>
 

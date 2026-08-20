@@ -252,34 +252,34 @@ class FakeVideoServicePartialRejected(FakeVideoService):
         return first_task, partial
 
 
-def test_create_video_task_body_rejects_prompt_over_5000_chars():
-    """v0.2.37.3:画面描述 2000→5000 字,单值 + 列表元素都按 5000 封顶。
+def test_create_video_task_body_rejects_prompt_over_20000_chars():
+    """v0.3.15:画面描述 5000→20000 字,单值 + 列表元素都按 20000 封顶。
     直接构造 CreateVideoTaskBody 触发 Pydantic 校验,不走 HTTP。
     """
     from pydantic import ValidationError
 
     from doupool.api.app import CreateVideoTaskBody
 
-    boundary_ok = CreateVideoTaskBody(prompt="a" * 5000)
-    assert len(boundary_ok.prompt) == 5000
+    boundary_ok = CreateVideoTaskBody(prompt="a" * 20000)
+    assert len(boundary_ok.prompt) == 20000
 
-    over_by_one = {"prompt": "a" * 5001}
+    over_by_one = {"prompt": "a" * 20001}
     try:
         CreateVideoTaskBody(**over_by_one)
     except ValidationError as exc:
         assert "prompt" in str(exc)
     else:
-        raise AssertionError("5001-char prompt should fail validation")
+        raise AssertionError("20001-char prompt should fail validation")
 
-    # v0.2.37.3:`prompts` 列表中每个元素也按 5000 字封顶(field_validator 兜底)
-    CreateVideoTaskBody(prompts=["x" * 5000, "short"])
-    over_prompts = {"prompts": ["x" * 5001]}
+    # v0.3.15:`prompts` 列表中每个元素也按 20000 字封顶(field_validator 兜底)
+    CreateVideoTaskBody(prompts=["x" * 20000, "short"])
+    over_prompts = {"prompts": ["x" * 20001]}
     try:
         CreateVideoTaskBody(**over_prompts)
     except ValidationError as exc:
         assert "prompts" in str(exc)
     else:
-        raise AssertionError("prompts element over 5000 chars should fail validation")
+        raise AssertionError("prompts element over 20000 chars should fail validation")
 
     assert CreateVideoTaskBody(group_name="组" * 40).group_name == "组" * 40
     with pytest.raises(ValidationError):
