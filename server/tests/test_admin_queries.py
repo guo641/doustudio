@@ -27,14 +27,15 @@ def _insert_license(
     last_seen_at: int = NOW - 60,
     heartbeat_count: int = 1,
     fingerprint_hex: str = "fa" * 32,
+    note: str | None = None,
 ) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO license_activations (
                 license_hmac, fingerprint_hex, expires_at, first_seen_at,
-                last_seen_at, heartbeat_count
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                last_seen_at, heartbeat_count, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 license_hmac,
@@ -43,8 +44,44 @@ def _insert_license(
                 first_seen_at,
                 last_seen_at,
                 heartbeat_count,
+                note,
             ),
         )
+
+
+def test_init_db_migrates_note_column_idempotently(tmp_path):
+    db_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE license_activations (
+                license_hmac TEXT PRIMARY KEY,
+                fingerprint_hex TEXT NOT NULL,
+                expires_at INTEGER,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                heartbeat_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO license_activations VALUES (?, ?, ?, ?, ?, ?)",
+            ("1" * 64, "fa" * 32, None, NOW, NOW, 1),
+        )
+
+    db.init_db(db_path)
+    db.init_db(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        columns = [
+            row[1]
+            for row in conn.execute("PRAGMA table_info(license_activations)")
+        ]
+        row = conn.execute(
+            "SELECT license_hmac, note FROM license_activations"
+        ).fetchone()
+    assert columns.count("note") == 1
+    assert row == ("1" * 64, None)
 
 
 def test_statistics_and_distribution_exclude_revoked_activity(admin_db):
@@ -96,6 +133,7 @@ def test_listing_filters_sorts_pages_and_never_returns_fingerprint(admin_db):
         last_seen_at=NOW - 10,
         heartbeat_count=4,
         fingerprint_hex="secret-fingerprint-active",
+        note="Alice",
     )
     _insert_license(
         admin_db,
@@ -126,6 +164,8 @@ def test_listing_filters_sorts_pages_and_never_returns_fingerprint(admin_db):
     assert total == 3
     assert [row["license_hmac"] for row in rows] == [expired, active]
     assert all("fingerprint_hex" not in row for row in rows)
+    assert all("note" in row for row in rows)
+    assert rows[1]["note"] == "Alice"
     assert "secret-fingerprint" not in repr(rows)
 
     second_page, second_total = admin_queries.get_all_licenses(
@@ -205,6 +245,87 @@ def test_extend_with_any_missing_target_is_atomic(admin_db):
             (existing,),
         ).fetchone()[0]
     assert actual == original_expiry
+
+
+def test_set_license_note_sets_and_clears(admin_db):
+    target = "8" * 64
+    missing = "9" * 64
+    _insert_license(admin_db, target, expires_at=None)
+
+    assert admin_queries.set_license_note(
+        target.upper(), "  customer A  "
+    ) == admin_queries.MutationResult(changed=1)
+    with sqlite3.connect(admin_db) as conn:
+        note = conn.execute(
+            "SELECT note FROM license_activations WHERE license_hmac = ?",
+            (target,),
+        ).fetchone()[0]
+    assert note == "customer A"
+
+    assert admin_queries.set_license_note(
+        target, "   "
+    ) == admin_queries.MutationResult(changed=1)
+    assert admin_queries.set_license_note(
+        missing, "unknown"
+    ) == admin_queries.MutationResult(not_found=1)
+    with sqlite3.connect(admin_db) as conn:
+        note = conn.execute(
+            "SELECT note FROM license_activations WHERE license_hmac = ?",
+            (target,),
+        ).fetchone()[0]
+    assert note is None
+
+    with pytest.raises(ValueError, match="at most 200"):
+        admin_queries.set_license_note(target, "x" * 201)
+
+
+def test_set_license_expiry_sets_absolute(admin_db):
+    first = "a" * 64
+    second = "b" * 64
+    missing = "c" * 64
+    _insert_license(admin_db, first, expires_at=None)
+    _insert_license(admin_db, second, expires_at=NOW + 10)
+    future = NOW + 365 * 86400
+
+    assert admin_queries.set_license_expiry(
+        [first.upper(), second], future, now=NOW
+    ) == admin_queries.MutationResult(changed=2)
+    with sqlite3.connect(admin_db) as conn:
+        values = dict(
+            conn.execute(
+                "SELECT license_hmac, expires_at FROM license_activations"
+            ).fetchall()
+        )
+    assert values[first] == future
+    assert values[second] == future
+
+    assert admin_queries.set_license_expiry(
+        [first, second], None, now=NOW
+    ) == admin_queries.MutationResult(changed=2)
+    with sqlite3.connect(admin_db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM license_activations WHERE expires_at IS NULL"
+        ).fetchone()[0] == 2
+
+    with pytest.raises(ValueError, match=r"now..now\+3650d"):
+        admin_queries.set_license_expiry([first], NOW - 1, now=NOW)
+    with pytest.raises(ValueError, match=r"now..now\+3650d"):
+        admin_queries.set_license_expiry(
+            [first], NOW + 3650 * 86400 + 1, now=NOW
+        )
+
+    assert admin_queries.set_license_expiry(
+        [missing], future, now=NOW
+    ) == admin_queries.MutationResult(not_found=1)
+
+    assert admin_queries.set_license_expiry(
+        [first, missing], future, now=NOW
+    ) == admin_queries.MutationResult(not_found=1)
+    with sqlite3.connect(admin_db) as conn:
+        assert conn.execute(
+            "SELECT expires_at FROM license_activations WHERE license_hmac = ?",
+            (first,),
+        ).fetchone()[0] is None
 
 
 def test_revoke_is_idempotent_and_returns_ordered_records(admin_db):

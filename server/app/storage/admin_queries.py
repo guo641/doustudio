@@ -88,7 +88,7 @@ def get_all_licenses(
         rows = conn.execute(
             f"""
             SELECT a.license_hmac, a.expires_at, a.first_seen_at,
-                   a.last_seen_at, a.heartbeat_count
+                   a.last_seen_at, a.heartbeat_count, a.note
             FROM license_activations a
             WHERE {where_sql}
             ORDER BY a.{order_by} {order_sql}, a.license_hmac ASC
@@ -177,6 +177,66 @@ def _deduplicate(values: Iterable[str]) -> list[str]:
             raise ValueError("license_hmac must be 64 hexadecimal characters")
         normalized.append(candidate)
     return list(dict.fromkeys(normalized))
+
+
+def set_license_note(license_hmac: str, note: str) -> MutationResult:
+    """Set or clear one license note; blank text is stored as NULL."""
+    candidate = license_hmac.strip().lower()
+    if not _HMAC_RE.fullmatch(candidate):
+        raise ValueError("license_hmac must be 64 hexadecimal characters")
+    note = (note or "").strip()
+    if len(note) > 200:
+        raise ValueError("note must be at most 200 characters")
+    value = note or None
+    with db_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE license_activations SET note = ? WHERE license_hmac = ?",
+            (value, candidate),
+        )
+        if cursor.rowcount == 0:
+            return MutationResult(not_found=1)
+        return MutationResult(changed=1)
+
+
+def set_license_expiry(
+    license_hmacs: Iterable[str],
+    expires_at: int | None,
+    *,
+    now: int | None = None,
+) -> MutationResult:
+    """Set an absolute server-side expiry; None restores an unlimited license."""
+    targets = _deduplicate(license_hmacs)
+    if not targets or len(targets) > 50:
+        raise ValueError("between 1 and 50 targets are required")
+    now = int(time.time()) if now is None else now
+    if expires_at is not None:
+        expires_at = int(expires_at)
+        if not now <= expires_at <= now + 3650 * 86400:
+            raise ValueError("expires_at must be within now..now+3650d")
+    placeholders = ",".join("?" for _ in targets)
+
+    with db_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            found = conn.execute(
+                f"SELECT license_hmac FROM license_activations "
+                f"WHERE license_hmac IN ({placeholders})",
+                targets,
+            ).fetchall()
+            not_found = len(targets) - len(found)
+            if not_found:
+                conn.rollback()
+                return MutationResult(not_found=not_found)
+            conn.execute(
+                f"UPDATE license_activations SET expires_at = ? "
+                f"WHERE license_hmac IN ({placeholders})",
+                (expires_at, *targets),
+            )
+            conn.commit()
+            return MutationResult(changed=len(found))
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def extend_license_expiry(

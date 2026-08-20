@@ -19,6 +19,8 @@ from ..storage.admin_queries import (
     get_revoked_licenses,
     get_statistics,
     revoke_licenses,
+    set_license_expiry,
+    set_license_note,
 )
 from .auth import csrf_token, verify_credentials, verify_csrf
 
@@ -80,6 +82,24 @@ class RevokeRequest(LicenseTargets):
         if not value:
             raise ValueError("reason must not be blank")
         return value
+
+
+class NoteRequest(BaseModel):
+    license_hmac: str = Field(min_length=64, max_length=64)
+    note: str = Field(default="", max_length=200)
+
+    @field_validator("license_hmac")
+    @classmethod
+    def normalize_hmac(cls, value: str) -> str:
+        candidate = value.strip().lower()
+        if not _HMAC_RE.fullmatch(candidate):
+            raise ValueError("license_hmac must be 64-character hex")
+        return candidate
+
+
+class SetExpiryRequest(LicenseTargets):
+    # Absolute unix seconds; null clears the server-side override.
+    expires_at: int | None = Field(default=None, ge=0)
 
 
 def _page_response(name: str, request: Request, context: dict) -> HTMLResponse:
@@ -284,6 +304,57 @@ def revoke_license(
     return _json_response(
         {"ok": True, "revoked": result.changed, "already_revoked": result.skipped}
     )
+
+
+@router.post("/licenses/note")
+def set_note(
+    request: Request,
+    body: NoteRequest,
+    username: Annotated[str, Depends(verify_credentials)],
+) -> JSONResponse:
+    verify_csrf(request)
+    result = set_license_note(body.license_hmac, body.note)
+    if result.not_found:
+        return _json_response(
+            {"ok": False, "error": "license_not_found"}, status_code=404
+        )
+    logger.info(
+        "admin_note operator=%s hmac=%s len=%d",
+        username,
+        body.license_hmac[:16],
+        len(body.note.strip()),
+    )
+    return _json_response({"ok": True, "updated": result.changed})
+
+
+@router.post("/licenses/set-expiry")
+def set_expiry(
+    request: Request,
+    body: SetExpiryRequest,
+    username: Annotated[str, Depends(verify_credentials)],
+) -> JSONResponse:
+    verify_csrf(request)
+    try:
+        result = set_license_expiry(body.license_hmacs, body.expires_at)
+    except ValueError as exc:
+        return _json_response({"ok": False, "error": str(exc)}, status_code=400)
+    if result.not_found:
+        return _json_response(
+            {
+                "ok": False,
+                "error": "license_not_found",
+                "not_found": result.not_found,
+            },
+            status_code=404,
+        )
+    logger.info(
+        "admin_set_expiry operator=%s targets=%d expires_at=%s updated=%d",
+        username,
+        len(body.license_hmacs),
+        body.expires_at,
+        result.changed,
+    )
+    return _json_response({"ok": True, "updated": result.changed})
 
 
 @router.get("/revoked", response_class=HTMLResponse)

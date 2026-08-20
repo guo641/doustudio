@@ -256,3 +256,81 @@ def test_revoke_route_is_idempotent(web_client):
     assert first.json() == {"ok": True, "revoked": 1, "already_revoked": 0}
     assert second.status_code == 200
     assert second.json() == {"ok": True, "revoked": 0, "already_revoked": 1}
+
+
+def test_set_note_endpoint(web_client):
+    client, db_path = web_client
+    _insert_license(db_path)
+
+    response = client.post(
+        "/admin/licenses/note",
+        auth=_auth(),
+        headers=_csrf_headers(),
+        json={"license_hmac": LICENSE_HMAC, "note": "  customer A  "},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "updated": 1}
+    with sqlite3.connect(db_path) as conn:
+        note = conn.execute(
+            "SELECT note FROM license_activations WHERE license_hmac = ?",
+            (LICENSE_HMAC,),
+        ).fetchone()[0]
+    assert note == "customer A"
+
+    missing_csrf = client.post(
+        "/admin/licenses/note",
+        auth=_auth(),
+        headers={"Origin": "http://testserver"},
+        json={"license_hmac": LICENSE_HMAC, "note": "blocked"},
+    )
+    assert missing_csrf.status_code == 403
+
+    unknown = client.post(
+        "/admin/licenses/note",
+        auth=_auth(),
+        headers=_csrf_headers(),
+        json={"license_hmac": "f" * 64, "note": "unknown"},
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"] == "license_not_found"
+
+
+def test_set_expiry_endpoint(web_client):
+    client, db_path = web_client
+    _insert_license(db_path, expires_at=None)
+    future = int(time.time()) + 30 * 86400
+
+    response = client.post(
+        "/admin/licenses/set-expiry",
+        auth=_auth(),
+        headers=_csrf_headers(),
+        json={"license_hmacs": [LICENSE_HMAC], "expires_at": future},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "updated": 1}
+    with sqlite3.connect(db_path) as conn:
+        expiry = conn.execute(
+            "SELECT expires_at FROM license_activations WHERE license_hmac = ?",
+            (LICENSE_HMAC,),
+        ).fetchone()[0]
+    assert expiry == future
+
+    past = client.post(
+        "/admin/licenses/set-expiry",
+        auth=_auth(),
+        headers=_csrf_headers(),
+        json={"license_hmacs": [LICENSE_HMAC], "expires_at": 1},
+    )
+    assert past.status_code == 400
+    assert "now..now+3650d" in past.json()["error"]
+
+    unknown = client.post(
+        "/admin/licenses/set-expiry",
+        auth=_auth(),
+        headers=_csrf_headers(),
+        json={"license_hmacs": ["f" * 64], "expires_at": future},
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"] == "license_not_found"

@@ -27,6 +27,7 @@
   </div>
   <div class="toolbar">
     <button id="batch-extend" disabled>批量延期</button>
+    <button id="batch-setexpiry" disabled>批量设置到期</button>
     <button id="batch-revoke" class="danger" disabled>批量撤销</button>
     <span id="selection-count" class="subtle">未选择 License</span>
   </div>
@@ -36,7 +37,7 @@
     <thead>
       <tr>
         <th><input id="select-page" type="checkbox" aria-label="选择当前页"></th>
-        <th>HMAC 前缀</th><th>激活时间</th><th>最后心跳</th><th>服务端到期覆盖</th><th>剩余时间</th><th>心跳次数</th><th>操作</th>
+        <th>HMAC 前缀</th><th>激活时间</th><th>最后心跳</th><th>服务端到期覆盖</th><th>剩余时间</th><th>备注</th><th>心跳次数</th><th>操作</th>
       </tr>
     </thead>
     <tbody>
@@ -59,14 +60,20 @@
           {% elif lic.expiry_state == 'expiring' %}<span class="badge warn">{{ lic.days_label }}</span>
           {% else %}<span class="badge good">{{ lic.days_label }}</span>{% endif %}
         </td>
+        <td>
+          {% if lic.note %}<span title="{{ lic.note }}">{{ lic.note }}</span>
+          {% else %}<span class="subtle">—</span>{% endif %}
+        </td>
         <td>{{ lic.heartbeat_count }}</td>
         <td style="white-space:nowrap">
           <button class="row-extend" data-hmac="{{ lic.license_hmac }}" {% if lic.expires_at is none %}disabled title="未设置到期覆盖,保持不变"{% endif %}>延期</button>
+          <button class="row-note" data-hmac="{{ lic.license_hmac }}" data-note="{{ lic.note or '' }}">备注</button>
+          <button class="row-setexpiry" data-hmac="{{ lic.license_hmac }}">设置到期</button>
           <button class="row-revoke danger" data-hmac="{{ lic.license_hmac }}">撤销</button>
         </td>
       </tr>
       {% else %}
-      <tr><td class="empty" colspan="8">当前筛选下没有用户</td></tr>
+      <tr><td class="empty" colspan="9">当前筛选下没有用户</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -100,6 +107,17 @@
       <label for="revoke-reason">撤销原因</label>
       <input id="revoke-reason" type="text" maxlength="200" autocomplete="off">
     </div>
+    <div id="note-fields" hidden>
+      <label for="note-input">备注（区分用户，最多 200 字，留空=清除）</label>
+      <input id="note-input" type="text" maxlength="200" autocomplete="off">
+    </div>
+    <div id="expiry-fields" hidden>
+      <label for="expiry-date">服务端到期日期（留空=清除，恢复不限期）</label>
+      <input id="expiry-date" type="date">
+      <p class="subtle" style="margin-top:6px">
+        到点后心跳被拒，客户端在 fresh+grace 窗口耗尽后锁定（非立即）。立即封停请用「撤销」。
+      </p>
+    </div>
     <div class="dialog-actions">
       <button id="dialog-cancel">取消</button>
       <button id="dialog-confirm" class="primary">确认</button>
@@ -114,17 +132,21 @@
   const checks = [...document.querySelectorAll('.row-select')];
   const selectPage = document.getElementById('select-page');
   const batchExtend = document.getElementById('batch-extend');
+  const batchSetExpiry = document.getElementById('batch-setexpiry');
   const batchRevoke = document.getElementById('batch-revoke');
   const selectionCount = document.getElementById('selection-count');
   const dialog = document.getElementById('action-dialog');
   const extendFields = document.getElementById('extend-fields');
   const revokeFields = document.getElementById('revoke-fields');
+  const noteFields = document.getElementById('note-fields');
+  const expiryFields = document.getElementById('expiry-fields');
   let pending = null;
 
   const selected = () => checks.filter(item => item.checked).map(item => item.value);
   const updateSelection = () => {
     const count = selected().length;
     batchExtend.disabled = count === 0;
+    batchSetExpiry.disabled = count === 0;
     batchRevoke.disabled = count === 0;
     selectionCount.textContent = count ? `已选择 ${count} 条` : '未选择 License';
     if (selectPage) {
@@ -142,24 +164,37 @@
     element.textContent = message;
     element.className = `message show ${ok ? 'ok' : 'error'}`;
   };
-  const openDialog = (action, targets) => {
-    pending = {action, targets};
+  const openDialog = (action, targets, note = '') => {
+    pending = {action, targets, note};
     const isExtend = action === 'extend';
-    document.getElementById('dialog-title').textContent = isExtend ? '延期确认' : '撤销确认';
+    const isRevoke = action === 'revoke';
+    const isNote = action === 'note';
+    const isExpiry = action === 'set-expiry';
+    document.getElementById('dialog-title').textContent = isExtend ? '延期确认'
+      : isRevoke ? '撤销确认' : isNote ? '设置备注' : '设置服务端到期';
     document.getElementById('dialog-summary').textContent = `将操作 ${targets.length} 条 License。`;
     extendFields.hidden = !isExtend;
-    revokeFields.hidden = isExtend;
-    document.getElementById('dialog-confirm').className = isExtend ? 'primary' : 'danger';
+    revokeFields.hidden = !isRevoke;
+    noteFields.hidden = !isNote;
+    expiryFields.hidden = !isExpiry;
+    document.getElementById('dialog-confirm').className = isRevoke ? 'danger' : 'primary';
+    if (isNote) document.getElementById('note-input').value = pending.note || '';
     dialog.classList.add('open');
-    (isExtend ? document.getElementById('extend-preset') : document.getElementById('revoke-reason')).focus();
+    (isExtend ? document.getElementById('extend-preset')
+      : isRevoke ? document.getElementById('revoke-reason')
+      : isNote ? document.getElementById('note-input')
+      : document.getElementById('expiry-date')).focus();
   };
   const closeDialog = () => { pending = null; dialog.classList.remove('open'); };
   document.getElementById('dialog-cancel').addEventListener('click', closeDialog);
   dialog.addEventListener('click', event => { if (event.target === dialog) closeDialog(); });
   document.addEventListener('keydown', event => { if (event.key === 'Escape') closeDialog(); });
   batchExtend.addEventListener('click', () => openDialog('extend', selected()));
+  batchSetExpiry.addEventListener('click', () => openDialog('set-expiry', selected()));
   batchRevoke.addEventListener('click', () => openDialog('revoke', selected()));
   document.querySelectorAll('.row-extend').forEach(button => button.addEventListener('click', () => openDialog('extend', [button.dataset.hmac])));
+  document.querySelectorAll('.row-note').forEach(button => button.addEventListener('click', () => openDialog('note', [button.dataset.hmac], button.dataset.note)));
+  document.querySelectorAll('.row-setexpiry').forEach(button => button.addEventListener('click', () => openDialog('set-expiry', [button.dataset.hmac])));
   document.querySelectorAll('.row-revoke').forEach(button => button.addEventListener('click', () => openDialog('revoke', [button.dataset.hmac])));
   const extendPreset = document.getElementById('extend-preset');
   const customDaysField = document.getElementById('custom-days-field');
@@ -171,10 +206,24 @@
   document.getElementById('dialog-confirm').addEventListener('click', async () => {
     if (!pending) return;
     const isExtend = pending.action === 'extend';
-    const body = {license_hmacs: pending.targets};
-    if (isExtend) body.days = Number(extendPreset.value === 'custom' ? document.getElementById('extend-days').value : extendPreset.value);
-    else body.reason = document.getElementById('revoke-reason').value.trim();
-    if ((!isExtend && !body.reason) || (isExtend && (!Number.isInteger(body.days) || body.days < 1 || body.days > 3650))) {
+    const isRevoke = pending.action === 'revoke';
+    const isNote = pending.action === 'note';
+    const isExpiry = pending.action === 'set-expiry';
+    let body;
+    if (isExtend) {
+      body = {license_hmacs: pending.targets};
+      body.days = Number(extendPreset.value === 'custom' ? document.getElementById('extend-days').value : extendPreset.value);
+    } else if (isRevoke) {
+      body = {license_hmacs: pending.targets, reason: document.getElementById('revoke-reason').value.trim()};
+    } else if (isNote) {
+      body = {license_hmac: pending.targets[0], note: document.getElementById('note-input').value};
+    } else if (isExpiry) {
+      const value = document.getElementById('expiry-date').value;
+      let expires_at = null;
+      if (value) expires_at = Math.floor(new Date(`${value}T23:59:59+08:00`).getTime() / 1000);
+      body = {license_hmacs: pending.targets, expires_at};
+    }
+    if ((isRevoke && !body.reason) || (isExtend && (!Number.isInteger(body.days) || body.days < 1 || body.days > 3650))) {
       showMessage(isExtend ? '延期天数必须在 1 到 3650 之间。' : '请填写撤销原因。', false); return;
     }
     const confirmButton = document.getElementById('dialog-confirm');
@@ -188,7 +237,9 @@
       closeDialog();
       showMessage(isExtend
         ? `延期完成：更新 ${result.updated} 条，未设置到期覆盖而保持不变 ${result.skipped_unbounded} 条。`
-        : `撤销完成：新增 ${result.revoked} 条，已撤销 ${result.already_revoked} 条。`, true);
+        : isRevoke
+          ? `撤销完成：新增 ${result.revoked} 条，已撤销 ${result.already_revoked} 条。`
+          : isNote ? '备注已保存。' : `已设置服务端到期：更新 ${result.updated} 条。`, true);
       window.setTimeout(() => window.location.reload(), 700);
     } catch (error) {
       showMessage(`操作失败：${error.message}`, false);

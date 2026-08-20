@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS license_activations (
     expires_at      INTEGER,
     first_seen_at   INTEGER NOT NULL,
     last_seen_at    INTEGER NOT NULL,
-    heartbeat_count INTEGER NOT NULL DEFAULT 0
+    heartbeat_count INTEGER NOT NULL DEFAULT 0,
+    note            TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_license_first_seen ON license_activations(first_seen_at);
 
@@ -48,6 +49,15 @@ def init_db(path: Path | None = None) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        # Multiple uvicorn workers can initialize an existing database at once.
+        # Serialize the legacy-column check and ALTER so only one worker migrates.
+        conn.execute("BEGIN IMMEDIATE")
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(license_activations)")
+        }
+        if "note" not in cols:
+            conn.execute("ALTER TABLE license_activations ADD COLUMN note TEXT")
         conn.commit()
     logger.info("数据库初始化完成: %s", db_path)
 
