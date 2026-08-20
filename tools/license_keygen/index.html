@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>DouStudio 激活码签发工具</title>
+<style>
+  /* 工具型 UI,简单但专业。原生 CSS,无外部依赖(pywebview 离线运行) */
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f7f8fa;
+    color: #1f2328;
+    font-size: 14px;
+  }
+  .container { max-width: 660px; margin: 0 auto; }
+  h1 {
+    font-size: 20px;
+    font-weight: 600;
+    margin: 0 0 4px;
+  }
+  .subtitle {
+    color: #6b7280;
+    font-size: 13px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .field { margin-bottom: 16px; }
+  .field label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: #374151;
+    margin-bottom: 6px;
+  }
+  .field input, .field select, .field textarea {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: inherit;
+    background: #fff;
+  }
+  .field input:focus, .field select:focus, .field textarea:focus {
+    outline: none;
+    border-color: #4a6cf7;
+    box-shadow: 0 0 0 3px rgba(74, 108, 247, 0.1);
+  }
+  .field .hint {
+    margin-top: 4px;
+    font-size: 11px;
+    color: #9ca3af;
+  }
+  .row { display: flex; gap: 12px; align-items: flex-end; }
+  .row > * { flex: 1; }
+  button {
+    padding: 9px 16px;
+    border: 1px solid #4a6cf7;
+    border-radius: 6px;
+    background: #4a6cf7;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  button:hover { background: #3b5ce6; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary {
+    background: #fff;
+    color: #4a6cf7;
+  }
+  button.secondary:hover { background: #f3f4f6; }
+  .actions { display: flex; gap: 8px; margin-top: 8px; }
+  .output {
+    font-family: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    background: #f3f4f6;
+    padding: 12px;
+    border-radius: 6px;
+    word-break: break-all;
+    min-height: 60px;
+    white-space: pre-wrap;
+  }
+  .meta {
+    margin-top: 12px;
+    padding: 10px;
+    background: #f9fafb;
+    border-radius: 6px;
+    font-size: 11px;
+    color: #6b7280;
+    line-height: 1.6;
+  }
+  .error { color: #dc2626; font-size: 12px; margin-top: 8px; }
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    padding: 10px 16px;
+    background: #1f2937;
+    color: #fff;
+    border-radius: 6px;
+    font-size: 13px;
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .footer {
+    margin-top: 24px;
+    text-align: center;
+    font-size: 11px;
+    color: #9ca3af;
+  }
+  .version-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    background: #f3f4f6;
+    border-radius: 4px;
+    font-size: 11px;
+    color: #6b7280;
+    margin-left: 8px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>DouStudio 激活码签发工具<span class="version-badge" id="version-badge">v—</span></h1>
+  <div class="subtitle">给客户签发激活码 · 完全离线 · 不联网</div>
+
+  <div class="card">
+    <div class="field">
+      <label>客户机器码 (64 位 hex)</label>
+      <textarea id="fingerprint" rows="3" placeholder="从客户的激活窗复制粘贴到这里"></textarea>
+      <div class="hint">客户在 DouStudio 激活窗 → 「您的机器码」右侧点「复制」</div>
+    </div>
+
+    <div class="field">
+      <label>客户标识 (备注用,如 「张三 - 北京」)</label>
+      <input id="customer" type="text" placeholder="张三 - 北京" maxlength="64">
+    </div>
+
+    <div class="row">
+      <div class="field">
+        <label>有效时长</label>
+        <select id="duration">
+          <option value="30">30 天</option>
+          <option value="90">90 天</option>
+          <option value="180">180 天</option>
+          <option value="365" selected>365 天 (1 年)</option>
+          <option value="730">730 天 (2 年)</option>
+          <option value="date">按日期…</option>
+          <option value="0">永久</option>
+        </select>
+        <div class="field" id="expiry-date-field" style="display:none;">
+          <label>到期日期</label>
+          <input id="expiry-date" type="date">
+          <div class="hint">选具体某天到期（含当天，按北京时间 23:59:59 计）</div>
+        </div>
+      </div>
+      <div style="flex: 0 0 auto;">
+        <button id="self-test" class="secondary" type="button">本机自检</button>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="generate" type="button">生成激活码</button>
+    </div>
+    <div class="error" id="error"></div>
+  </div>
+
+  <div class="card">
+    <div class="field" style="margin-bottom: 8px;">
+      <label>激活码</label>
+      <div class="output" id="output">— 还没生成 —</div>
+      <div class="actions">
+        <button class="secondary" id="copy" type="button" disabled>复制</button>
+        <button class="secondary" id="clear" type="button">清空</button>
+      </div>
+    </div>
+    <div class="meta" id="meta"></div>
+  </div>
+
+  <div class="footer">
+    DouStudio License Keygen · 私钥仅在本地,签发过程不联网
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function loadVersion() {
+  try {
+    const r = await fetch('/api/version');
+    const j = await r.json();
+    $('version-badge').textContent = 'v' + j.version;
+  } catch {
+    $('version-badge').textContent = 'v?';
+  }
+}
+
+function showToast(msg) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 1800);
+}
+
+function showError(msg) {
+  $('error').textContent = msg || '';
+}
+
+$('duration').addEventListener('change', () => {
+  const byDate = $('duration').value === 'date';
+  $('expiry-date-field').style.display = byDate ? '' : 'none';
+  if (!byDate) $('expiry-date').value = '';
+});
+
+function setOutput(code, payload, expires_at) {
+  $('output').textContent = code || '— 还没生成 —';
+  $('copy').disabled = !code;
+  if (payload) {
+    const expiresStr = expires_at === null ? '永久' : new Date(expires_at * 1000).toLocaleString('zh-CN');
+    const issued = new Date(payload.issued_at * 1000).toLocaleString('zh-CN');
+    $('meta').innerHTML = `
+      <strong>客户:</strong> ${payload.customer || '(未填)'}<br>
+      <strong>签发时间:</strong> ${issued}<br>
+      <strong>到期时间:</strong> ${expiresStr}<br>
+      <strong>最低版本:</strong> ${payload.min_app_version}
+    `;
+  } else {
+    $('meta').innerHTML = '';
+  }
+}
+
+$('generate').addEventListener('click', async () => {
+  showError('');
+  const fingerprint = $('fingerprint').value.trim();
+  const customer = $('customer').value.trim();
+  let duration_days;
+  const durSel = $('duration').value;
+  if (durSel === 'date') {
+    const d = $('expiry-date').value;
+    if (!d) { showError('请选择到期日期'); return; }
+    const endMs = new Date(d + 'T23:59:59+08:00').getTime();
+    const now = Date.now();
+    if (!Number.isFinite(endMs) || endMs <= now) {
+      showError('到期日期必须晚于今天');
+      return;
+    }
+    duration_days = Math.ceil((endMs - now) / 86400000);
+    if (duration_days < 1) duration_days = 1;
+  } else {
+    duration_days = parseInt(durSel, 10);
+  }
+  if (!fingerprint) { showError('请填机器码'); return; }
+  if (!customer) { showError('请填客户标识'); return; }
+
+  $('generate').disabled = true;
+  try {
+    const r = await fetch('/api/generate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ fingerprint, customer, duration_days, features: [] }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({detail: r.statusText}));
+      throw new Error(err.detail || '生成失败');
+    }
+    const j = await r.json();
+    setOutput(j.code, j.payload, j.expires_at);
+    showToast('已生成');
+  } catch (e) {
+    showError(e.message);
+  } finally {
+    $('generate').disabled = false;
+  }
+});
+
+$('copy').addEventListener('click', async () => {
+  const code = $('output').textContent;
+  if (!code || code.startsWith('—')) return;
+  try {
+    await navigator.clipboard.writeText(code);
+    showToast('已复制');
+  } catch {
+    // 旧 pywebview / 无 clipboard 权限 → 让用户手动框选
+    showError('自动复制失败,请手动框选上方激活码');
+  }
+});
+
+$('clear').addEventListener('click', () => {
+  setOutput('', null, null);
+  showError('');
+});
+
+$('self-test').addEventListener('click', async () => {
+  showError('');
+  try {
+    const r = await fetch('/api/fingerprint-self-test');
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({detail: r.statusText}));
+      throw new Error(err.detail || 'self-test 失败');
+    }
+    const j = await r.json();
+    setOutput(j.code, {
+      customer: 'self-test',
+      issued_at: Math.floor(Date.now() / 1000),
+      min_app_version: '0.3.0',
+    }, j.expires_at);
+    $('fingerprint').value = j.fingerprint;
+    $('customer').value = 'self-test';
+    showToast('自检通过 — 拿这个码去激活本机 DouStudio');
+  } catch (e) {
+    showError(e.message);
+  }
+});
+
+loadVersion();
+</script>
+</body>
+</html>
