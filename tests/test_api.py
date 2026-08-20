@@ -1919,10 +1919,11 @@ def test_refresh_url_endpoint_non_succeeded_returns_409(repository, tmp_path):
 
 
 # ---------- v0.2.28 Q2:批量任务按组下载到独立文件夹 ----------
-# 三个用例覆盖:
+# 用例覆盖:
 #  1) 正常路径 —— 3 条 succeeded 任务,httpx 流式落盘,文件名 `{group_index:02d}_{HHMMSS}_{prompt前12字符}.mp4`
-#  2) 过期签名 —— httpx 返回 403 → 409 提示用户先点刷新
-#  3) 空组 —— group_id 不存在 → 404
+#  2) 过期签名 —— 整组自动刷新 URL,跳过已下载项并完成剩余下载
+#  3) 自动刷新失败 / 刷新后仍 403 —— 409 且最多刷新一次
+#  4) 空组 —— group_id 不存在 → 404
 
 class _FakeChunkedResponse:
     """模拟 httpx 流式响应:status_code + aiter_bytes"""
@@ -1969,6 +1970,29 @@ class _FakeStreamClient:
         return resp
 
 
+class _FakeGroupDownloadRefreshService(FakeVideoService):
+    """批量下载测试用刷新服务:按 task_id 写回指定的新 result_url。"""
+
+    def __init__(self, repository, fresh_urls: dict[str, str], *, return_none=False):
+        super().__init__(repository)
+        self.fresh_urls = fresh_urls
+        self.return_none = return_none
+        self.refresh_calls: list[str] = []
+
+    def schedule_refresh_url(self, task_id: str):
+        async def wrapper():
+            self.refresh_calls.append(task_id)
+            if self.return_none:
+                return None
+            self.repository.update_video_task(
+                task_id,
+                result_url=self.fresh_urls[task_id],
+            )
+            return self.repository.get_video_task(task_id)
+
+        return wrapper()
+
+
 def _seed_grouped_tasks(repository, group_id: str, count: int = 3):
     """在指定 group_id 下建 count 条 succeeded 任务,result_url 用
     https://example.test/v1.mp4 ... v{count}.mp4。"""
@@ -1981,7 +2005,11 @@ def _seed_grouped_tasks(repository, group_id: str, count: int = 3):
         # 后端逻辑里 group_id 是建任务时外部传入的(批量提交时由 service 设),
         # repository 没有 update_group 工具,直接走 SQL 模拟:
         from doupool.db.models import VideoTask
-        VideoTask.update(group_id=group_id, group_index=i).where(VideoTask.id == task.id).execute()
+        VideoTask.update(
+            group_id=group_id,
+            group_index=i,
+            conversation_id=f"conversation-{i}",
+        ).where(VideoTask.id == task.id).execute()
         repository.update_video_task(task.id, status="succeeded", result_url=f"https://example.test/v{i}.mp4")
         task_ids.append(task.id)
     return task_ids, urls
@@ -2175,33 +2203,122 @@ def test_group_download_prefers_sanitized_group_name(
     assert saved_dir.name == "美女蛇_竖屏"
 
 
-def test_group_download_handles_expired_signature(repository, tmp_path, database_manager, monkeypatch):
-    """httpx 返回 403 → 端点返 409,提示用户先刷新下载链接。"""
+def test_group_download_auto_refreshes_expired_group(
+    repository, tmp_path, database_manager, monkeypatch,
+):
+    """中途 403 时刷新整组,保留已下载文件并用新 URL 完成剩余任务。"""
     settings = SettingsService(repository, tmp_path, database_manager.path)
     settings.update({"download_dir": str(tmp_path / "downloads")})
 
+    group_id = "expired-group-success"
+    task_ids, old_responses = _seed_grouped_tasks(repository, group_id, count=2)
+    fresh_urls = {
+        task_ids[0]: "https://fresh.example/v1.mp4",
+        task_ids[1]: "https://fresh.example/v2.mp4",
+    }
+    service = _FakeGroupDownloadRefreshService(repository, fresh_urls)
     login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
     client = TestClient(create_app(
         "secret", tmp_path / "missing", repository, login,
-        video_service=FakeVideoService(repository),
+        video_service=service,
         settings_service=settings,
     ))
     headers = {"X-DouPool-Token": "secret"}
 
-    group_id = "expired-group-1"
-    _seed_grouped_tasks(repository, group_id, count=1)
-    # 把签名 URL 改成会触发 403 的占位
+    # 第 1 条先成功,第 2 条的 clean URL 才发现过期。刷新服务只更新
+    # result_url,因此重试必须改用 fresh result URL,且不能重复下载第 1 条。
     from doupool.db.models import VideoTask
-    VideoTask.update(result_url="https://example.test/expired.mp4").where(VideoTask.group_id == group_id).execute()
+    expired_clean_url = "https://example.test/clean-expired.mp4"
+    VideoTask.update(clean_video_url=expired_clean_url).where(
+        VideoTask.id == task_ids[1]
+    ).execute()
+    responses = {
+        **old_responses,
+        expired_clean_url: _FakeChunkedResponse(403, b""),
+        fresh_urls[task_ids[0]]: _FakeChunkedResponse(200, b"fresh-video-1"),
+        fresh_urls[task_ids[1]]: _FakeChunkedResponse(200, b"fresh-video-2"),
+    }
+    fake = _FakeStreamClient(responses)
+    monkeypatch.setattr("doupool.api.app.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    response = client.post("/api/results/group-download", headers=headers, json={"group_id": group_id})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["file_count"] == 2
+    assert service.refresh_calls == task_ids
+    assert fake.calls == [
+        "https://example.test/v1.mp4",
+        expired_clean_url,
+        fresh_urls[task_ids[1]],
+    ]
+    saved_files = list(Path(response.json()["saved_dir"]).glob("*.mp4"))
+    assert len(saved_files) == 2
+    assert {path.read_bytes() for path in saved_files} == {b"video-1", b"fresh-video-2"}
+
+
+def test_group_download_handles_expired_signature(
+    repository, tmp_path, database_manager, monkeypatch,
+):
+    """403 且自动刷新无结果 → 409 明确说明后端已经尝试刷新。"""
+    settings = SettingsService(repository, tmp_path, database_manager.path)
+    settings.update({"download_dir": str(tmp_path / "downloads")})
+
+    group_id = "expired-group-failure"
+    task_ids, _responses = _seed_grouped_tasks(repository, group_id, count=1)
+    service = _FakeGroupDownloadRefreshService(repository, {}, return_none=True)
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=service,
+        settings_service=settings,
+    ))
+    headers = {"X-DouPool-Token": "secret"}
+
+    expired_url = "https://example.test/v1.mp4"
+    fake = _FakeStreamClient({expired_url: _FakeChunkedResponse(403, b"")})
+    monkeypatch.setattr("doupool.api.app.httpx.AsyncClient", lambda *a, **kw: fake)
+
+    response = client.post("/api/results/group-download", headers=headers, json={"group_id": group_id})
+    assert response.status_code == 409
+    assert "后端尝试自动刷新但失败" in response.json()["detail"]
+    assert "未获得新的下载链接" in response.json()["detail"]
+    assert "请先在结果页点刷新" not in response.json()["detail"]
+    assert service.refresh_calls == task_ids
+
+
+def test_group_download_only_refreshes_once_when_fresh_url_is_still_expired(
+    repository, tmp_path, database_manager, monkeypatch,
+):
+    """刷新后的 URL 仍返 403 时立即报错,不进入无限刷新循环。"""
+    settings = SettingsService(repository, tmp_path, database_manager.path)
+    settings.update({"download_dir": str(tmp_path / "downloads")})
+
+    group_id = "expired-group-still-expired"
+    task_ids, _responses = _seed_grouped_tasks(repository, group_id, count=1)
+    fresh_url = "https://fresh.example/still-expired.mp4"
+    service = _FakeGroupDownloadRefreshService(
+        repository,
+        {task_ids[0]: fresh_url},
+    )
+    login = LoginService(repository, IdleRunner(), tmp_path / "profiles")
+    client = TestClient(create_app(
+        "secret", tmp_path / "missing", repository, login,
+        video_service=service,
+        settings_service=settings,
+    ))
+    headers = {"X-DouPool-Token": "secret"}
 
     fake = _FakeStreamClient({
-        "https://example.test/expired.mp4": _FakeChunkedResponse(403, b""),
+        "https://example.test/v1.mp4": _FakeChunkedResponse(403, b""),
+        fresh_url: _FakeChunkedResponse(403, b""),
     })
     monkeypatch.setattr("doupool.api.app.httpx.AsyncClient", lambda *a, **kw: fake)
 
     response = client.post("/api/results/group-download", headers=headers, json={"group_id": group_id})
     assert response.status_code == 409
-    assert "签名链接已过期" in response.json()["detail"]
+    assert "自动刷新后仍过期" in response.json()["detail"]
+    assert service.refresh_calls == task_ids
+    assert fake.calls == ["https://example.test/v1.mp4", fresh_url]
 
 
 def test_group_download_empty_group_returns_404(repository, tmp_path, database_manager):

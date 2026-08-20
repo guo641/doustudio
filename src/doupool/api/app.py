@@ -872,8 +872,7 @@ def create_app(
         状态码:
           - 200:{saved_dir, file_count} —— 即使 file_count=0 也成功
           - 404:group_id 不存在
-          - 409:某个视频的签名 URL 已过期(401/403) → 提示用户先点
-            「刷新下载链接」
+          - 409:签名 URL 已过期且整组自动刷新失败,或刷新后仍然过期
           - 500:磁盘满 / 权限不足 / 下载目录不存在 → 引导用户去设置改
             download_dir
           - 503:video_service 未启动 或 settings_service 缺失
@@ -928,59 +927,129 @@ def create_app(
                 detail=f"无法创建批次文件夹 {batch_folder}: {exc}",
             ) from exc
 
+        async def _refresh_group_urls(task_list: list) -> tuple[bool, str]:
+            """Refresh every eligible result URL without aborting on one failure."""
+            refreshable = [
+                task
+                for task in task_list
+                if task.status == "succeeded" and task.conversation_id
+            ]
+            if not refreshable:
+                return False, "该组没有可刷新的 succeeded 任务或任务缺少 conversation_id"
+
+            async def _refresh_one(task):
+                wrapper = video_service.schedule_refresh_url(task.id)
+                return await wrapper
+
+            results = await asyncio.gather(
+                *(_refresh_one(task) for task in refreshable),
+                return_exceptions=True,
+            )
+            if any(
+                result is not None and not isinstance(result, BaseException)
+                for result in results
+            ):
+                return True, ""
+
+            failures = []
+            for task, result in zip(refreshable, results):
+                if isinstance(result, BaseException):
+                    failures.append(f"任务 {task.id}: {result}")
+                else:
+                    failures.append(f"任务 {task.id}: 未获得新的下载链接")
+            return False, "; ".join(failures[:3])
+
         saved_count = 0
+        downloaded_task_ids: set[str] = set()
+        refresh_attempted = False
+        use_refreshed_result_url = False
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(30.0, connect=10.0),
                 follow_redirects=True,
             ) as client:
-                for task in tasks:
-                    url = task.clean_video_url or task.result_url
-                    if not url:
-                        continue
-                    # v0.2.35:批量下载命名 —— 与 _video_task_dict.download_filename 同源
-                    stem = _build_download_filename(task).removesuffix(".mp4")
-                    target = batch_folder / f"{stem}.mp4"
-                    suffix_n = 2
-                    while target.exists():
-                        target = batch_folder / f"{stem}-{suffix_n}.mp4"
-                        suffix_n += 1
-                    try:
-                        async with client.stream("GET", url) as resp:
-                            if resp.status_code in (401, 403):
+                while True:
+                    restart_after_refresh = False
+                    for task in tasks:
+                        if task.id in downloaded_task_ids:
+                            continue
+                        # schedule_refresh_url 只更新 result_url 系列,不会更新
+                        # clean_video_url。刷新后优先使用刚写回 DB 的 result_url,
+                        # 避免再次请求同一个已过期 clean URL。
+                        if use_refreshed_result_url:
+                            url = task.result_url or task.clean_video_url
+                        else:
+                            url = task.clean_video_url or task.result_url
+                        if not url:
+                            continue
+                        # v0.2.35:批量下载命名 —— 与 _video_task_dict.download_filename 同源
+                        stem = _build_download_filename(task).removesuffix(".mp4")
+                        target = batch_folder / f"{stem}.mp4"
+                        suffix_n = 2
+                        while target.exists():
+                            target = batch_folder / f"{stem}-{suffix_n}.mp4"
+                            suffix_n += 1
+                        try:
+                            async with client.stream("GET", url) as resp:
+                                if resp.status_code in (401, 403):
+                                    if refresh_attempted:
+                                        raise HTTPException(
+                                            status_code=409,
+                                            detail=(
+                                                f"任务 {task.id} 签名链接自动刷新后仍过期,"
+                                                "请检查豆包账号状态"
+                                            ),
+                                        )
+                                    refresh_attempted = True
+                                    refresh_ok, refresh_error = await _refresh_group_urls(tasks)
+                                    if not refresh_ok:
+                                        raise HTTPException(
+                                            status_code=409,
+                                            detail=(
+                                                f"任务 {task.id} 签名链接已过期,"
+                                                "后端尝试自动刷新但失败: "
+                                                f"{refresh_error}"
+                                            ),
+                                        )
+                                    # 刷新协程已把新 URL 写回 DB。重读整组并从首项
+                                    # 重试；已成功落盘的 task_id 会被跳过,不会重复下载。
+                                    tasks = repository.list_tasks_by_group(body.group_id)
+                                    use_refreshed_result_url = True
+                                    restart_after_refresh = True
+                                    break
+                                resp.raise_for_status()
+                                with target.open("wb") as f:
+                                    async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                                        f.write(chunk)
+                        except HTTPException:
+                            # 签名过期这种业务错误直接往上抛
+                            raise
+                        except OSError as exc:
+                            err_no = getattr(exc, "errno", None)
+                            if err_no == 28:  # ENOSPC
                                 raise HTTPException(
-                                    status_code=409,
-                                    detail=f"任务 {task.id} 签名链接已过期,请先在结果页点刷新",
-                                )
-                            resp.raise_for_status()
-                            with target.open("wb") as f:
-                                async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
-                                    f.write(chunk)
-                    except HTTPException:
-                        # 签名过期这种业务错误直接往上抛
-                        raise
-                    except OSError as exc:
-                        err_no = getattr(exc, "errno", None)
-                        if err_no == 28:  # ENOSPC
+                                    status_code=500,
+                                    detail="本地磁盘空间不足,无法保存视频",
+                                ) from exc
+                            if err_no == 13:  # EACCES
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail=f"下载目录无写权限,请在设置中更换路径: {download_dir}",
+                                ) from exc
                             raise HTTPException(
                                 status_code=500,
-                                detail="本地磁盘空间不足,无法保存视频",
+                                detail=f"写文件失败 {target}: {exc}",
                             ) from exc
-                        if err_no == 13:  # EACCES
+                        except httpx.HTTPError as exc:
                             raise HTTPException(
-                                status_code=500,
-                                detail=f"下载目录无写权限,请在设置中更换路径: {download_dir}",
+                                status_code=502,
+                                detail=f"下载任务 {task.id} 视频失败: {exc}",
                             ) from exc
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"写文件失败 {target}: {exc}",
-                        ) from exc
-                    except httpx.HTTPError as exc:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"下载任务 {task.id} 视频失败: {exc}",
-                        ) from exc
-                    saved_count += 1
+                        saved_count += 1
+                        downloaded_task_ids.add(task.id)
+                    if restart_after_refresh:
+                        continue
+                    break
         except HTTPException:
             # 出错时把已落盘的部分文件夹留着给用户手动取 —— 比直接清掉友好。
             raise
