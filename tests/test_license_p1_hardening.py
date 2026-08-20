@@ -43,6 +43,32 @@ def test_clock_rollback_is_rejected_during_verification(monkeypatch):
     assert result["needs_heartbeat"] is True
 
 
+def test_small_clock_skew_within_tolerance_is_allowed(monkeypatch):
+    """v0.3.13: 本地时钟比 last_server_sync 慢几秒时不应误判 expired。"""
+    pytest.importorskip("doupool.license._license_verify", reason="需要编译的 .pyd")
+    from doupool.license import _license_verify as verifier
+
+    payload = {
+        "fingerprint_hex": "cc" * 32,
+        "customer": "test-customer",
+        "issued_at": 1000000000,
+        "expires_at": 2000000000,
+    }
+    last_server_sync = 1000000000
+    now_slightly_behind = last_server_sync - 2
+
+    monkeypatch.setattr(time, "time", lambda: now_slightly_behind)
+
+    result = verifier._evaluate_status_with_fresh(
+        payload,
+        fresh_until=1000100000,
+        last_server_sync=last_server_sync,
+    )
+
+    assert result["status"] == "valid", "几秒时钟漂移不应误判过期"
+    assert result.get("error") != "clock_rollback"
+
+
 def test_fresh_until_zero_with_expired_grace_period(monkeypatch):
     """P1-B: fresh_until=0 + last_server_sync 超过 7 天 → status=expired。
 

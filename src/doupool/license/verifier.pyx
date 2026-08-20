@@ -50,6 +50,9 @@ _MIN_APP_VERSION: str = "0.3.1"
 # v0.3.1 半在线心跳参数(跟 server 对齐)
 _FRESH_DAYS: int = 30
 _GRACE_DAYS: int = 7
+# v0.3.13: 时钟回拨容忍窗口,与 heartbeat.py CLOCK_SKEW_TOLERANCE_SEC 一致。
+# 正常客户端-服务器几秒时钟漂移不应误锁;真正的回拨攻击需回拨 7~30 天,远超此窗口。
+_CLOCK_SKEW_TOLERANCE_SEC: int = 300
 # grace 用完时,verifier 行为: sys.exit(0) 静默退出(避免弹窗被逆向)
 _GRACE_EXIT_CODE: int = 0
 _REVOKED_EXIT_CODE: int = 73
@@ -300,8 +303,8 @@ def _evaluate_status_with_fresh(payload, *, fresh_until: int, last_server_sync: 
     needs_heartbeat = False
     grace = False
 
-    # P1-A: 防本地时钟回拨攻击
-    if last_server_sync > 0 and now < last_server_sync:
+    # P1-A: 防本地时钟回拨攻击(v0.3.13:容忍 +/-300s 正常时钟漂移,与握手一致)
+    if last_server_sync > 0 and now < last_server_sync - _CLOCK_SKEW_TOLERANCE_SEC:
         # 系统时钟回拨到上次心跳之前 → 拒绝(攻击者试图让过期 token 看起来有效)
         logger = logging.getLogger(__name__)
         logger.error(
